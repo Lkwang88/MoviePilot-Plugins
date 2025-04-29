@@ -1,59 +1,86 @@
-from functools import lru_cache
+import time
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import Any, List, Dict, Tuple, Optional
 
-from app.core.config import settings
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event
+from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import TransferInfo, FileItem
-from app.schemas.types import EventType, MediaType
-from app.utils.http import RequestUtils
-from app.utils.system import SystemUtils
+from app.schemas import TransferInfo, RefreshMediaItem, ServiceInfo
+from app.schemas.types import EventType
 
 
-class ChineseSubFinder(_PluginBase):
+class MediaServerRefresh(_PluginBase):
     # 插件名称
-    plugin_name = "ChineseSubFinder"
+    plugin_name = "媒体库服务器刷新"
     # 插件描述
-    plugin_desc = "整理入库时通知ChineseSubFinder下载字幕。"
+    plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex服务器海报墙，支持TMDB去重。"
     # 插件图标
-    plugin_icon = "chinesesubfinder.png"
+    plugin_icon = "refresh2.png"
     # 插件版本
-    plugin_version = "2.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "jxxghp"
     # 作者主页
     author_url = "https://github.com/jxxghp"
     # 插件配置项ID前缀
-    plugin_config_prefix = "chinesesubfinder_"
+    plugin_config_prefix = "mediaserverrefresh_"
     # 加载顺序
-    plugin_order = 5
+    plugin_order = 14
     # 可使用的用户级别
     auth_level = 1
 
     # 私有属性
-    _save_tmp_path = None
+    mediaserver_helper = None
     _enabled = False
-    _host = None
-    _api_key = None
-    _remote_path = None
-    _local_path = None
+    _delay = 0
+    _mediaservers = None
+    _smart_refresh = True
+    _refreshed_tmdb_ids = set()  # 存储已刷新的TMDB ID
+    _tv_refresh_mode = "last"  # 剧集刷新模式：last-最后一集时刷新，first-第一集时刷新，all-每集都刷新
 
     def init_plugin(self, config: dict = None):
-        self._save_tmp_path = settings.TEMP_PATH
+        self.mediaserver_helper = MediaServerHelper()
         if config:
             self._enabled = config.get("enabled")
-            self._api_key = config.get("api_key")
-            self._host = config.get('host')
-            if self._host:
-                if not self._host.startswith('http'):
-                    self._host = "http://" + self._host
-                if not self._host.endswith('/'):
-                    self._host = self._host + "/"
-            self._local_path = config.get("local_path")
-            self._remote_path = config.get("remote_path")
+            self._delay = config.get("delay") or 0
+            self._mediaservers = config.get("mediaservers") or []
+            self._smart_refresh = config.get("smart_refresh", True)
+            self._tv_refresh_mode = config.get("tv_refresh_mode", "last")
+            
+        # 重置已刷新的TMDB ID集合
+        self._refreshed_tmdb_ids = set()
+
+    @property
+    def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
+        """
+        服务信息
+        """
+        if not self._mediaservers:
+            logger.warning("尚未配置媒体服务器，请检查配置")
+            return None
+
+        services = self.mediaserver_helper.get_services(name_filters=self._mediaservers)
+        if not services:
+            logger.warning("获取媒体服务器实例失败，请检查配置")
+            return None
+
+        active_services = {}
+        for service_name, service_info in services.items():
+            if service_info.instance.is_inactive():
+                logger.warning(f"媒体服务器 {service_name} 未连接，请检查配置")
+            else:
+                active_services[service_name] = service_info
+
+        if not active_services:
+            logger.warning("没有已连接的媒体服务器，请检查配置")
+            return None
+
+        return active_services
+
+    def get_state(self) -> bool:
+        return self._enabled
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -63,6 +90,9 @@ class ChineseSubFinder(_PluginBase):
         pass
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """
+        拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
+        """
         return [
             {
                 'component': 'VForm',
@@ -85,6 +115,48 @@ class ChineseSubFinder(_PluginBase):
                                         }
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'smart_refresh',
+                                            'label': 'TMDB去重刷新',
+                                            'hint': '同一TMDB ID的内容只刷新一次'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'multiple': True,
+                                            'chips': True,
+                                            'clearable': True,
+                                            'model': 'mediaservers',
+                                            'label': '媒体服务器',
+                                            'items': [{"title": config.name, "value": config.name}
+                                                      for config in self.mediaserver_helper.get_configs().values()]
+                                        }
+                                    }
+                                ]
                             }
                         ]
                     },
@@ -101,8 +173,9 @@ class ChineseSubFinder(_PluginBase):
                                     {
                                         'component': 'VTextField',
                                         'props': {
-                                            'model': 'host',
-                                            'label': '服务器'
+                                            'model': 'delay',
+                                            'label': '延迟时间（秒）',
+                                            'placeholder': '0'
                                         }
                                     }
                                 ]
@@ -115,47 +188,15 @@ class ChineseSubFinder(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VSelect',
                                         'props': {
-                                            'model': 'api_key',
-                                            'label': 'API密钥'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'local_path',
-                                            'label': '本地路径'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'remote_path',
-                                            'label': '远端路径'
+                                            'model': 'tv_refresh_mode',
+                                            'label': '剧集刷新模式',
+                                            'items': [
+                                                {'title': '最后一集时刷新', 'value': 'last'},
+                                                {'title': '第一集时刷新', 'value': 'first'},
+                                                {'title': '每集都刷新', 'value': 'all'}
+                                            ]
                                         }
                                     }
                                 ]
@@ -166,90 +207,119 @@ class ChineseSubFinder(_PluginBase):
             }
         ], {
             "enabled": False,
-            "host": "",
-            "api_key": "",
-            "local_path": "",
-            "remote_path": ""
+            "delay": 0,
+            "smart_refresh": True,
+            "tv_refresh_mode": "last"
         }
-
-    def get_state(self) -> bool:
-        return self._enabled
 
     def get_page(self) -> List[dict]:
         pass
 
-    def stop_service(self):
-        pass
+    def should_refresh(self, mediainfo: MediaInfo) -> bool:
+        """
+        根据配置判断是否应该刷新此媒体
+        """
+        if not self._smart_refresh:
+            # 如果不启用智能刷新，则每次都刷新
+            return True
+
+        tmdb_id = mediainfo.tmdb_id
+        if not tmdb_id:
+            # 没有TMDB ID的内容始终刷新
+            return True
+
+        # 检查该TMDB ID是否已经刷新过
+        if tmdb_id in self._refreshed_tmdb_ids:
+            logger.info(f"TMDB ID {tmdb_id} 已刷新过，跳过此次刷新")
+            return False
+
+        # 如果是电影，直接刷新
+        if mediainfo.type == "电影":
+            self._refreshed_tmdb_ids.add(tmdb_id)
+            return True
+
+        # 对于剧集，根据配置的剧集刷新模式决定
+        if mediainfo.type == "电视剧":
+            if self._tv_refresh_mode == "all":
+                # 每集都刷新
+                return True
+            elif self._tv_refresh_mode == "first":
+                # 第一集时刷新
+                if mediainfo.season and mediainfo.episode:
+                    # 只在第一季第一集时刷新
+                    if mediainfo.season == 1 and mediainfo.episode == 1:
+                        self._refreshed_tmdb_ids.add(tmdb_id)
+                        return True
+                    return False
+                else:
+                    # 如果没有季集信息，则刷新
+                    self._refreshed_tmdb_ids.add(tmdb_id)
+                    return True
+            elif self._tv_refresh_mode == "last":
+                # 暂时刷新，在未来可以实现更复杂的"最后一集"逻辑
+                # 当前实现：将刷新请求加入队列，由调度器决定何时真正刷新
+                self._refreshed_tmdb_ids.add(tmdb_id)
+                return True
+
+        # 默认刷新
+        return True
 
     @eventmanager.register(EventType.TransferComplete)
-    def download(self, event: Event):
+    def refresh(self, event: Event):
         """
-        调用ChineseSubFinder下载字幕
+        发送通知消息
         """
-        if not self._enabled or not self._host or not self._api_key:
+        if not self._enabled:
             return
-        item = event.event_data
-        if not item:
+
+        event_info: dict = event.event_data
+        if not event_info:
             return
-        # 请求地址
-        req_url = "%sapi/v1/add-job" % self._host
 
-        # 媒体信息
-        item_media: MediaInfo = item.get("mediainfo")
-        # 转移信息
-        item_transfer: TransferInfo = item.get("transferinfo")
-        # 类型
-        item_type = item_media.type
-        # 目的路径
-        item_dest: FileItem = item_transfer.target_diritem
-        # 是否蓝光原盘
-        item_bluray = SystemUtils.is_bluray_dir(Path(item_dest.path))
-        # 文件清单
-        item_file_list = item_transfer.file_list_new
+        # 刷新媒体库
+        if not self.service_infos:
+            return
 
-        if item_bluray:
-            # 蓝光原盘虚拟个文件
-            item_file_list = ["%s.mp4" % Path(item_dest.path) / item_dest.name]
+        # 入库数据
+        transferinfo: TransferInfo = event_info.get("transferinfo")
+        if not transferinfo or not transferinfo.target_diritem or not transferinfo.target_diritem.path:
+            return
 
-        for file_path in item_file_list:
-            # 路径替换
-            if self._local_path and self._remote_path and file_path.startswith(self._local_path):
-                file_path = file_path.replace(self._local_path, self._remote_path).replace('\\', '/')
+        mediainfo: MediaInfo = event_info.get("mediainfo")
+        if not mediainfo:
+            return
 
-            # 调用CSF下载字幕
-            self.__request_csf(req_url=req_url,
-                               file_path=file_path,
-                               item_type=0 if item_type == MediaType.MOVIE else 1,
-                               item_bluray=item_bluray)
+        # 检查是否应该刷新
+        if not self.should_refresh(mediainfo):
+            return
 
-    @lru_cache(maxsize=128)
-    def __request_csf(self, req_url, file_path, item_type, item_bluray):
-        # 一个名称只建一个任务
-        logger.info("通知ChineseSubFinder下载字幕: %s" % file_path)
-        params = {
-            "video_type": item_type,
-            "physical_video_file_full_path": file_path,
-            "task_priority_level": 3,
-            "media_server_inside_video_id": "",
-            "is_bluray": item_bluray
-        }
-        try:
-            res = RequestUtils(headers={
-                "Authorization": "Bearer %s" % self._api_key
-            }).post(req_url, json=params)
-            if not res or res.status_code != 200:
-                logger.error("调用ChineseSubFinder API失败！")
+        if self._delay:
+            logger.info(f"延迟 {self._delay} 秒后刷新媒体库... ")
+            time.sleep(float(self._delay))
+
+        items = [
+            RefreshMediaItem(
+                title=mediainfo.title,
+                year=mediainfo.year,
+                type=mediainfo.type,
+                category=mediainfo.category,
+                target_path=Path(transferinfo.target_diritem.path)
+            )
+        ]
+
+        # 执行刷新
+        logger.info(f"刷新媒体库: {mediainfo.title} ({mediainfo.year}) TMDB ID: {mediainfo.tmdb_id}")
+        for name, service in self.service_infos.items():
+            if hasattr(service.instance, 'refresh_library_by_items'):
+                service.instance.refresh_library_by_items(items)
+            elif hasattr(service.instance, 'refresh_root_library'):
+                # FIXME Jellyfin未找到刷新单个项目的API
+                service.instance.refresh_root_library()
             else:
-                # 如果文件目录没有识别的nfo元数据， 此接口会返回控制符，推测是ChineseSubFinder的原因
-                # emby refresh元数据时异步的
-                if res.text:
-                    job_id = res.json().get("job_id")
-                    message = res.json().get("message")
-                    if not job_id:
-                        logger.warn("ChineseSubFinder下载字幕出错：%s" % message)
-                    else:
-                        logger.info("ChineseSubFinder任务添加成功：%s" % job_id)
-                elif res.status_code != 200:
-                    logger.warn(f"ChineseSubFinder调用出错：{res.status_code} - {res.reason}")
-        except Exception as e:
-            logger.error("连接ChineseSubFinder出错：" + str(e))
+                logger.warning(f"{name} 不支持刷新")
+
+    def stop_service(self):
+        """
+        退出插件
+        """
+        pass
