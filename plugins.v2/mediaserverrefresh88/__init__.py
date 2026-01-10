@@ -12,21 +12,23 @@ from app.schemas.types import EventType
 
 # ----------------------------------------------------------------------------
 # Modified by: LKWANG88
-# Feature: 异步防抖刷新 (Async Debounce Refresh)
-# Folder: mediaserverrefresh88 (Fully Compatible)
+# Feature: 异步防抖刷新 (Async Debounce Refresh) - Fully Independent Class
+# Class Name: MediaServerRefresh88
 # ----------------------------------------------------------------------------
 
-class MediaServerRefresh(_PluginBase):
+class MediaServerRefresh88(_PluginBase):
+    # [关键修改] 插件类名已改为 MediaServerRefresh88，彻底独立
+
     # 插件基本信息
-    plugin_name = "媒体库服务器刷新"
-    plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 定制防抖版)。"
-    plugin_icon = "refresh2.png" # 确保 refresh2.png 图片文件也在 mediaserverrefresh88 文件夹内
-    plugin_version = "2.0.3"
+    plugin_name = "媒体库刷新 (LKWANG88版)"  # 修改名称，方便在UI中直接区分
+    plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 独立防抖版)。"
+    plugin_icon = "refresh2.png"
+    plugin_version = "2.0.4"
     
     plugin_author = "LKWANG88"
     author_url = "https://github.com/jxxghp"
     
-    # [关键修改] 修改配置前缀，避免与原版插件(mediaserverrefresh_)发生数据库配置冲突
+    # 独立的配置前缀，数据与原版完全隔离
     plugin_config_prefix = "mediaserverrefresh88_"
     
     plugin_order = 14
@@ -43,6 +45,9 @@ class MediaServerRefresh(_PluginBase):
     _lock = threading.Lock()
 
     def init_plugin(self, config: dict = None):
+        """
+        初始化：加载配置
+        """
         if config:
             self._enabled = config.get("enabled")
             self._delay = config.get("delay") or 0
@@ -51,6 +56,10 @@ class MediaServerRefresh(_PluginBase):
         self._stop_timer()
         with self._lock:
             self._pending_items.clear()
+        
+        # [新增] 启动成功日志，证明插件已活过来
+        if self._enabled:
+            logger.info(f"LKWANG88-Plugin: 独立版插件已就绪，当前延迟设定: {self._delay}秒")
 
     @property
     def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
@@ -231,6 +240,9 @@ class MediaServerRefresh(_PluginBase):
         self._timer = None
 
     def stop_service(self):
+        """
+        退出清理
+        """
         self._stop_timer()
         with self._lock:
             self._pending_items.clear()
