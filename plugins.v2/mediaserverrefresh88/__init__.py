@@ -12,20 +12,23 @@ from app.schemas.types import EventType
 
 # ----------------------------------------------------------------------------
 # Modified by: LKWANG88
-# Feature: 异步防抖刷新 (Async Debounce Refresh) - Hot-Reload Compatible
+# Feature: 异步防抖刷新 (Async Debounce Refresh)
+# Folder: mediaserverrefresh88 (Fully Compatible)
 # ----------------------------------------------------------------------------
 
 class MediaServerRefresh(_PluginBase):
     # 插件基本信息
     plugin_name = "媒体库服务器刷新"
     plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 定制防抖版)。"
-    plugin_icon = "refresh2.png"
-    plugin_version = "2.0.2"  # 稍微增加版本号以确保系统感知变化
+    plugin_icon = "refresh2.png" # 确保 refresh2.png 图片文件也在 mediaserverrefresh88 文件夹内
+    plugin_version = "2.0.3"
     
     plugin_author = "LKWANG88"
     author_url = "https://github.com/jxxghp"
     
-    plugin_config_prefix = "mediaserverrefresh_"
+    # [关键修改] 修改配置前缀，避免与原版插件(mediaserverrefresh_)发生数据库配置冲突
+    plugin_config_prefix = "mediaserverrefresh88_"
+    
     plugin_order = 14
     auth_level = 1
 
@@ -40,15 +43,11 @@ class MediaServerRefresh(_PluginBase):
     _lock = threading.Lock()
 
     def init_plugin(self, config: dict = None):
-        """
-        插件初始化方法，热重载时会被自动调用
-        """
         if config:
             self._enabled = config.get("enabled")
             self._delay = config.get("delay") or 0
             self._target_servers = config.get("mediaservers") or []
         
-        # 确保热重载时清理旧状态
         self._stop_timer()
         with self._lock:
             self._pending_items.clear()
@@ -76,16 +75,12 @@ class MediaServerRefresh(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
-    # -------------------------------------------------------------------------
-    # 关键修复：必须实现以下两个方法，否则抽象类实例化会失败，导致热重载静默忽略
-    # -------------------------------------------------------------------------
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
         return []
-    # -------------------------------------------------------------------------
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
@@ -236,9 +231,6 @@ class MediaServerRefresh(_PluginBase):
         self._timer = None
 
     def stop_service(self):
-        """
-        退出清理：热重载或关闭时调用
-        """
         self._stop_timer()
         with self._lock:
             self._pending_items.clear()
