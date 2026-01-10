@@ -1,4 +1,5 @@
 import threading
+import time
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional, Set
 
@@ -12,7 +13,7 @@ from app.schemas.types import EventType
 
 # ----------------------------------------------------------------------------
 # Modified by: LKWANG88
-# Feature: 异步防抖刷新 (Async Debounce Refresh)
+# Feature: 异步防抖刷新 (Async Debounce Refresh) - Fixed Abstract Methods
 # ----------------------------------------------------------------------------
 
 class MediaServerRefresh(_PluginBase):
@@ -20,9 +21,8 @@ class MediaServerRefresh(_PluginBase):
     plugin_name = "媒体库服务器刷新"
     plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 定制防抖版)。"
     plugin_icon = "refresh2.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     
-    # 这里修改为你的名字，系统界面中会显示
     plugin_author = "LKWANG88"
     author_url = "https://github.com/jxxghp"
     
@@ -33,7 +33,7 @@ class MediaServerRefresh(_PluginBase):
     # 配置属性
     _enabled = False
     _delay = 0
-    _target_servers = []  # 重命名以区分实例与配置名
+    _target_servers = []
 
     # 运行时属性
     _timer: Optional[threading.Timer] = None
@@ -55,7 +55,6 @@ class MediaServerRefresh(_PluginBase):
     def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
         """
         获取活跃的服务实例
-        优化：增加异常捕获，防止单次网络抖动导致崩溃
         """
         if not self._target_servers:
             return None
@@ -67,7 +66,6 @@ class MediaServerRefresh(_PluginBase):
 
             active_services = {}
             for service_name, service_info in services.items():
-                # 即使在这里，也不建议过于频繁检查 is_inactive，但在获取实例时无法避免
                 if service_info.instance and not service_info.instance.is_inactive():
                     active_services[service_name] = service_info
             
@@ -79,9 +77,26 @@ class MediaServerRefresh(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
+    # -------------------------------------------------------------------------
+    # [修复] 必须实现这两个方法，否则插件无法加载
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        """
+        定义插件命令（必须实现）
+        """
+        return []
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        """
+        定义插件API（必须实现）
+        """
+        return []
+    # -------------------------------------------------------------------------
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
-        保持原有的表单逻辑
+        拼装插件配置页面
         """
         return [
             {
@@ -140,7 +155,7 @@ class MediaServerRefresh(_PluginBase):
                                         'props': {
                                             'model': 'delay',
                                             'label': '延迟时间（秒）',
-                                            'placeholder': '30' # 建议默认值设大一点
+                                            'placeholder': '30'
                                         }
                                     }
                                 ]
@@ -161,7 +176,7 @@ class MediaServerRefresh(_PluginBase):
     @eventmanager.register(EventType.TransferComplete)
     def refresh(self, event: Event):
         """
-        事件回调：极速响应，仅做入队和重置计时器操作
+        事件回调
         """
         if not self._enabled:
             return
@@ -170,14 +185,12 @@ class MediaServerRefresh(_PluginBase):
         if not event_info:
             return
 
-        # 获取数据
         transferinfo: TransferInfo = event_info.get("transferinfo")
         mediainfo: MediaInfo = event_info.get("mediainfo")
         
         if not transferinfo or not transferinfo.target_diritem or not transferinfo.target_diritem.path:
             return
 
-        # 构造刷新对象
         item = RefreshMediaItem(
             title=mediainfo.title,
             year=mediainfo.year,
@@ -187,14 +200,21 @@ class MediaServerRefresh(_PluginBase):
         )
 
         with self._lock:
-            # 1. 加入队列
             self._pending_items.append(item)
-            # 2. 停止旧计时器
             self._stop_timer()
-            # 3. 启动新计时器 (Debounce 核心)
-            delay = float(self._delay) if self._delay else 5.0 # 默认至少5秒缓冲
-            logger.info(f"LKWANG88-Plugin: 监测到入库 [{mediainfo.title}]，将在 {delay} 秒后触发批量刷新 (当前队列: {len(self._pending_items)})")
-            self._timer = threading.Timer(delay, self._flush_queue)
+            
+            # 使用 float 确保转换安全
+            try:
+                delay_val = float(self._delay)
+            except (TypeError, ValueError):
+                delay_val = 5.0
+            
+            # 最小延迟保护
+            if delay_val < 1: 
+                delay_val = 1.0
+
+            logger.info(f"LKWANG88-Plugin: 监测到入库 [{mediainfo.title}]，将在 {delay_val} 秒后触发批量刷新 (当前队列: {len(self._pending_items)})")
+            self._timer = threading.Timer(delay_val, self._flush_queue)
             self._timer.start()
 
     def _flush_queue(self):
@@ -204,14 +224,12 @@ class MediaServerRefresh(_PluginBase):
         with self._lock:
             if not self._pending_items:
                 return
-            # 取出所有待处理项并清空队列
             items_to_refresh = list(self._pending_items)
             self._pending_items.clear()
             self._timer = None
 
         logger.info(f"LKWANG88-Plugin: 防抖结束，开始执行媒体库刷新，共 {len(items_to_refresh)} 个项目...")
         
-        # 惰性获取服务实例（此时再检查网络，避免在事件风暴中频繁检查）
         services = self.service_infos
         if not services:
             logger.warning("LKWANG88-Plugin: 刷新取消，未找到活跃的媒体服务器连接。")
@@ -231,7 +249,6 @@ class MediaServerRefresh(_PluginBase):
                 logger.error(f"刷新 {name} 失败: {e}")
 
     def _stop_timer(self):
-        """安全停止计时器"""
         if self._timer and self._timer.is_alive():
             self._timer.cancel()
         self._timer = None
@@ -241,7 +258,5 @@ class MediaServerRefresh(_PluginBase):
         插件退出清理
         """
         self._stop_timer()
-        # 退出时，如果有残留数据，可以选择立即刷新一次，或者直接丢弃
-        # 这里选择为了安全退出，不再执行耗时操作
         with self._lock:
             self._pending_items.clear()
