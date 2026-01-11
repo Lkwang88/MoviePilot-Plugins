@@ -2,26 +2,25 @@ import threading
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 
-# ----------------------------------------------------------------------------
-# 强制日志埋点：验证模块是否被系统加载
-# ----------------------------------------------------------------------------
-from app.log import logger
-logger.info("【LKWANG88-Debug】: 系统正在尝试加载 MediaServerRefresh88 插件文件...")
-# ----------------------------------------------------------------------------
-
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event
 from app.helper.mediaserver import MediaServerHelper
+from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import TransferInfo, RefreshMediaItem, ServiceInfo
 from app.schemas.types import EventType
+
+# ----------------------------------------------------------------------------
+# Modified by: LKWANG88
+# Feature: 严格复刻原版逻辑 + 异步防抖 (Strict Original Logic + Async Debounce)
+# ----------------------------------------------------------------------------
 
 class MediaServerRefresh88(_PluginBase):
     # 插件基本信息
     plugin_name = "媒体库刷新 (LKWANG88版)"
     plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 独立防抖版)。"
     plugin_icon = "refresh2.png"
-    plugin_version = "2.0.5"
+    plugin_version = "2.0.7"
     
     plugin_author = "LKWANG88"
     author_url = "https://github.com/jxxghp"
@@ -43,12 +42,6 @@ class MediaServerRefresh88(_PluginBase):
     _lock = threading.Lock()
 
     def init_plugin(self, config: dict = None):
-        """
-        插件初始化
-        """
-        # 调试日志：证明类被实例化了
-        logger.info("【LKWANG88-Debug】: MediaServerRefresh88 类正在初始化...")
-        
         if config:
             self._enabled = config.get("enabled")
             self._delay = config.get("delay") or 0
@@ -57,9 +50,15 @@ class MediaServerRefresh88(_PluginBase):
         self._stop_timer()
         with self._lock:
             self._pending_items.clear()
+            
+        if self._enabled:
+            logger.info(f"LKWANG88-Plugin: 独立防抖版已就绪，当前延迟设定: {self._delay}秒")
 
     @property
     def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
+        """
+        与原版逻辑保持高度一致的获取服务方式
+        """
         if not self._target_servers:
             return None
         
@@ -179,6 +178,7 @@ class MediaServerRefresh88(_PluginBase):
         if not transferinfo or not transferinfo.target_diritem or not transferinfo.target_diritem.path:
             return
 
+        # [严格回归原版]：完全使用原版的数据结构，不多一个字，不少一个字
         item = RefreshMediaItem(
             title=mediainfo.title,
             year=mediainfo.year,
@@ -188,9 +188,12 @@ class MediaServerRefresh88(_PluginBase):
         )
 
         with self._lock:
+            # 1. 加入队列
             self._pending_items.append(item)
+            # 2. 停止旧计时器（实现防抖）
             self._stop_timer()
             
+            # 容错处理：确保延迟是有效数字
             try:
                 delay_val = float(self._delay)
             except (TypeError, ValueError):
@@ -200,13 +203,18 @@ class MediaServerRefresh88(_PluginBase):
                 delay_val = 1.0
 
             logger.info(f"LKWANG88-Plugin: 监测到入库 [{mediainfo.title}]，将在 {delay_val} 秒后触发批量刷新 (当前队列: {len(self._pending_items)})")
+            # 3. 启动新计时器（替代原版的 sleep）
             self._timer = threading.Timer(delay_val, self._flush_queue)
             self._timer.start()
 
     def _flush_queue(self):
+        """
+        真正执行刷新的工作线程
+        """
         with self._lock:
             if not self._pending_items:
                 return
+            # 复制并清空队列
             items_to_refresh = list(self._pending_items)
             self._pending_items.clear()
             self._timer = None
@@ -220,6 +228,7 @@ class MediaServerRefresh88(_PluginBase):
 
         for name, service in services.items():
             try:
+                # 兼容原版逻辑的调用方式
                 if hasattr(service.instance, 'refresh_library_by_items'):
                     logger.info(f"正在刷新 {name} ...")
                     service.instance.refresh_library_by_items(items_to_refresh)
@@ -237,9 +246,6 @@ class MediaServerRefresh88(_PluginBase):
         self._timer = None
 
     def stop_service(self):
-        """
-        退出清理
-        """
         self._stop_timer()
         with self._lock:
             self._pending_items.clear()
