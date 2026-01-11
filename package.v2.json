@@ -79,16 +79,12 @@
     "name": "媒体库服务器刷新",
     "description": "入库后自动刷新Emby/Jellyfin/Plex服务器海报墙 (LKWANG88 定制防抖版)。",
     "labels": "媒体库",
-    "version": "2.0.9",
+    "version": "2.1.1",
     "icon": "refresh2.png",
     "author": "LKWANG88",
     "level": 1,
     "history": {
-      "v2.0.0": "重构核心逻辑，引入异步防抖机制，彻底解决线程阻塞与偶发失效问题。",
-      "v1.3.3": "优化延迟刷新",
-      "v1.3.2": "适配飞牛媒体库",
-      "v1.3.1": "修复兼容性问题",
-      "v1.3": "MoviePilot V2 版本媒体库服务器刷新插件"
+      "v2.1.1": "重构核心逻辑，引入异步防抖机制，彻底解决线程阻塞与偶发失效问题。",
     }
   },
   "MediaServerMsg": {

@@ -1,4 +1,6 @@
 import threading
+import json
+import os
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 
@@ -12,26 +14,27 @@ from app.schemas.types import EventType
 
 # ----------------------------------------------------------------------------
 # Modified by: LKWANG88
-# Feature: 严格复刻原版路径逻辑 + 详细人话日志 (Strict Original Path + Detailed Logs)
+# Core Upgrade: 移植 CloudStrmCompanion 的核心逻辑 (Library/Media/Updated)
+# Feature: 直接推送文件路径变化，无需查询ID，支持路径映射
 # ----------------------------------------------------------------------------
 
 class MediaServerRefresh88(_PluginBase):
     plugin_name = "媒体库刷新 (LKWANG88版)"
-    plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 独立防抖版)。"
+    plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 路径推送版)。"
     plugin_icon = "refresh2.png"
-    plugin_version = "2.0.9"
+    plugin_version = "2.1.1"
     
     plugin_author = "LKWANG88"
     author_url = "https://github.com/jxxghp"
     
     plugin_config_prefix = "mediaserverrefresh88_"
-    
     plugin_order = 14
     auth_level = 1
 
     _enabled = False
     _delay = 0
     _target_servers = []
+    _path_mapping = {} # 存储路径映射配置
 
     _timer: Optional[threading.Timer] = None
     _pending_items: List[RefreshMediaItem] = []
@@ -42,19 +45,29 @@ class MediaServerRefresh88(_PluginBase):
             self._enabled = config.get("enabled")
             self._delay = config.get("delay") or 0
             self._target_servers = config.get("mediaservers") or []
-        
+            
+            # 解析路径映射配置
+            self._path_mapping = {}
+            mapping_str = config.get("path_mapping")
+            if mapping_str:
+                for line in mapping_str.split('\n'):
+                    if ':' in line:
+                        local_path, remote_path = line.split(':', 1)
+                        self._path_mapping[local_path.strip()] = remote_path.strip()
+
         self._stop_timer()
         with self._lock:
             self._pending_items.clear()
             
         if self._enabled:
-            logger.info(f"LKWANG88-Plugin: 独立防抖版 (v2.0.9) 已就绪，延迟: {self._delay}秒")
+            logger.info(f"LKWANG88-Plugin: 路径推送版 (v2.1.1) 已就绪，映射规则: {len(self._path_mapping)}条")
 
     @property
     def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
         if not self._target_servers:
             return None
         try:
+            # 同样获取服务，但我们后续会直接操作 instance
             services = MediaServerHelper().get_services(name_filters=self._target_servers)
             if not services:
                 return None
@@ -128,7 +141,7 @@ class MediaServerRefresh88(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12},
+                                'props': {'cols': 12, 'md': 6},
                                 'content': [
                                     {
                                         'component': 'VTextField',
@@ -141,13 +154,35 @@ class MediaServerRefresh88(_PluginBase):
                                 ]
                             }
                         ]
+                    },
+                    # [新增] 路径映射配置框，参考 CloudStrmCompanion
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'path_mapping',
+                                            'label': '路径映射 (MP路径:Emby路径)',
+                                            'rows': 3,
+                                            'placeholder': '例如：/mnt/user/downloads:/data/media\n每行一条，MP和Emby路径一致则留空'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
                     }
                 ]
             }
         ], {
             "enabled": False,
             "delay": 30,
-            "mediaservers": []
+            "mediaservers": [],
+            "path_mapping": ""
         }
 
     def get_page(self) -> List[dict]:
@@ -168,10 +203,9 @@ class MediaServerRefresh88(_PluginBase):
         if not transferinfo or not transferinfo.target_diritem or not transferinfo.target_diritem.path:
             return
 
-        # [回归原版逻辑] 直接使用 target_diritem.path
-        # 这是最安全的做法，因为它能被 Emby 准确识别为 Item ID。
-        # 只要 Emby 开启了 Recursive=True（日志已确认开启），它就会扫描该 Item ID 下的所有关联路径。
-        target_path = Path(transferinfo.target_diritem.path)
+        # 获取文件路径
+        # 仍然使用父目录，因为通过 Updated 接口通知文件夹变更，扫描效率最高且最稳
+        target_path = Path(transferinfo.target_diritem.path).parent
 
         item = RefreshMediaItem(
             title=mediainfo.title,
@@ -189,37 +223,36 @@ class MediaServerRefresh88(_PluginBase):
                 delay_val = float(self._delay)
             except (TypeError, ValueError):
                 delay_val = 5.0
-            
             if delay_val < 1: delay_val = 1.0
 
-            # 详细日志，方便确认路径是否正确
-            logger.info(
-                f"LKWANG88-Plugin: 监测到入库 [{mediainfo.title}]\n"
-                f"    - 目标路径: {target_path}\n"
-                f"    - 防抖倒计时: {delay_val} 秒 (当前队列: {len(self._pending_items)})"
-            )
-            
+            logger.info(f"LKWANG88-Plugin: 监测到入库，将在 {delay_val} 秒后推送路径: {target_path}")
             self._timer = threading.Timer(delay_val, self._flush_queue)
             self._timer.start()
+
+    def _convert_path(self, local_path: str) -> str:
+        """
+        核心逻辑：参考 CloudStrmCompanion 的 __get_path
+        将 MP 的路径转换为 Emby 容器内的路径
+        """
+        local_path_str = str(local_path)
+        for mp_path, emby_path in self._path_mapping.items():
+            if local_path_str.startswith(mp_path):
+                # 替换路径前缀
+                remote_path = local_path_str.replace(mp_path, emby_path, 1)
+                logger.debug(f"LKWANG88-Plugin: 路径映射 {local_path_str} -> {remote_path}")
+                return remote_path
+        return local_path_str
 
     def _flush_queue(self):
         with self._lock:
             if not self._pending_items:
                 return
-            items_to_refresh = list(self._pending_items)
+            # 去重：只保留唯一的路径
+            unique_paths = list(set([item.target_path for item in self._pending_items]))
             self._pending_items.clear()
             self._timer = None
 
-        # 打印本次刷新的摘要
-        titles = [item.title for item in items_to_refresh]
-        # 打印第一个项目的路径作为参考
-        sample_path = items_to_refresh[0].target_path if items_to_refresh else "无"
-        
-        logger.info(
-            f"LKWANG88-Plugin: 防抖结束，触发刷新\n"
-            f"    - 包含项目: {titles}\n"
-            f"    - 路径示例: {sample_path}"
-        )
+        logger.info(f"LKWANG88-Plugin: 防抖结束，准备推送 {len(unique_paths)} 个目录更新...")
         
         services = self.service_infos
         if not services:
@@ -227,17 +260,48 @@ class MediaServerRefresh88(_PluginBase):
             return
 
         for name, service in services.items():
+            # 仅支持 Emby/Jellyfin，Plex 机制不同
+            if service.type not in ['emby', 'jellyfin']:
+                logger.warning(f"LKWANG88-Plugin: {name} 不是 Emby/Jellyfin，跳过路径推送。")
+                continue
+
             try:
-                if hasattr(service.instance, 'refresh_library_by_items'):
-                    logger.info(f"LKWANG88-Plugin: 请求 {name} 刷新项目 ID...")
-                    service.instance.refresh_library_by_items(items_to_refresh)
-                elif hasattr(service.instance, 'refresh_root_library'):
-                    logger.info(f"{name} 不支持局部刷新，触发全库扫描...")
-                    service.instance.refresh_root_library()
-                else:
-                    logger.warning(f"{name} 未实现刷新接口")
+                # 获取 Emby 实例
+                emby_instance = service.instance
+                
+                # 遍历所有路径进行推送
+                for path in unique_paths:
+                    # 1. 路径映射转换
+                    final_path = self._convert_path(str(path))
+                    
+                    # 2. 构造 payload (参考 CloudStrmCompanion)
+                    payload = {
+                        "Updates": [
+                            {
+                                "Path": final_path,
+                                "UpdateType": "Created"
+                            }
+                        ]
+                    }
+                    
+                    logger.info(f"LKWANG88-Plugin: 向 {name} 推送路径更新 -> {final_path}")
+                    
+                    # 3. 直接调用 API (绕过 refresh_item 逻辑)
+                    # 这里的 url 路径是通用的，Emby 和 Jellyfin 都支持
+                    response = emby_instance.post_data(
+                        url='emby/Library/Media/Updated',
+                        data=json.dumps(payload),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    
+                    if response and response.status_code in [200, 204]:
+                        logger.info(f"LKWANG88-Plugin: {name} 响应成功 (204)")
+                    else:
+                        code = response.status_code if response else "Unknown"
+                        logger.error(f"LKWANG88-Plugin: {name} 响应失败: {code}")
+
             except Exception as e:
-                logger.error(f"刷新 {name} 失败: {e}")
+                logger.error(f"LKWANG88-Plugin: 推送失败 {name}: {e}")
 
     def _stop_timer(self):
         if self._timer and self._timer.is_alive():
