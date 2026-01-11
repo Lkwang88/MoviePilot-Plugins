@@ -12,14 +12,14 @@ from app.schemas.types import EventType
 
 # ----------------------------------------------------------------------------
 # Modified by: LKWANG88
-# Feature: 父目录刷新策略 + 人话日志 (Parent Directory Refresh + Detailed Logs)
+# Feature: 严格复刻原版路径逻辑 + 详细人话日志 (Strict Original Path + Detailed Logs)
 # ----------------------------------------------------------------------------
 
 class MediaServerRefresh88(_PluginBase):
     plugin_name = "媒体库刷新 (LKWANG88版)"
     plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 独立防抖版)。"
     plugin_icon = "refresh2.png"
-    plugin_version = "2.0.8"
+    plugin_version = "2.0.9"
     
     plugin_author = "LKWANG88"
     author_url = "https://github.com/jxxghp"
@@ -48,7 +48,7 @@ class MediaServerRefresh88(_PluginBase):
             self._pending_items.clear()
             
         if self._enabled:
-            logger.info(f"LKWANG88-Plugin: 独立防抖版已就绪，当前延迟设定: {self._delay}秒")
+            logger.info(f"LKWANG88-Plugin: 独立防抖版 (v2.0.9) 已就绪，延迟: {self._delay}秒")
 
     @property
     def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
@@ -168,16 +168,11 @@ class MediaServerRefresh88(_PluginBase):
         if not transferinfo or not transferinfo.target_diritem or not transferinfo.target_diritem.path:
             return
 
-        # 获取原始文件路径
-        file_path = Path(transferinfo.target_diritem.path)
-        
-        # [核心修改] 策略：不再刷新具体文件，而是刷新它的父目录（文件夹）
-        # 如果是电影：/Movie/Avatar/Avatar.mkv -> 刷新 /Movie/Avatar
-        # 如果是剧集：/TV/Show/Season 1/Ep01.mkv -> 刷新 /TV/Show/Season 1
-        # 这通常足以触发 Emby 的目录扫描。
-        target_path = file_path.parent
+        # [回归原版逻辑] 直接使用 target_diritem.path
+        # 这是最安全的做法，因为它能被 Emby 准确识别为 Item ID。
+        # 只要 Emby 开启了 Recursive=True（日志已确认开启），它就会扫描该 Item ID 下的所有关联路径。
+        target_path = Path(transferinfo.target_diritem.path)
 
-        # 构造对象
         item = RefreshMediaItem(
             title=mediainfo.title,
             year=mediainfo.year,
@@ -197,12 +192,11 @@ class MediaServerRefresh88(_PluginBase):
             
             if delay_val < 1: delay_val = 1.0
 
-            # [人话日志] 打印出具体的路径变化，方便排查
+            # 详细日志，方便确认路径是否正确
             logger.info(
                 f"LKWANG88-Plugin: 监测到入库 [{mediainfo.title}]\n"
-                f"    - 原始文件: {file_path}\n"
-                f"    - 计划刷新: {target_path} (父目录)\n"
-                f"    - 状态: 将在 {delay_val} 秒后执行 (当前队列: {len(self._pending_items)})"
+                f"    - 目标路径: {target_path}\n"
+                f"    - 防抖倒计时: {delay_val} 秒 (当前队列: {len(self._pending_items)})"
             )
             
             self._timer = threading.Timer(delay_val, self._flush_queue)
@@ -216,15 +210,14 @@ class MediaServerRefresh88(_PluginBase):
             self._pending_items.clear()
             self._timer = None
 
-        # [人话日志] 打印本次批量刷新的摘要
+        # 打印本次刷新的摘要
         titles = [item.title for item in items_to_refresh]
-        # 取出第一个路径作为示例显示
+        # 打印第一个项目的路径作为参考
         sample_path = items_to_refresh[0].target_path if items_to_refresh else "无"
         
         logger.info(
-            f"LKWANG88-Plugin: 防抖结束，开始执行刷新\n"
-            f"    - 项目数量: {len(items_to_refresh)}\n"
-            f"    - 涉及内容: {titles}\n"
+            f"LKWANG88-Plugin: 防抖结束，触发刷新\n"
+            f"    - 包含项目: {titles}\n"
             f"    - 路径示例: {sample_path}"
         )
         
@@ -236,7 +229,7 @@ class MediaServerRefresh88(_PluginBase):
         for name, service in services.items():
             try:
                 if hasattr(service.instance, 'refresh_library_by_items'):
-                    logger.info(f"LKWANG88-Plugin: 正在请求 {name} 刷新上述目录...")
+                    logger.info(f"LKWANG88-Plugin: 请求 {name} 刷新项目 ID...")
                     service.instance.refresh_library_by_items(items_to_refresh)
                 elif hasattr(service.instance, 'refresh_root_library'):
                     logger.info(f"{name} 不支持局部刷新，触发全库扫描...")
