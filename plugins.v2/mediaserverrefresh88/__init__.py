@@ -2,41 +2,37 @@ import threading
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 
+from app.log import logger
 from app.core.context import MediaInfo
 from app.core.event import eventmanager, Event
 from app.helper.mediaserver import MediaServerHelper
-from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import TransferInfo, RefreshMediaItem, ServiceInfo
 from app.schemas.types import EventType
 
 # ----------------------------------------------------------------------------
 # Modified by: LKWANG88
-# Feature: 严格复刻原版逻辑 + 异步防抖 (Strict Original Logic + Async Debounce)
+# Feature: 父目录刷新策略 + 人话日志 (Parent Directory Refresh + Detailed Logs)
 # ----------------------------------------------------------------------------
 
 class MediaServerRefresh88(_PluginBase):
-    # 插件基本信息
     plugin_name = "媒体库刷新 (LKWANG88版)"
     plugin_desc = "入库后自动刷新Emby/Jellyfin/Plex海报墙 (LKWANG88 独立防抖版)。"
     plugin_icon = "refresh2.png"
-    plugin_version = "2.0.7"
+    plugin_version = "2.0.8"
     
     plugin_author = "LKWANG88"
     author_url = "https://github.com/jxxghp"
     
-    # 独立的配置前缀
     plugin_config_prefix = "mediaserverrefresh88_"
     
     plugin_order = 14
     auth_level = 1
 
-    # 配置属性
     _enabled = False
     _delay = 0
     _target_servers = []
 
-    # 运行时属性
     _timer: Optional[threading.Timer] = None
     _pending_items: List[RefreshMediaItem] = []
     _lock = threading.Lock()
@@ -56,22 +52,16 @@ class MediaServerRefresh88(_PluginBase):
 
     @property
     def service_infos(self) -> Optional[Dict[str, ServiceInfo]]:
-        """
-        与原版逻辑保持高度一致的获取服务方式
-        """
         if not self._target_servers:
             return None
-        
         try:
             services = MediaServerHelper().get_services(name_filters=self._target_servers)
             if not services:
                 return None
-
             active_services = {}
             for service_name, service_info in services.items():
                 if service_info.instance and not service_info.instance.is_inactive():
                     active_services[service_name] = service_info
-            
             return active_services
         except Exception as e:
             logger.error(f"LKWANG88-Plugin: 获取媒体服务器列表失败: {e}")
@@ -178,48 +168,65 @@ class MediaServerRefresh88(_PluginBase):
         if not transferinfo or not transferinfo.target_diritem or not transferinfo.target_diritem.path:
             return
 
-        # [严格回归原版]：完全使用原版的数据结构，不多一个字，不少一个字
+        # 获取原始文件路径
+        file_path = Path(transferinfo.target_diritem.path)
+        
+        # [核心修改] 策略：不再刷新具体文件，而是刷新它的父目录（文件夹）
+        # 如果是电影：/Movie/Avatar/Avatar.mkv -> 刷新 /Movie/Avatar
+        # 如果是剧集：/TV/Show/Season 1/Ep01.mkv -> 刷新 /TV/Show/Season 1
+        # 这通常足以触发 Emby 的目录扫描。
+        target_path = file_path.parent
+
+        # 构造对象
         item = RefreshMediaItem(
             title=mediainfo.title,
             year=mediainfo.year,
             type=mediainfo.type,
             category=mediainfo.category,
-            target_path=Path(transferinfo.target_diritem.path),
+            target_path=target_path,
         )
 
         with self._lock:
-            # 1. 加入队列
             self._pending_items.append(item)
-            # 2. 停止旧计时器（实现防抖）
             self._stop_timer()
             
-            # 容错处理：确保延迟是有效数字
             try:
                 delay_val = float(self._delay)
             except (TypeError, ValueError):
                 delay_val = 5.0
             
-            if delay_val < 1: 
-                delay_val = 1.0
+            if delay_val < 1: delay_val = 1.0
 
-            logger.info(f"LKWANG88-Plugin: 监测到入库 [{mediainfo.title}]，将在 {delay_val} 秒后触发批量刷新 (当前队列: {len(self._pending_items)})")
-            # 3. 启动新计时器（替代原版的 sleep）
+            # [人话日志] 打印出具体的路径变化，方便排查
+            logger.info(
+                f"LKWANG88-Plugin: 监测到入库 [{mediainfo.title}]\n"
+                f"    - 原始文件: {file_path}\n"
+                f"    - 计划刷新: {target_path} (父目录)\n"
+                f"    - 状态: 将在 {delay_val} 秒后执行 (当前队列: {len(self._pending_items)})"
+            )
+            
             self._timer = threading.Timer(delay_val, self._flush_queue)
             self._timer.start()
 
     def _flush_queue(self):
-        """
-        真正执行刷新的工作线程
-        """
         with self._lock:
             if not self._pending_items:
                 return
-            # 复制并清空队列
             items_to_refresh = list(self._pending_items)
             self._pending_items.clear()
             self._timer = None
 
-        logger.info(f"LKWANG88-Plugin: 防抖结束，开始执行媒体库刷新，共 {len(items_to_refresh)} 个项目...")
+        # [人话日志] 打印本次批量刷新的摘要
+        titles = [item.title for item in items_to_refresh]
+        # 取出第一个路径作为示例显示
+        sample_path = items_to_refresh[0].target_path if items_to_refresh else "无"
+        
+        logger.info(
+            f"LKWANG88-Plugin: 防抖结束，开始执行刷新\n"
+            f"    - 项目数量: {len(items_to_refresh)}\n"
+            f"    - 涉及内容: {titles}\n"
+            f"    - 路径示例: {sample_path}"
+        )
         
         services = self.service_infos
         if not services:
@@ -228,9 +235,8 @@ class MediaServerRefresh88(_PluginBase):
 
         for name, service in services.items():
             try:
-                # 兼容原版逻辑的调用方式
                 if hasattr(service.instance, 'refresh_library_by_items'):
-                    logger.info(f"正在刷新 {name} ...")
+                    logger.info(f"LKWANG88-Plugin: 正在请求 {name} 刷新上述目录...")
                     service.instance.refresh_library_by_items(items_to_refresh)
                 elif hasattr(service.instance, 'refresh_root_library'):
                     logger.info(f"{name} 不支持局部刷新，触发全库扫描...")

@@ -79,7 +79,7 @@
     "name": "媒体库服务器刷新",
     "description": "入库后自动刷新Emby/Jellyfin/Plex服务器海报墙 (LKWANG88 定制防抖版)。",
     "labels": "媒体库",
-    "version": "2.0.7",
+    "version": "2.0.8",
     "icon": "refresh2.png",
     "author": "LKWANG88",
     "level": 1,
