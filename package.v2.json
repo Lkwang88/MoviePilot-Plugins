@@ -27,16 +27,16 @@
       "v2.0.1": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
     }
   },
-    "Lkwang88": {
-    "name": "Lkwang88",
-    "description": "基于CloudStrm的优化版：支持异步启动与聚合刷新，解决挂载卡顿与API轰炸问题。",
+    "MediaServerMsg-lkwang": {
+    "name": "MediaServerMsg-lkwang",
+    "description": "消息通知。",
     "labels": "媒体库,工具",
-    "version": "2.1.2",
-    "icon": "cloudcompanion.png",
+    "version": "1.9.5",
+    "icon": "mediaplay.png",
     "author": "lkwang88",
     "level": 1,
     "history": {
-      "v2.0.1": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
+      "v1.9.5": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
     }
   }
 }
