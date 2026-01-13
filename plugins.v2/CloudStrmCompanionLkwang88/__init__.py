@@ -63,7 +63,7 @@ class CloudStrmCompanionLkwang88(_PluginBase):
     # 作者主页
     author_url = ""
     # 插件配置项ID前缀
-    plugin_config_prefix = "lkwang88_"
+    plugin_config_prefix = "CloudStrmCompanionLkwang88_"
     # 加载顺序
     plugin_order = 26
     # 可使用的用户级别
