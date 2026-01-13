@@ -14,5 +14,17 @@
       "v1.3.1": "修复兼容性问题",
       "v1.3": "MoviePilot V2 版本媒体库服务器刷新插件"
     }
+  },
+    "CloudStrmCompanionLkwang88": {
+    "name": "strm刷新",
+    "description": "入库后自动刷新 (LKWANG88 定制防抖版)。",
+    "labels": "媒体库",
+    "version": "2.0.0",
+    "icon": "refresh2.png",
+    "author": "LKWANG88",
+    "level": 1,
+    "history": {
+      "v2.0.0": "重构核心逻辑，引入异步防抖机制，彻底解决线程阻塞与偶发失效问题。",
+      }
  }
 }
