@@ -16,15 +16,14 @@
     }
   },
     "CloudStrmCompanionLkwang88": {
-    "name": "strm刷新",
-    "description": "入库后自动刷新 (LKWANG88 定制防抖版)。",
-    "labels": "媒体库",
+    "description": "基于CloudStrm的优化版：支持异步启动与聚合刷新，解决挂载卡顿与API轰炸问题。",
+    "labels": "媒体库,工具",
     "version": "2.0.0",
-    "icon": "refresh2.png",
-    "author": "LKWANG88",
+    "icon": "cloudcompanion.png",
+    "author": "lkwang88",
     "level": 1,
     "history": {
-      "v2.0.0": "重构核心逻辑，引入异步防抖机制，彻底解决线程阻塞与偶发失效问题。"
-      }
- }
+      "v2.0.0": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
+    }
+  } 
 }
