@@ -18,7 +18,11 @@ from app.utils.web import WebUtils
 
 class wd99(_PluginBase):
     """
-    媒体服务器通知插件 (大师融合修复版)
+    媒体服务器通知插件 (大师融合终修版)
+    v1.9.8: 
+    1. 修复 '_aggregate_tv_episodes' 缺失导致的 AttributeError
+    2. 修复剧集ID识别为字符串 "None" 的BUG
+    3. 保留所有美化和聚合功能
     """
 
     # ==================== 常量定义 ====================
@@ -30,10 +34,9 @@ class wd99(_PluginBase):
     plugin_name = "媒体库通知(融合版)"
     plugin_desc = "基于Emby/Jellyfin/Plex的通知插件，支持防轰炸聚合与丰富元数据展示。"
     plugin_icon = "mediaplay.png"
-    plugin_version = "1.9.7"
+    plugin_version = "1.9.8"
     plugin_author = "MP插件大师"
     author_url = "https://github.com/jxxghp"
-    # 配置隔离，允许与官方版共存
     plugin_config_prefix = "mediaservermsg_pro_" 
     plugin_order = 13
     auth_level = 1
@@ -196,7 +199,6 @@ class wd99(_PluginBase):
             if not event_info:
                 return
 
-            # 类型检查
             event_type = str(getattr(event_info, 'event', ''))
             if not event_type:
                 return
@@ -206,7 +208,7 @@ class wd99(_PluginBase):
             # 检查配置
             if not self._mediaservers:
                 if "test" not in event_type.lower():
-                    logger.error("【融合版】拦截: 未配置媒体服务器，请检查插件设置")
+                    logger.error("【融合版】拦截: 未配置媒体服务器")
                     return
             elif event_info.server_name and event_info.server_name not in self._mediaservers:
                 logger.info(f"【融合版】拦截: 服务器 {event_info.server_name} 未勾选")
@@ -235,7 +237,7 @@ class wd99(_PluginBase):
                 self._add_key_cache(expiring_key)
                 return
 
-            # 处理逻辑
+            # 路由处理
             if "test" in event_type.lower():
                 self._handle_test_event(event_info)
                 return
@@ -244,12 +246,14 @@ class wd99(_PluginBase):
                 return
 
             if self._should_aggregate_tv(event_info):
-                # !!! 这里的调用之前报错，现在 _get_series_id 已补全 !!!
+                # 获取ID并校验
                 series_id = self._get_series_id(event_info)
                 if series_id:
                     logger.info(f"【融合版】加入聚合队列: {series_id}")
                     self._aggregate_tv_episodes(series_id, event_info)
                     return
+                else:
+                    logger.warning("【融合版】无法获取SeriesID，跳过聚合，转为单条发送")
 
             self._process_single_media_event(event_info, expiring_key)
 
@@ -267,12 +271,33 @@ class wd99(_PluginBase):
             return False
         return True
 
-    # !!! 之前缺失的方法，已补全 !!!
+    # ========== 修复点：添加了之前缺失的 _aggregate_tv_episodes 方法 ==========
+    def _aggregate_tv_episodes(self, series_id: str, event_info: WebhookEventInfo):
+        if series_id not in self._pending_messages:
+            self._pending_messages[series_id] = []
+        
+        self._pending_messages[series_id].append(event_info)
+        
+        if series_id in self._aggregate_timers:
+            try:
+                self._aggregate_timers[series_id].cancel()
+            except: pass
+        
+        timer = threading.Timer(self._aggregate_time, self._send_aggregated_message, [series_id])
+        self._aggregate_timers[series_id] = timer
+        timer.start()
+
+    # ========== 修复点：修复 None 转换成字符串 "None" 的逻辑错误 ==========
     def _get_series_id(self, event_info: WebhookEventInfo) -> Optional[str]:
         if event_info.json_object and isinstance(event_info.json_object, dict):
             item = event_info.json_object.get("Item", {})
-            return str(item.get("SeriesId") or item.get("SeriesName"))
-        return getattr(event_info, "series_id", None)
+            val = item.get("SeriesId") or item.get("SeriesName")
+            if val:
+                return str(val)
+        
+        # 只有当 series_id 真实存在时才返回，否则返回 None
+        sid = getattr(event_info, "series_id", None)
+        return str(sid) if sid else None
 
     def _process_single_media_event(self, event_info: WebhookEventInfo, expiring_key: str):
         logger.info(f"【融合版】处理单条消息: {event_info.item_name}")
@@ -333,7 +358,7 @@ class wd99(_PluginBase):
             image=image_url,
             link=play_link
         )
-        if ret: logger.info("【融合版】消息已推送到MP")
+        if ret: logger.info("【融合版】单条消息已推送")
 
     def _send_aggregated_message(self, series_id: str):
         if series_id not in self._pending_messages: return
@@ -349,7 +374,7 @@ class wd99(_PluginBase):
             self._process_single_media_event(msg_list[0], fake_key)
             return
 
-        logger.info(f"【融合版】发送聚合消息，共 {len(msg_list)} 条")
+        logger.info(f"【融合版】处理聚合消息: 数量 {len(msg_list)}")
         
         first_info = msg_list[0]
         count = len(msg_list)
@@ -387,13 +412,14 @@ class wd99(_PluginBase):
         image_url = self._get_image_url(first_info, tmdb_info)
         play_link = self._get_play_link(first_info) if self._add_play_link else None
 
-        self.post_message(
+        ret = self.post_message(
             mtype=NotificationType.MediaServer,
             title=message_title,
             text="\n" + "\n".join(message_texts),
             image=image_url,
             link=play_link
         )
+        if ret: logger.info("【融合版】聚合消息已推送")
 
     # ==================== 辅助方法 ====================
 
