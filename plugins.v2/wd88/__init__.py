@@ -49,7 +49,7 @@ class FileMonitorHandler(FileSystemEventHandler):
                                 mon_path=self._watch_path, event_path=event.dest_path)
 
 
-class Wd88(_PluginBase):
+class wd88(_PluginBase):
     # 插件名称
     plugin_name = "wd88"
     # 插件描述
@@ -195,6 +195,7 @@ class Wd88(_PluginBase):
                 self._format_conf[local_dir] = format_str
                 self._category_conf[local_dir] = category
 
+                # 优化：不在此处直接启动 observer
                 try:
                     if strm_dir and Path(strm_dir).is_relative_to(Path(local_dir)):
                         logger.warn(f"{strm_dir} 是 {local_dir} 的子目录，无法监控")
@@ -697,6 +698,10 @@ class Wd88(_PluginBase):
             },
         ]
 
+    # 关键修复：添加 get_api 方法
+    def get_api(self) -> List[Dict[str, Any]]:
+        return []
+
     def get_service(self) -> List[Dict[str, Any]]:
         return []
 
@@ -1006,7 +1011,7 @@ class Wd88(_PluginBase):
                                             'clearable': True,
                                             'model': 'mediaservers',
                                             'label': '媒体服务器',
-                                            'items': emby_items  # 使用安全获取的列表
+                                            'items': emby_items  # 这里使用了安全获取的列表
                                         }
                                     }
                                 ]
