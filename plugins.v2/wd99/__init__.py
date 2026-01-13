@@ -18,28 +18,24 @@ from app.utils.web import WebUtils
 
 class wd99(_PluginBase):
     """
-    媒体服务器通知插件 (大师融合版)
-    功能：
-    1. 基于官方版稳定性底座，保留防轰炸聚合。
-    2. 移植AI版的高颜值排版(Emoji/演员/评分/地区)。
-    3. 修复TG发送失败BUG(移除标题Markdown)。
-    4. 增强元数据获取能力(主动查询Emby)。
+    媒体服务器通知插件 (大师融合版 - Debug增强)
     """
 
     # ==================== 常量定义 ====================
-    DEFAULT_EXPIRATION_TIME = 600                  # 默认过期时间（秒）
-    DEFAULT_AGGREGATE_TIME = 15                    # 默认聚合时间（秒）
-    DEFAULT_OVERVIEW_MAX_LENGTH = 150              # 默认简介最大长度
+    DEFAULT_EXPIRATION_TIME = 600
+    DEFAULT_AGGREGATE_TIME = 15
+    DEFAULT_OVERVIEW_MAX_LENGTH = 150
 
     # ==================== 插件基本信息 ====================
-    plugin_name = "媒体库服务器通知"
+    plugin_name = "媒体库通知(融合版)"  # 修改名字以区分官方版
     plugin_desc = "基于Emby/Jellyfin/Plex的通知插件，支持防轰炸聚合与丰富元数据展示。"
     plugin_icon = "mediaplay.png"
-    plugin_version = "1.9.5"
-    plugin_author = "lkwang88"
+    plugin_version = "1.9.6"
+    plugin_author = "MP插件大师"
     author_url = "https://github.com/jxxghp"
-    plugin_config_prefix = "Media88_"
-    plugin_order = 14
+    # !!! 关键修改：修改配置前缀，防止与官方版配置冲突/共享导致错乱 !!!
+    plugin_config_prefix = "mediaservermsg_pro_" 
+    plugin_order = 13 # 调整顺序
     auth_level = 1
 
     # ==================== 插件配置 ====================
@@ -51,13 +47,11 @@ class wd99(_PluginBase):
     _aggregate_enabled = True
     _aggregate_time = DEFAULT_AGGREGATE_TIME
     _overview_max_length = DEFAULT_OVERVIEW_MAX_LENGTH
-    _smart_category_enabled = True  # 启用智能分类
+    _smart_category_enabled = True
 
-    # 聚合相关
     _pending_messages = {}
     _aggregate_timers = {}
 
-    # Webhook事件映射
     _webhook_actions = {
         "library.new": "已入库",
         "system.webhooktest": "测试",
@@ -79,14 +73,12 @@ class wd99(_PluginBase):
         "PlaybackStop": "停止播放"
     }
 
-    # 媒体服务器图标 (使用Code1的高清图标源)
     _webhook_images = {
         "emby": "https://raw.githubusercontent.com/qqcomeup/MoviePilot-Plugins/bb3ca257f74cf000640f9ebadab257bb0850baac/icons/11-11.jpg",
         "plex": "https://raw.githubusercontent.com/qqcomeup/MoviePilot-Plugins/bb3ca257f74cf000640f9ebadab257bb0850baac/icons/11-11.jpg",
         "jellyfin": "https://raw.githubusercontent.com/qqcomeup/MoviePilot-Plugins/bb3ca257f74cf000640f9ebadab257bb0850baac/icons/11-11.jpg"
     }
 
-    # 国家/地区代码映射
     _country_cn_map = {
         'CN': '中国大陆', 'US': '美国', 'JP': '日本', 'KR': '韩国',
         'HK': '中国香港', 'TW': '中国台湾', 'GB': '英国', 'FR': '法国',
@@ -101,7 +93,6 @@ class wd99(_PluginBase):
     def __init__(self):
         super().__init__()
         self.category = CategoryHelper()
-        logger.debug("媒体服务器消息插件(大师融合版)初始化完成")
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -114,8 +105,7 @@ class wd99(_PluginBase):
             self._smart_category_enabled = config.get("smart_category_enabled", True)
 
     def service_infos(self, type_filter: Optional[str] = None) -> Optional[Dict[str, ServiceInfo]]:
-        if not self._mediaservers:
-            return None
+        # 这里不做非空检查，为了能输出“配置为空”的日志
         services = MediaServerHelper().get_services(type_filter=type_filter, name_filters=self._mediaservers)
         if not services:
             return None
@@ -208,22 +198,44 @@ class wd99(_PluginBase):
                 return
 
             # 类型检查
-            event_type = getattr(event_info, 'event', None)
+            event_type = str(getattr(event_info, 'event', ''))
             if not event_type:
                 return
             
+            # ========== 调试日志入口 ==========
+            logger.info(f"【融合版】收到Webhook事件: {event_type} 来自 {event_info.server_name}")
+
+            # 检查1：服务器配置
+            # 如果配置为空，且不是测试消息，则报错
+            if not self._mediaservers:
+                # 只有系统测试允许未配置服务器通过，否则拦截
+                if "test" not in event_type.lower():
+                    logger.error("【融合版】拦截: 未在插件配置中勾选任何'媒体服务器'，请前往设置！")
+                    return
+            elif event_info.server_name and event_info.server_name not in self._mediaservers:
+                logger.info(f"【融合版】拦截: 服务器 {event_info.server_name} 未在配置的允许列表中")
+                return
+
+            # 检查2：消息类型配置
             allowed_types = set()
             for _type in self._types:
                 allowed_types.update(_type.split("|"))
-            if event_type not in allowed_types:
+            
+            # 强制允许测试消息通过检查
+            if "test" in event_type.lower():
+                pass 
+            elif event_type not in allowed_types:
+                # 只有当非测试消息，且不在列表时才拦截
+                # 很多时候无输出是因为这里被拦截了
+                logger.info(f"【融合版】拦截: 类型 {event_type} 未勾选，当前允许: {allowed_types}")
                 return
 
-            # 服务器检查
-            server_name = getattr(event_info, 'server_name', None)
-            if server_name and not self.service_info(name=server_name):
-                return
+            # 检查3：服务器实例连接
+            if event_info.server_name and not self.service_info(name=event_info.server_name):
+                # 仅警告，不强行return，防止名字不匹配导致无法测试
+                logger.warning(f"【融合版】警告: 无法获取服务器 {event_info.server_name} 的连接实例，部分元数据可能无法获取")
 
-            # 防重复逻辑 (针对停止播放)
+            # 防重复逻辑
             item_id = getattr(event_info, 'item_id', '')
             client = getattr(event_info, 'client', '')
             user_name = getattr(event_info, 'user_name', '')
@@ -231,30 +243,32 @@ class wd99(_PluginBase):
             
             self._clean_expired_cache()
             
-            if "stop" in str(event_type).lower() and expiring_key in self._webhook_msg_keys:
+            if "stop" in event_type.lower() and expiring_key in self._webhook_msg_keys:
+                logger.info(f"【融合版】拦截: 重复的停止播放事件")
                 self._add_key_cache(expiring_key)
                 return
 
-            # 1. 登录/系统测试等非媒体消息
-            if "test" in str(event_type).lower():
+            # 分发处理
+            if "test" in event_type.lower():
                 self._handle_test_event(event_info)
                 return
-            if "user.authentic" in str(event_type).lower():
+            if "user.authentic" in event_type.lower():
                 self._handle_login_event(event_info)
                 return
 
-            # 2. 剧集聚合处理
             if self._should_aggregate_tv(event_info):
                 series_id = self._get_series_id(event_info)
                 if series_id:
+                    logger.info(f"【融合版】加入聚合队列: {series_id}")
                     self._aggregate_tv_episodes(series_id, event_info)
                     return
 
-            # 3. 常规单条媒体消息处理 (电影、单集、播放停止等)
             self._process_single_media_event(event_info, expiring_key)
 
         except Exception as e:
-            logger.error(f"发送消息异常: {str(e)}")
+            logger.error(f"【融合版】发送消息异常: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     def _should_aggregate_tv(self, event_info: WebhookEventInfo) -> bool:
         if not self._aggregate_enabled:
@@ -266,24 +280,20 @@ class wd99(_PluginBase):
         return True
 
     def _process_single_media_event(self, event_info: WebhookEventInfo, expiring_key: str):
-        """处理单条媒体消息"""
+        logger.info(f"【融合版】处理单条消息: {event_info.item_name}")
         
-        # 1. 尝试获取TmdbID，如果缺失则主动查询服务器
         tmdb_id = self._ensure_tmdb_id(event_info)
         event_info.tmdb_id = tmdb_id
         
-        # 2. 获取TMDB详细元数据
         tmdb_info = None
         if tmdb_id:
             mtype = MediaType.MOVIE if event_info.item_type == "MOV" else MediaType.TV
             tmdb_info = self._get_tmdb_info_cached(tmdb_id, mtype, event_info.season_id)
 
-        # 3. 构建标题 (纯文本，防止TG报错)
         title_name = event_info.item_name
         if event_info.item_type in ["TV", "SHOW"] and event_info.json_object:
             title_name = event_info.json_object.get('Item', {}).get('SeriesName') or title_name
         
-        # 年份
         year = tmdb_info.get('year') if tmdb_info else None
         if not year and event_info.json_object:
             year = event_info.json_object.get('Item', {}).get('ProductionYear')
@@ -295,93 +305,75 @@ class wd99(_PluginBase):
         
         message_title = f"{title_name} {action_cn} {server_cn}"
 
-        # 4. 构建消息体
         message_texts = []
         message_texts.append(f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
 
-        # 智能分类
         category = self._get_smart_category(event_info, tmdb_info)
         if category:
             message_texts.append(f"📂 分类：{category}")
 
-        # 季集信息
         self._append_season_episode_info(message_texts, event_info, title_name)
-        
-        # 评分/地区/状态
         self._append_meta_info(message_texts, tmdb_info)
-        
-        # 类型/演员
         self._append_genres_actors(message_texts, tmdb_info)
 
-        # 简介
         overview = self._get_overview(event_info, tmdb_info)
         if overview:
             message_texts.append("\n━━━━━━━━━━━━━━━━━━\n") 
             message_texts.append(f"📖 剧情简介\n{overview}")
 
-        # 附加信息(用户/IP等)
         self._append_extra_info(message_texts, event_info)
 
-        # 图片处理
         image_url = self._get_image_url(event_info, tmdb_info)
-        
-        # 链接处理 (只添加Link参数，不修改Title)
         play_link = self._get_play_link(event_info) if self._add_play_link else None
         
-        # 记录缓存(防止停止播放刷屏)
         if "stop" in str(event_info.event).lower():
             self._add_key_cache(expiring_key)
         elif "start" in str(event_info.event).lower():
             self._remove_key_cache(expiring_key)
 
-        # 发送
-        self.post_message(
+        ret = self.post_message(
             mtype=NotificationType.MediaServer,
             title=message_title,
             text="\n" + "\n".join(message_texts),
             image=image_url,
             link=play_link
         )
+        if ret:
+            logger.info("【融合版】消息推送请求已发送")
+        else:
+            logger.error("【融合版】消息推送失败，请检查系统通知设置")
 
     def _send_aggregated_message(self, series_id: str):
-        """发送聚合的TV消息"""
-        if series_id not in self._pending_messages:
-            return
+        if series_id not in self._pending_messages: return
         
         msg_list = self._pending_messages.pop(series_id)
         if series_id in self._aggregate_timers:
             self._aggregate_timers.pop(series_id, None)
             
-        if not msg_list:
-            return
+        if not msg_list: return
 
-        # 如果只有一条，走单条处理流程
         if len(msg_list) == 1:
-            # 伪造一个key
             fake_key = f"{msg_list[0].item_id}-agg-{time.time()}"
             self._process_single_media_event(msg_list[0], fake_key)
             return
 
-        # 多条聚合
+        logger.info(f"【融合版】处理聚合消息: 数量 {len(msg_list)}")
+        
         first_info = msg_list[0]
         count = len(msg_list)
         
-        # 主动完善TmdbID
         tmdb_id = self._ensure_tmdb_id(first_info)
         tmdb_info = None
         if tmdb_id:
             tmdb_info = self._get_tmdb_info_cached(tmdb_id, MediaType.TV)
 
-        # 标题
         title_name = first_info.item_name
         if first_info.json_object:
             title_name = first_info.json_object.get('Item', {}).get('SeriesName') or title_name
         
         server_cn = self._get_server_name_cn(first_info)
-        
         message_title = f"{title_name} 已入库 (含{count}个文件) {server_cn}"
 
-        # 内容
         message_texts = []
         message_texts.append(f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
         
@@ -389,7 +381,6 @@ class wd99(_PluginBase):
         if category:
             message_texts.append(f"📂 分类：{category}")
 
-        # 合并集数
         episodes_str = self._merge_continuous_episodes(msg_list)
         message_texts.append(f"📺 季集：{episodes_str}")
 
@@ -412,39 +403,28 @@ class wd99(_PluginBase):
             link=play_link
         )
 
-    # ==================== 辅助方法 (移植自Code1并优化) ====================
+    # ==================== 辅助方法 ====================
 
     def _ensure_tmdb_id(self, event_info: WebhookEventInfo) -> Optional[str]:
-        """确保获取到TmdbID，如果Event中没有，则调用API查询"""
-        # 1. 尝试从事件本身获取
-        if event_info.tmdb_id:
-            return str(event_info.tmdb_id)
-        
+        if event_info.tmdb_id: return str(event_info.tmdb_id)
         if event_info.json_object:
             pids = event_info.json_object.get('Item', {}).get('ProviderIds', {})
-            if pids.get('Tmdb'):
-                return str(pids.get('Tmdb'))
-            
+            if pids.get('Tmdb'): return str(pids.get('Tmdb'))
         if event_info.item_path:
             if match := re.search(r'[\[{](?:tmdbid|tmdb)[=-](\d+)[\]}]', event_info.item_path, re.IGNORECASE):
                 return match.group(1)
-        
-        # 2. 尝试从Emby服务器查询 (Code 2 逻辑增强)
         try:
             if event_info.server_name and event_info.item_id:
                 service_info = self.service_info(event_info.server_name)
                 if service_info and service_info.instance:
-                    # 使用封装好的get_iteminfo
                     info = service_info.instance.get_iteminfo(event_info.item_id)
-                    if info and info.tmdbid:
-                        return str(info.tmdbid)
-        except Exception as e:
-            logger.debug(f"主动查询TmdbID失败: {e}")
-            
+                    if info and info.tmdbid: return str(info.tmdbid)
+        except: pass
         return None
 
     def _handle_test_event(self, event_info: WebhookEventInfo):
-        title = f"🔔 媒体服务器通知测试"
+        logger.info("【融合版】处理测试消息")
+        title = f"🔔 媒体服务器通知测试(融合版)"
         server_name = self._get_server_name_cn(event_info)
         texts = [
             f"来自：{server_name}",
@@ -454,12 +434,13 @@ class wd99(_PluginBase):
         if event_info.user_name:
             texts.append(f"用户：{event_info.user_name}")
             
-        self.post_message(
+        ret = self.post_message(
             mtype=NotificationType.MediaServer,
             title=title,
             text="\n".join(texts),
             image=self._webhook_images.get(event_info.channel)
         )
+        if ret: logger.info("【融合版】测试消息已发出")
 
     def _handle_login_event(self, event_info: WebhookEventInfo):
         action = "登录成功" if "authenticated" in event_info.event and "failed" not in event_info.event else "登录失败"
@@ -494,7 +475,6 @@ class wd99(_PluginBase):
         return server_name
 
     def _get_smart_category(self, event_info, tmdb_info):
-        """智能分类获取"""
         category = None
         if self._smart_category_enabled and tmdb_info:
             try:
@@ -503,8 +483,6 @@ class wd99(_PluginBase):
                 else:
                     category = self.category.get_tv_category(tmdb_info)
             except: pass
-        
-        # 路径降级回退
         if not category:
             is_folder = event_info.json_object.get('Item', {}).get('IsFolder', False) if event_info.json_object else False
             category = self._get_category_from_path(event_info.item_path, event_info.item_type, is_folder)
@@ -540,7 +518,6 @@ class wd99(_PluginBase):
         if tmdb_info.get('vote_average'):
             texts.append(f"⭐️ 评分：{round(float(tmdb_info.get('vote_average')), 1)}/10")
         
-        # 地区
         region = ""
         try:
             countries = tmdb_info.get('origin_country') or tmdb_info.get('production_countries') or []
@@ -556,7 +533,6 @@ class wd99(_PluginBase):
         if region:
             texts.append(f"🏳️ 地区：{region}")
 
-        # 状态
         status = tmdb_info.get('status')
         if status:
             status_map = {'Ended': '已完结', 'Returning Series': '连载中', 'Canceled': '已取消', 'In Production': '制作中', 'Planned': '计划中', 'Released': '已上映', 'Continuing': '连载中'}
@@ -599,23 +575,17 @@ class wd99(_PluginBase):
         return text
 
     def _get_image_url(self, event_info, tmdb_info):
-        # 优先使用TMDB图片
         if tmdb_info:
             if event_info.item_type == "MOV":
                 if tmdb_info.get('poster_path'):
                     return f"https://{settings.TMDB_IMAGE_DOMAIN}/t/p/original{tmdb_info.get('poster_path')}"
             else:
-                # 剧集优先背景图
                 if tmdb_info.get('backdrop_path'):
                     return f"https://{settings.TMDB_IMAGE_DOMAIN}/t/p/original{tmdb_info.get('backdrop_path')}"
                 elif tmdb_info.get('poster_path'):
                     return f"https://{settings.TMDB_IMAGE_DOMAIN}/t/p/original{tmdb_info.get('poster_path')}"
-        
-        # 其次使用事件自带图片
         if event_info.image_url:
             return event_info.image_url
-            
-        # 兜底
         return self._webhook_images.get(event_info.channel)
 
     def _get_play_link(self, event_info: WebhookEventInfo) -> Optional[str]:
@@ -623,29 +593,7 @@ class wd99(_PluginBase):
         service = self.service_info(event_info.server_name)
         return service.instance.get_play_url(event_info.item_id) if service else None
 
-    # ==================== 聚合/缓存逻辑 ====================
-
-    def _aggregate_tv_episodes(self, series_id: str, event_info: WebhookEventInfo):
-        if series_id not in self._pending_messages:
-            self._pending_messages[series_id] = []
-        
-        self._pending_messages[series_id].append(event_info)
-        
-        if series_id in self._aggregate_timers:
-            self._aggregate_timers[series_id].cancel()
-        
-        timer = threading.Timer(self._aggregate_time, self._send_aggregated_message, [series_id])
-        self._aggregate_timers[series_id] = timer
-        timer.start()
-
-    def _get_series_id(self, event_info: WebhookEventInfo) -> Optional[str]:
-        if event_info.json_object and isinstance(event_info.json_object, dict):
-            item = event_info.json_object.get("Item", {})
-            return str(item.get("SeriesId") or item.get("SeriesName"))
-        return getattr(event_info, "series_id", None)
-
     def _merge_continuous_episodes(self, events: List[WebhookEventInfo]) -> str:
-        """合并连续集数"""
         season_episodes = {}
         for event in events:
             s, e = None, None
@@ -692,7 +640,6 @@ class wd99(_PluginBase):
             info = self.chain.tmdb_info(tmdbid=tmdb_id, mtype=mtype, season=season)
             base_info = self.chain.tmdb_info(tmdbid=tmdb_id, mtype=mtype)
             if info and base_info:
-                # 兼容合并
                 return {**base_info, **info}
             return info or base_info
 
@@ -709,7 +656,6 @@ class wd99(_PluginBase):
         for k in expired: self._webhook_msg_keys.pop(k, None)
 
     def stop_service(self):
-        """退出清理"""
         try:
             for series_id in list(self._pending_messages.keys()):
                 self._send_aggregated_message(series_id)

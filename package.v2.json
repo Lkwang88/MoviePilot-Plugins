@@ -28,15 +28,15 @@
     }
   },
     "wd99": {
-    "name": "Medialkwang",
+    "name": "媒体库通知(融合版)",
     "description": "消息通知。",
     "labels": "媒体库,工具",
-    "version": "1.9.5",
+    "version": "1.9.6",
     "icon": "mediaplay.png",
     "author": "lkwang88",
     "level": 1,
     "history": {
-      "v1.9.5": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
+      "v1.9.6": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
     }
   },
     "Media88": {
