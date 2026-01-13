@@ -34,7 +34,7 @@ class wd99(_PluginBase):
     plugin_name = "媒体库通知(融合版)"
     plugin_desc = "基于Emby/Jellyfin/Plex的通知插件，支持防轰炸聚合与丰富元数据展示。"
     plugin_icon = "mediaplay.png"
-    plugin_version = "1.9.8"
+    plugin_version = "1.9.9"
     plugin_author = "MP插件大师"
     author_url = "https://github.com/jxxghp"
     plugin_config_prefix = "mediaservermsg_pro_" 
