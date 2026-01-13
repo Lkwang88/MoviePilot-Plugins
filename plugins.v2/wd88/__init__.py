@@ -57,7 +57,7 @@ class wd88(_PluginBase):
     # 插件图标
     plugin_icon = "cloudcompanion.png"
     # 插件版本
-    plugin_version = "2.1.2"
+    plugin_version = "2.1.3"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -698,19 +698,19 @@ class wd88(_PluginBase):
             },
         ]
 
-    # 关键修复：添加 get_api 方法
+    # 【重要】严格按照基类要求实现
     def get_api(self) -> List[Dict[str, Any]]:
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
         return []
 
+    # 【重要】保留防止配置页崩溃的 try-except 优化
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        # 确保 helper 已初始化
         if not self.mediaserver_helper:
             self.mediaserver_helper = MediaServerHelper()
         
-        # 安全获取 emby 服务器列表，防止报错导致整个配置页白屏
+        # 安全获取 emby 服务器列表
         emby_items = []
         try:
             configs = self.mediaserver_helper.get_configs()
@@ -1011,7 +1011,7 @@ class wd88(_PluginBase):
                                             'clearable': True,
                                             'model': 'mediaservers',
                                             'label': '媒体服务器',
-                                            'items': emby_items  # 这里使用了安全获取的列表
+                                            'items': emby_items  # 使用安全获取的列表
                                         }
                                     }
                                 ]
@@ -1142,6 +1142,10 @@ class wd88(_PluginBase):
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",
             "path_replacements": ""
         }
+
+    # 【关键修复】补充完整的 get_page 方法，即使为空也必须实现
+    def get_page(self) -> List[dict]:
+        pass
 
     def stop_service(self):
         if self._observer:
