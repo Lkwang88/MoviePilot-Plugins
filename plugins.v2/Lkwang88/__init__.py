@@ -49,7 +49,7 @@ class FileMonitorHandler(FileSystemEventHandler):
                                 mon_path=self._watch_path, event_path=event.dest_path)
 
 
-class CloudStrmCompanionLkwang88(_PluginBase):
+class Lkwang88(_PluginBase):
     # 插件名称
     plugin_name = "CloudStrmCompanionLkwang88"
     # 插件描述
@@ -63,7 +63,7 @@ class CloudStrmCompanionLkwang88(_PluginBase):
     # 作者主页
     author_url = ""
     # 插件配置项ID前缀
-    plugin_config_prefix = "CloudStrmCompanionLkwang88_"
+    plugin_config_prefix = "Lkwang88_"
     # 加载顺序
     plugin_order = 26
     # 可使用的用户级别

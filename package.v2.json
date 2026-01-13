@@ -15,7 +15,7 @@
       "v1.3": "MoviePilot V2 版本媒体库服务器刷新插件"
     }
   },
-    "CloudStrmCompanionLkwang88": {
+    "Lkwang88": {
     "name": "CloudStrmCompanionLkwang88",
     "description": "基于CloudStrm的优化版：支持异步启动与聚合刷新，解决挂载卡顿与API轰炸问题。",
     "labels": "媒体库,工具",
