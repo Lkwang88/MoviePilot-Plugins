@@ -16,7 +16,7 @@
     }
   },
     "Lkwang88": {
-    "name": "CloudStrmCompanionLkwang88",
+    "name": "Lkwang88",
     "description": "基于CloudStrm的优化版：支持异步启动与聚合刷新，解决挂载卡顿与API轰炸问题。",
     "labels": "媒体库,工具",
     "version": "2.0.1",

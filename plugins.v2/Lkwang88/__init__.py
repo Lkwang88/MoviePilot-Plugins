@@ -51,7 +51,7 @@ class FileMonitorHandler(FileSystemEventHandler):
 
 class Lkwang88(_PluginBase):
     # 插件名称
-    plugin_name = "CloudStrmCompanionLkwang88"
+    plugin_name = "Lkwang88"
     # 插件描述
     plugin_desc = "基于CloudStrm的优化版：支持异步启动与聚合刷新。"
     # 插件图标
