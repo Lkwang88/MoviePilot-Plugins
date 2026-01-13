@@ -483,6 +483,10 @@ class wd99(_PluginBase):
         )
 
     def _get_server_name_cn(self, event_info):
+        # ———— 强制自定义名称区域 ————
+        # 你可以在这里直接返回你想要的名字，无视 Emby 的设置
+        return "芙服" 
+        # ————————————————————————
         server_name = ""
         if event_info.json_object and isinstance(event_info.json_object.get('Server'), dict):
             server_name = event_info.json_object.get('Server', {}).get('Name')
