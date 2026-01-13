@@ -28,7 +28,7 @@
     }
   },
     "Media88": {
-    "name": "MediaServerMsg-lkwang",
+    "name": "Media88",
     "description": "消息通知。",
     "labels": "媒体库,工具",
     "version": "1.9.5",
