@@ -18,7 +18,7 @@ from app.utils.web import WebUtils
 
 class wd99(_PluginBase):
     """
-    媒体服务器通知插件 (大师融合版 - Debug增强)
+    媒体服务器通知插件 (大师融合修复版)
     """
 
     # ==================== 常量定义 ====================
@@ -27,15 +27,15 @@ class wd99(_PluginBase):
     DEFAULT_OVERVIEW_MAX_LENGTH = 150
 
     # ==================== 插件基本信息 ====================
-    plugin_name = "媒体库通知(融合版)"  # 修改名字以区分官方版
+    plugin_name = "媒体库通知(融合版)"
     plugin_desc = "基于Emby/Jellyfin/Plex的通知插件，支持防轰炸聚合与丰富元数据展示。"
     plugin_icon = "mediaplay.png"
-    plugin_version = "1.9.6"
+    plugin_version = "1.9.7"
     plugin_author = "MP插件大师"
     author_url = "https://github.com/jxxghp"
-    # !!! 关键修改：修改配置前缀，防止与官方版配置冲突/共享导致错乱 !!!
+    # 配置隔离，允许与官方版共存
     plugin_config_prefix = "mediaservermsg_pro_" 
-    plugin_order = 13 # 调整顺序
+    plugin_order = 13
     auth_level = 1
 
     # ==================== 插件配置 ====================
@@ -105,7 +105,6 @@ class wd99(_PluginBase):
             self._smart_category_enabled = config.get("smart_category_enabled", True)
 
     def service_infos(self, type_filter: Optional[str] = None) -> Optional[Dict[str, ServiceInfo]]:
-        # 这里不做非空检查，为了能输出“配置为空”的日志
         services = MediaServerHelper().get_services(type_filter=type_filter, name_filters=self._mediaservers)
         if not services:
             return None
@@ -202,40 +201,28 @@ class wd99(_PluginBase):
             if not event_type:
                 return
             
-            # ========== 调试日志入口 ==========
             logger.info(f"【融合版】收到Webhook事件: {event_type} 来自 {event_info.server_name}")
 
-            # 检查1：服务器配置
-            # 如果配置为空，且不是测试消息，则报错
+            # 检查配置
             if not self._mediaservers:
-                # 只有系统测试允许未配置服务器通过，否则拦截
                 if "test" not in event_type.lower():
-                    logger.error("【融合版】拦截: 未在插件配置中勾选任何'媒体服务器'，请前往设置！")
+                    logger.error("【融合版】拦截: 未配置媒体服务器，请检查插件设置")
                     return
             elif event_info.server_name and event_info.server_name not in self._mediaservers:
-                logger.info(f"【融合版】拦截: 服务器 {event_info.server_name} 未在配置的允许列表中")
+                logger.info(f"【融合版】拦截: 服务器 {event_info.server_name} 未勾选")
                 return
 
-            # 检查2：消息类型配置
             allowed_types = set()
             for _type in self._types:
                 allowed_types.update(_type.split("|"))
             
-            # 强制允许测试消息通过检查
             if "test" in event_type.lower():
                 pass 
             elif event_type not in allowed_types:
-                # 只有当非测试消息，且不在列表时才拦截
-                # 很多时候无输出是因为这里被拦截了
-                logger.info(f"【融合版】拦截: 类型 {event_type} 未勾选，当前允许: {allowed_types}")
+                logger.info(f"【融合版】拦截: 类型 {event_type} 未勾选")
                 return
 
-            # 检查3：服务器实例连接
-            if event_info.server_name and not self.service_info(name=event_info.server_name):
-                # 仅警告，不强行return，防止名字不匹配导致无法测试
-                logger.warning(f"【融合版】警告: 无法获取服务器 {event_info.server_name} 的连接实例，部分元数据可能无法获取")
-
-            # 防重复逻辑
+            # 防重复
             item_id = getattr(event_info, 'item_id', '')
             client = getattr(event_info, 'client', '')
             user_name = getattr(event_info, 'user_name', '')
@@ -244,11 +231,11 @@ class wd99(_PluginBase):
             self._clean_expired_cache()
             
             if "stop" in event_type.lower() and expiring_key in self._webhook_msg_keys:
-                logger.info(f"【融合版】拦截: 重复的停止播放事件")
+                logger.info(f"【融合版】拦截: 重复停止事件")
                 self._add_key_cache(expiring_key)
                 return
 
-            # 分发处理
+            # 处理逻辑
             if "test" in event_type.lower():
                 self._handle_test_event(event_info)
                 return
@@ -257,6 +244,7 @@ class wd99(_PluginBase):
                 return
 
             if self._should_aggregate_tv(event_info):
+                # !!! 这里的调用之前报错，现在 _get_series_id 已补全 !!!
                 series_id = self._get_series_id(event_info)
                 if series_id:
                     logger.info(f"【融合版】加入聚合队列: {series_id}")
@@ -266,7 +254,7 @@ class wd99(_PluginBase):
             self._process_single_media_event(event_info, expiring_key)
 
         except Exception as e:
-            logger.error(f"【融合版】发送消息异常: {str(e)}")
+            logger.error(f"【融合版】异常: {str(e)}")
             import traceback
             traceback.print_exc()
 
@@ -278,6 +266,13 @@ class wd99(_PluginBase):
         if event_info.item_type not in ["TV", "SHOW"]:
             return False
         return True
+
+    # !!! 之前缺失的方法，已补全 !!!
+    def _get_series_id(self, event_info: WebhookEventInfo) -> Optional[str]:
+        if event_info.json_object and isinstance(event_info.json_object, dict):
+            item = event_info.json_object.get("Item", {})
+            return str(item.get("SeriesId") or item.get("SeriesName"))
+        return getattr(event_info, "series_id", None)
 
     def _process_single_media_event(self, event_info: WebhookEventInfo, expiring_key: str):
         logger.info(f"【融合版】处理单条消息: {event_info.item_name}")
@@ -338,10 +333,7 @@ class wd99(_PluginBase):
             image=image_url,
             link=play_link
         )
-        if ret:
-            logger.info("【融合版】消息推送请求已发送")
-        else:
-            logger.error("【融合版】消息推送失败，请检查系统通知设置")
+        if ret: logger.info("【融合版】消息已推送到MP")
 
     def _send_aggregated_message(self, series_id: str):
         if series_id not in self._pending_messages: return
@@ -357,7 +349,7 @@ class wd99(_PluginBase):
             self._process_single_media_event(msg_list[0], fake_key)
             return
 
-        logger.info(f"【融合版】处理聚合消息: 数量 {len(msg_list)}")
+        logger.info(f"【融合版】发送聚合消息，共 {len(msg_list)} 条")
         
         first_info = msg_list[0]
         count = len(msg_list)
@@ -423,7 +415,6 @@ class wd99(_PluginBase):
         return None
 
     def _handle_test_event(self, event_info: WebhookEventInfo):
-        logger.info("【融合版】处理测试消息")
         title = f"🔔 媒体服务器通知测试(融合版)"
         server_name = self._get_server_name_cn(event_info)
         texts = [
@@ -434,13 +425,12 @@ class wd99(_PluginBase):
         if event_info.user_name:
             texts.append(f"用户：{event_info.user_name}")
             
-        ret = self.post_message(
+        self.post_message(
             mtype=NotificationType.MediaServer,
             title=title,
             text="\n".join(texts),
             image=self._webhook_images.get(event_info.channel)
         )
-        if ret: logger.info("【融合版】测试消息已发出")
 
     def _handle_login_event(self, event_info: WebhookEventInfo):
         action = "登录成功" if "authenticated" in event_info.event and "failed" not in event_info.event else "登录失败"
