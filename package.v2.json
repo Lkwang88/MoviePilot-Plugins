@@ -27,6 +27,18 @@
       "v2.0.1": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
     }
   },
+      "Medialkwang": {
+    "name": "Medialkwang",
+    "description": "消息通知。",
+    "labels": "媒体库,工具",
+    "version": "1.9.5",
+    "icon": "mediaplay.png",
+    "author": "lkwang88",
+    "level": 1,
+    "history": {
+      "v1.9.5": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
+    }
+  },
     "Media88": {
     "name": "Media88",
     "description": "消息通知。",
