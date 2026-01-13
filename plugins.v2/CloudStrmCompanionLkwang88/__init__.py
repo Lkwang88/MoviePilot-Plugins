@@ -49,7 +49,7 @@ class FileMonitorHandler(FileSystemEventHandler):
                                 mon_path=self._watch_path, event_path=event.dest_path)
 
 
-class Lkwang88(_PluginBase):
+class CloudStrmCompanionLkwang88(_PluginBase):
     # 插件名称
     plugin_name = "CloudStrmCompanionLkwang88"
     # 插件描述
