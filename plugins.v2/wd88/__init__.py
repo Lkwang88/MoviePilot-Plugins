@@ -49,7 +49,7 @@ class FileMonitorHandler(FileSystemEventHandler):
                                 mon_path=self._watch_path, event_path=event.dest_path)
 
 
-class wd88(_PluginBase):
+class Wd88(_PluginBase):
     # 插件名称
     plugin_name = "wd88"
     # 插件描述
@@ -57,7 +57,7 @@ class wd88(_PluginBase):
     # 插件图标
     plugin_icon = "cloudcompanion.png"
     # 插件版本
-    plugin_version = "2.1.1"
+    plugin_version = "2.1.2"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -195,7 +195,6 @@ class wd88(_PluginBase):
                 self._format_conf[local_dir] = format_str
                 self._category_conf[local_dir] = category
 
-                # 优化：不在此处直接启动 observer
                 try:
                     if strm_dir and Path(strm_dir).is_relative_to(Path(local_dir)):
                         logger.warn(f"{strm_dir} 是 {local_dir} 的子目录，无法监控")
@@ -209,10 +208,10 @@ class wd88(_PluginBase):
 
             # 运行一次定时服务
             if self._onlyonce:
-                logger.info("lkwang88 全量执行服务启动，立即运行一次")
+                logger.info("wd88 全量执行服务启动，立即运行一次")
                 self._scheduler.add_job(func=self.scan, trigger='date',
                                         run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                        name="lkwang88 全量执行服务")
+                                        name="wd88 全量执行服务")
                 self._onlyonce = False
                 self.__update_config()
 
@@ -231,12 +230,12 @@ class wd88(_PluginBase):
             # 简单的挂载检测
             retries = 12
             while not os.path.exists(local_dir) and retries > 0:
-                logger.info(f"[lkwang88] 监控目录 {local_dir} 尚未就绪，等待挂载... (剩余重试: {retries})")
+                logger.info(f"[wd88] 监控目录 {local_dir} 尚未就绪，等待挂载... (剩余重试: {retries})")
                 time.sleep(10)
                 retries -= 1
             
             if not os.path.exists(local_dir):
-                logger.error(f"[lkwang88] 监控目录 {local_dir} 无法访问，跳过该目录监控")
+                logger.error(f"[wd88] 监控目录 {local_dir} 无法访问，跳过该目录监控")
                 continue
 
             try:
@@ -245,16 +244,16 @@ class wd88(_PluginBase):
                 observer.schedule(FileMonitorHandler(local_dir, self), path=local_dir, recursive=True)
                 observer.daemon = True
                 observer.start()
-                logger.info(f"[lkwang88] {local_dir} 实时监控服务已启动")
+                logger.info(f"[wd88] {local_dir} 实时监控服务已启动")
             except Exception as e:
                 err_msg = str(e)
                 if "inotify" in err_msg and "reached" in err_msg:
-                    logger.warn(f"[lkwang88] inotify资源不足，请优化宿主机配置: {err_msg}")
+                    logger.warn(f"[wd88] inotify资源不足，请优化宿主机配置: {err_msg}")
                 else:
-                    logger.error(f"[lkwang88] {local_dir} 启动监控失败：{err_msg}")
+                    logger.error(f"[wd88] {local_dir} 启动监控失败：{err_msg}")
 
     def scan(self):
-        logger.info("lkwang88 开始全量执行")
+        logger.info("wd88 开始全量执行")
         for mon_path in self._strm_dir_conf.keys():
             if not os.path.exists(mon_path):
                 continue
@@ -269,7 +268,7 @@ class wd88(_PluginBase):
                             or source_file.find("/@eaDir") != -1):
                         continue
                     self.__handle_file(event_path=source_file, mon_path=mon_path)
-        logger.info("lkwang88 全量执行完成")
+        logger.info("wd88 全量执行完成")
 
     @eventmanager.register(EventType.PluginAction)
     def strm_one(self, event: Event = None):
@@ -435,7 +434,7 @@ class wd88(_PluginBase):
             paths = list(self._refresh_queue)
             self._refresh_queue.clear()
         
-        logger.info(f"[lkwang88] 触发聚合刷新，本批次包含 {len(paths)} 个目录")
+        logger.info(f"[wd88] 触发聚合刷新，本批次包含 {len(paths)} 个目录")
         for path in paths:
             self.__refresh_emby_file(path)
 
@@ -460,9 +459,9 @@ class wd88(_PluginBase):
                     }
                 )
                 if res and res.status_code in [200, 204]:
-                    logger.info(f"[lkwang88] 媒体服务器 {emby_name} 刷新路径成功: {strm_file}")
+                    logger.info(f"[wd88] 媒体服务器 {emby_name} 刷新路径成功: {strm_file}")
                 else:
-                    logger.error(f"[lkwang88] 媒体服务器 {emby_name} 刷新失败 {res.status_code}")
+                    logger.error(f"[wd88] 媒体服务器 {emby_name} 刷新失败 {res.status_code}")
             except Exception as err:
                 logger.error(f"通知媒体服务器刷新失败：{str(err)}")
 
@@ -702,11 +701,21 @@ class wd88(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        # 你的 mediaserver_helper 需要确保被实例化，通常 init_plugin 会处理，
-        # 为了安全起见，这里重新获取实例或复用成员变量
+        # 确保 helper 已初始化
         if not self.mediaserver_helper:
             self.mediaserver_helper = MediaServerHelper()
-            
+        
+        # 安全获取 emby 服务器列表，防止报错导致整个配置页白屏
+        emby_items = []
+        try:
+            configs = self.mediaserver_helper.get_configs()
+            if configs:
+                emby_items = [{"title": config.name, "value": config.name}
+                              for config in configs.values() 
+                              if config and config.type == "emby"]
+        except Exception as e:
+            logger.error(f"[wd88] 获取Emby服务器列表失败: {e}")
+
         return [
             {
                 'component': 'VForm',
@@ -997,9 +1006,7 @@ class wd88(_PluginBase):
                                             'clearable': True,
                                             'model': 'mediaservers',
                                             'label': '媒体服务器',
-                                            'items': [{"title": config.name, "value": config.name}
-                                                      for config in self.mediaserver_helper.get_configs().values() if
-                                                      config.type == "emby"]
+                                            'items': emby_items  # 使用安全获取的列表
                                         }
                                     }
                                 ]
@@ -1130,9 +1137,6 @@ class wd88(_PluginBase):
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",
             "path_replacements": ""
         }
-
-    def get_page(self) -> List[dict]:
-        pass
 
     def stop_service(self):
         if self._observer:
