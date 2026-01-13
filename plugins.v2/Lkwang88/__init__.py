@@ -195,7 +195,7 @@ class Lkwang88(_PluginBase):
                 self._format_conf[local_dir] = format_str
                 self._category_conf[local_dir] = category
 
-                # 优化：不在此处直接启动 observer，而是收集配置后统一处理
+                # 优化：不在此处直接启动 observer
                 try:
                     if strm_dir and Path(strm_dir).is_relative_to(Path(local_dir)):
                         logger.warn(f"{strm_dir} 是 {local_dir} 的子目录，无法监控")
@@ -203,7 +203,7 @@ class Lkwang88(_PluginBase):
                 except Exception as e:
                     pass
 
-            # 优化：异步启动监控服务，彻底解决MP启动卡死问题
+            # 优化：异步启动监控服务
             if self._monitor:
                 threading.Thread(target=self.__async_start_monitor, daemon=True).start()
 
@@ -225,11 +225,10 @@ class Lkwang88(_PluginBase):
         """
         优化：异步启动监控，带重试机制
         """
-        # 初始延迟，避开MP启动高峰
         time.sleep(10)
         
         for local_dir in self._strm_dir_conf.keys():
-            # 简单的挂载检测，如果目录不存在则等待（最多等待2分钟）
+            # 简单的挂载检测
             retries = 12
             while not os.path.exists(local_dir) and retries > 0:
                 logger.info(f"[lkwang88] 监控目录 {local_dir} 尚未就绪，等待挂载... (剩余重试: {retries})")
@@ -315,11 +314,9 @@ class Lkwang88(_PluginBase):
                                                          cloud_file=str(cloud_file),
                                                          uriencode=self._uriencode)
                     
-                    # 生成文件并获取结果
                     created = self.__create_strm_file(strm_file=target_file,
                                             strm_content=strm_content)
 
-                    # 仅在实际创建了文件时处理周边文件
                     if created:
                         pattern = Path(event_path).stem.replace('[', '?').replace(']', '?')
                         files = list(Path(event_path).parent.glob(f"{pattern}.*"))
@@ -388,11 +385,9 @@ class Lkwang88(_PluginBase):
                     json={"path": str(strm_content), "type": "add"},
                 )
 
-            # 收集通知信息
             if self._notify and Path(strm_content).suffix in settings.RMT_MEDIAEXT:
                 self.__collect_notify_info(strm_file_path)
 
-            # 优化：加入聚合刷新队列，而不是立即请求
             if self._refresh_emby and self._mediaservers:
                 self.__add_to_refresh_queue(strm_file_path)
             
@@ -428,17 +423,11 @@ class Lkwang88(_PluginBase):
         self._medias[key] = media_list
 
     def __add_to_refresh_queue(self, strm_file_path: str):
-        """
-        优化：添加路径到待刷新队列（父目录粒度）
-        """
         parent_dir = str(Path(strm_file_path).parent)
         with self._refresh_lock:
             self._refresh_queue.add(parent_dir)
 
     def __process_refresh_queue(self):
-        """
-        优化：处理刷新队列，去重后批量请求
-        """
         if not self._refresh_queue:
             return
 
@@ -451,9 +440,6 @@ class Lkwang88(_PluginBase):
             self.__refresh_emby_file(path)
 
     def __refresh_emby_file(self, strm_file: str):
-        """
-        通知emby刷新文件/目录
-        """
         emby_servers = self.mediaserver_helper.get_services(name_filters=self._mediaservers, type_filter="emby")
         if not emby_servers:
             return
@@ -462,7 +448,6 @@ class Lkwang88(_PluginBase):
         for emby_name, emby_server in emby_servers.items():
             emby = emby_server.instance
             try:
-                # 针对文件夹级别刷新，效率更高
                 res = emby.post_data(
                     url='emby/Library/Media/Updated',
                     data={
@@ -488,9 +473,6 @@ class Lkwang88(_PluginBase):
                     return str(file_path).replace(str(library_path), str(paths.get(str(library_path))))
         return file_path
 
-    # ... [remote_sync_one, __find_related_paths, __handle_limit, send_msg, send_transfer_message 
-    # 这些方法逻辑不需要变更，请直接从原插件复制到这里，以节省篇幅] ...
-    
     @eventmanager.register(EventType.PluginAction)
     def remote_sync_one(self, event: Event = None):
         if event:
@@ -501,9 +483,7 @@ class Lkwang88(_PluginBase):
             if not args:
                 logger.error(f"缺少参数：{event_data}")
                 return
-            all_args = args
-
-
+            
             # 使用正则表达式匹配
             category = None
             args_arr = args.split(maxsplit=1)
@@ -513,7 +493,6 @@ class Lkwang88(_PluginBase):
                 args = args_arr[1]
                 if str(args).isdigit():
                     limit = int(args)
-
 
             if category:
                 # 判断是不是目录
@@ -525,56 +504,33 @@ class Lkwang88(_PluginBase):
                             mon_path = mon
                             break
 
-
                     # 指定路径
                     if not mon_path:
                         logger.error(f"未找到 {category} 对应的监控目录")
-                        self.post_message(channel=event.event_data.get("channel"),
-                                          title=f"未找到 {category} 对应的监控目录",
-                                          userid=event.event_data.get("user"))
                         return
-
 
                     self.__handle_limit(path=category, mon_path=mon_path, limit=limit, event=event)
                     return
                 else:
                     for mon_path in self._category_conf.keys():
                         mon_category = self._category_conf.get(mon_path)
-                        logger.info(f"开始检查 {mon_path} {mon_category}")
                         if mon_category and str(category) in mon_category:
                             parent_path = os.path.join(mon_path, category)
                             if limit:
-                                logger.info(f"获取到 {category} 对应的监控目录 {parent_path}")
                                 self.__handle_limit(path=parent_path, mon_path=mon_path, limit=limit, event=event)
                             else:
-                                logger.info(f"获取到 {category} {args} 对应的监控目录 {parent_path}")
                                 target_path = os.path.join(str(parent_path), args)
-                                logger.info(f"开始处理 {target_path}")
                                 target_paths = self.__find_related_paths(os.path.join(str(parent_path), args))
                                 if not target_paths:
                                     logger.error(f"未查找到 {category} {args} 对应的具体目录")
-                                    self.post_message(channel=event.event_data.get("channel"),
-                                                      title=f"未查找到 {category} {args} 对应的具体目录",
-                                                      userid=event.event_data.get("user"))
                                     return
                                 for target_path in target_paths:
-                                    logger.info(f"开始定向处理文件夹 ...{target_path}")
                                     for sroot, sdirs, sfiles in os.walk(target_path):
                                         for file_name in sdirs + sfiles:
                                             src_file = os.path.join(sroot, file_name)
                                             if Path(src_file).is_file():
                                                 self.__handle_file(event_path=str(src_file), mon_path=mon_path)
-
-
-                                    if event.event_data.get("user"):
-                                        self.post_message(channel=event.event_data.get("channel"),
-                                                          title=f"{target_path} Strm生成完成！",
-                                                          userid=event.event_data.get("user"))
                                     time.sleep(2)
-
-
-                                    if limit is None and event_data and event_data.get("action") == "strm_one":
-                                        return
                             return
             else:
                 # 遍历所有监控目录
@@ -584,11 +540,9 @@ class Lkwang88(_PluginBase):
                         mon_path = mon
                         break
 
-
                 # 指定路径
                 if mon_path:
                     if not Path(args).exists():
-                        logger.info(f"同步路径 {args} 不存在")
                         return
                     # 处理单文件
                     if Path(args).is_file():
@@ -596,41 +550,23 @@ class Lkwang88(_PluginBase):
                         return
                     else:
                         # 处理指定目录
-                        logger.info(f"获取到 {args} 对应的监控目录 {mon_path}")
-
-
-                        logger.info(f"开始定向处理文件夹 ...{args}")
                         for sroot, sdirs, sfiles in os.walk(args):
                             for file_name in sdirs + sfiles:
                                 src_file = os.path.join(sroot, file_name)
                                 if Path(str(src_file)).is_file():
                                     self.__handle_file(event_path=str(src_file), mon_path=mon_path)
-                        if event.event_data.get("user"):
-                            self.post_message(channel=event.event_data.get("channel"),
-                                              title=f"{all_args} Strm生成完成！", userid=event.event_data.get("user"))
                         return
                 else:
                     for mon_path in self._category_conf.keys():
                         mon_category = self._category_conf.get(mon_path)
-                        logger.info(f"开始检查 {mon_path} {mon_category}")
                         if mon_category and str(args) in mon_category:
                             parent_path = os.path.join(mon_path, args)
-                            logger.info(f"获取到 {args} 对应的监控目录 {parent_path}")
                             for sroot, sdirs, sfiles in os.walk(parent_path):
                                 for file_name in sdirs + sfiles:
                                     src_file = os.path.join(sroot, file_name)
                                     if Path(str(src_file)).is_file():
                                         self.__handle_file(event_path=str(src_file), mon_path=mon_path)
-                            if event.event_data.get("user"):
-                                self.post_message(channel=event.event_data.get("channel"),
-                                                  title=f"{all_args} Strm生成完成！",
-                                                  userid=event.event_data.get("user"))
                             return
-            if event.event_data.get("user"):
-                self.post_message(channel=event.event_data.get("channel"),
-                                  title=f"{all_args} 未检索到，请检查输入是否正确！",
-                                  userid=event.event_data.get("user"))
-
 
     @staticmethod
     def __find_related_paths(base_path):
@@ -638,38 +574,27 @@ class Lkwang88(_PluginBase):
         base_dir = os.path.dirname(base_path)
         base_name = os.path.basename(base_path)
 
-
         for entry in os.listdir(base_dir):
             if entry.startswith(base_name):
                 full_path = os.path.join(base_dir, entry)
                 if os.path.isdir(full_path):
                     related_paths.append(full_path)
 
-
         # 按照修改时间倒序排列
         related_paths.sort(key=lambda path: os.path.getmtime(path), reverse=True)
-
-
         return related_paths
 
-
     def __handle_limit(self, path, limit, mon_path, event):
-        """
-        处理文件数量限制
-        """
         sub_paths = []
         for entry in os.listdir(path):
             full_path = os.path.join(path, entry)
             if os.path.isdir(full_path):
                 sub_paths.append(full_path)
 
-
         if not sub_paths:
             logger.error(f"未找到 {path} 目录下的文件夹")
             return
 
-
-        # 按照修改时间倒序排列
         sub_paths.sort(key=lambda path: os.path.getmtime(path), reverse=True)
         logger.info(f"开始定向处理文件夹 ...{path}, 最新 {limit} 个文件夹")
         for sub_path in sub_paths[:limit]:
@@ -679,32 +604,17 @@ class Lkwang88(_PluginBase):
                     src_file = os.path.join(sroot, file_name)
                     if Path(src_file).is_file():
                         self.__handle_file(event_path=str(src_file), mon_path=mon_path)
-            if event.event_data.get("user"):
-                self.post_message(channel=event.event_data.get("channel"),
-                                  title=f"{sub_path} Strm生成完成！", userid=event.event_data.get("user"))
             time.sleep(2)
 
-        pass
-
     def send_msg(self):
-        """
-        定时检查是否有媒体处理完，发送统一消息
-        """
         if not self._medias or not self._medias.keys():
             return
 
-
-        # 遍历检查是否已刮削完，发送消息
         for medis_title_year_season in list(self._medias.keys()):
             media_list = self._medias.get(medis_title_year_season)
-            logger.info(f"开始处理媒体 {medis_title_year_season} 消息")
-
-
             if not media_list:
                 continue
 
-
-            # 获取最后更新时间
             last_update_time = media_list.get("time")
             file_meta = media_list.get("file_meta")
             mtype = media_list.get("type")
@@ -712,58 +622,35 @@ class Lkwang88(_PluginBase):
             if not last_update_time:
                 continue
 
-
-            # 判断剧集最后更新时间距现在是已超过10秒或者电影，发送消息
             if (datetime.now() - last_update_time).total_seconds() > int(self._interval) \
                     or str(mtype) == "movie":
-                # 发送通知
                 if self._notify:
                     file_count = len(episodes) if episodes else 1
-
-
-                    # 剧集季集信息 S01 E01-E04 || S01 E01、E02、E04
-                    # 处理文件多，说明是剧集，显示季入库消息
                     media_type = None
                     if str(mtype) == "tv":
-                        # 季集文本
                         season_episode = f"{medis_title_year_season} {StringUtils.format_ep(episodes)}"
                         media_type = MediaType.TV
                     else:
-                        # 电影文本
                         season_episode = f"{medis_title_year_season}"
                         media_type = MediaType.MOVIE
 
-
-                    # 获取封面图片
                     mediainfo: MediaInfo = self.chain.recognize_media(meta=file_meta,
-                                                                      mtype=media_type,
-                                                                      tmdbid=file_meta.tmdbid)
+                                                                  mtype=media_type,
+                                                                  tmdbid=file_meta.tmdbid)
 
-
-                    # 发送消息
                     self.send_transfer_message(msg_title=season_episode,
                                                file_count=file_count,
                                                image=(
                                                    mediainfo.backdrop_path if mediainfo.backdrop_path else mediainfo.poster_path) if mediainfo else None)
-                # 发送完消息，移出key
                 del self._medias[medis_title_year_season]
                 continue
 
-        pass
-
     def send_transfer_message(self, msg_title, file_count, image):
-           """
-        发送消息
-        """
-        # 发送
         self.post_message(
             mtype=NotificationType.Plugin,
             title=f"{msg_title} Strm已生成", text=f"共{file_count}个文件",
             image=image,
             link=settings.MP_DOMAIN('#/history'))
-
-     # 请保留原版逻辑
-        pass
 
     def __update_config(self):
         self.update_config({
@@ -797,7 +684,7 @@ class Lkwang88(_PluginBase):
                 "desc": "lkwang88全量执行",
                 "category": "",
                 "data": {
-                    "action": "CloudStrmCompanion" # 保持兼容或修改为新ACTION
+                    "action": "CloudStrmCompanion"
                 }
             },
             {
@@ -815,8 +702,11 @@ class Lkwang88(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        # 这里请直接复制原代码的 get_form 中的 List[dict] 部分
-        # 仅修改默认值字典如下
+        # 你的 mediaserver_helper 需要确保被实例化，通常 init_plugin 会处理，
+        # 为了安全起见，这里重新获取实例或复用成员变量
+        if not self.mediaserver_helper:
+            self.mediaserver_helper = MediaServerHelper()
+            
         return [
             {
                 'component': 'VForm',
@@ -945,7 +835,7 @@ class Lkwang88(_PluginBase):
                                         }
                                     }
                                 ]
-                            },
+                            }
                         ]
                     },
                     {
@@ -998,7 +888,7 @@ class Lkwang88(_PluginBase):
                                         }
                                     }
                                 ]
-                            },
+                            }
                         ]
                     },
                     {
@@ -1134,7 +1024,6 @@ class Lkwang88(_PluginBase):
                             }
                         ]
                     },
-                    # 新增：路径替换规则文本框
                     {
                         'component': 'VRow',
                         'content': [
@@ -1171,10 +1060,7 @@ class Lkwang88(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': 'MoviePilot中云盘挂载本地的路径：/mnt/media/series/国产剧/雪迷宫 (2024)；'
-                                                    'MoviePilot中strm生成路径：/mnt/library/series/国产剧/雪迷宫 (2024)；'
-                                                    '云盘路径：/cloud/media/series/国产剧/雪迷宫 (2024)；'
-                                                    '则目录配置为：/mnt/media#/mnt/library#/cloud/media#{local_file}'
+                                            'text': 'MoviePilot中云盘挂载本地的路径：/mnt/media/series/国产剧/雪迷宫 (2024)；MoviePilot中strm生成路径：/mnt/library/series/国产剧/雪迷宫 (2024)；云盘路径：/cloud/media/series/国产剧/雪迷宫 (2024)；则目录配置为：/mnt/media#/mnt/library#/cloud/media#{local_file}'
                                         }
                                     }
                                 ]
@@ -1195,11 +1081,7 @@ class Lkwang88(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': 'strm格式化方式，自行把()替换为alist/cd2上路径：'
-                                                    '1.本地源文件路径：{local_file}。'
-                                                    '2.alist路径：http://192.168.31.103:5244/d/115{cloud_file}。'
-                                                    '3.cd2路径：http://192.168.31.103:19798/static/http/192.168.31.103:19798/False/115{cloud_file}。'
-                                                    '4.其他api路径：http://192.168.31.103:2001/{cloud_file}'
+                                            'text': 'strm格式化方式，自行把()替换为alist/cd2上路径：1.本地源文件路径：{local_file}。2.alist路径：http://192.168.31.103:5244/d/115{cloud_file}。3.cd2路径：http://192.168.31.103:19798/static/http/192.168.31.103:19798/False/115{cloud_file}。4.其他api路径：http://192.168.31.103:2001/{cloud_file}'
                                         }
                                     }
                                 ]
@@ -1228,7 +1110,7 @@ class Lkwang88(_PluginBase):
                         ],
                     },
                 ]
-            }      
+            }
         ], {
             "enabled": False,
             "notify": False,
