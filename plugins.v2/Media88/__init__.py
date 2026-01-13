@@ -16,7 +16,7 @@ from app.schemas.types import EventType, MediaType, MediaImageType, Notification
 from app.utils.web import WebUtils
 
 
-class MediaServerMsg-lkwang(_PluginBase):
+class Media88(_PluginBase):
     """
     媒体服务器通知插件 (大师融合版)
     功能：
@@ -38,7 +38,7 @@ class MediaServerMsg-lkwang(_PluginBase):
     plugin_version = "1.9.5"
     plugin_author = "lkwang88"
     author_url = "https://github.com/jxxghp"
-    plugin_config_prefix = "MediaServerMsg-lkwang_"
+    plugin_config_prefix = "Media88_"
     plugin_order = 14
     auth_level = 1
 
