@@ -16,7 +16,7 @@ from app.schemas.types import EventType, MediaType, MediaImageType, Notification
 from app.utils.web import WebUtils
 
 
-class Media88(_PluginBase):
+class wd99(_PluginBase):
     """
     媒体服务器通知插件 (大师融合版)
     功能：
