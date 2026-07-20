@@ -18,7 +18,7 @@ class GDriveUploadStat(_PluginBase):
     plugin_name = "网盘上传量统计"
     plugin_desc = "按盘符统计整理记录的落盘数据量，达到自定义阈值走通知频道告警（自用/gclone多盘限额监控）。"
     plugin_icon = "Alidrive_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "gdriveuploadstat_"
@@ -34,6 +34,8 @@ class GDriveUploadStat(_PluginBase):
     _rolling_hours = 24         # 滚动窗口小时数
     _cron = "*/30 * * * *"      # 检查频率
     _multi_level = True         # 多级预警 80%/95%/100%
+    _notify_change = False      # 每次统计有变化就通知
+    _test_notify = False        # 发送一条测试通知
     _rules_raw = ""             # 盘符规则原文
 
     _scheduler: Optional[BackgroundScheduler] = None
@@ -57,7 +59,15 @@ class GDriveUploadStat(_PluginBase):
             self._rolling_hours = 24
         self._cron = (config.get("cron") or "*/30 * * * *").strip()
         self._multi_level = bool(config.get("multi_level", True))
+        self._notify_change = bool(config.get("notify_change"))
+        self._test_notify = bool(config.get("test_notify"))
         self._rules_raw = config.get("rules") or ""
+
+        # 测试通知：勾选后立即发一条，验证通知渠道是否通
+        if self._test_notify:
+            self._test_notify = False
+            self._save_config()
+            self._send_test_notify()
 
         if self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -87,6 +97,8 @@ class GDriveUploadStat(_PluginBase):
             "rolling_hours": self._rolling_hours,
             "cron": self._cron,
             "multi_level": self._multi_level,
+            "notify_change": self._notify_change,
+            "test_notify": self._test_notify,
             "rules": self._rules_raw,
         })
 
@@ -240,7 +252,60 @@ class GDriveUploadStat(_PluginBase):
         for k in sorted(alerted.keys())[:-7]:
             alerted.pop(k, None)
         self.save_data("alerted", alerted)
+
+        # 变化通知：本轮统计与上轮相比有变化就发一条汇总（无变化不发）
+        if self._notify_change:
+            self._notify_on_change(stats, start, now)
+
         logger.info(f"{self.plugin_name} 统计完成，覆盖 {len(stats)} 个盘")
+
+    def _notify_on_change(self, stats: Dict[str, Dict[str, Any]],
+                          start: datetime, now: datetime):
+        """本轮各盘字节数与上轮不同则发送汇总通知。"""
+        # 用字节数指纹判断是否变化
+        fingerprint = {k: v["bytes"] for k, v in stats.items()}
+        last = self.get_data("last_fingerprint") or {}
+        if fingerprint == last:
+            return
+        self.save_data("last_fingerprint", fingerprint)
+
+        if not self._notify:
+            return
+
+        lines = []
+        for s in stats.values():
+            used_gb = s["bytes"] / (1024 ** 3)
+            threshold_gb = s["threshold_gb"]
+            if threshold_gb and threshold_gb > 0:
+                ratio = used_gb / threshold_gb * 100
+                lines.append(f"{s['name']}：{self._fmt(s['bytes'])} / "
+                             f"{threshold_gb:g} GB ({ratio:.0f}%) · {s['count']} 条")
+            else:
+                lines.append(f"{s['name']}：{self._fmt(s['bytes'])} · {s['count']} 条")
+        text = (
+            "\n".join(lines)
+            + f"\n统计区间：{start.strftime('%m-%d %H:%M')} ~ {now.strftime('%m-%d %H:%M')}"
+        )
+        self.post_message(
+            mtype=NotificationType.Plugin,
+            title="📈 网盘上传量更新",
+            text=text,
+        )
+
+    def _send_test_notify(self):
+        """发送一条测试通知，用于验证通知渠道是否连通。"""
+        now = datetime.now(tz=pytz.timezone(settings.TZ))
+        self.post_message(
+            mtype=NotificationType.Plugin,
+            title="🔔 网盘上传量统计 · 测试通知",
+            text=(
+                "如果你收到这条消息，说明通知渠道已连通。\n"
+                f"发送时间：{now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "提示：若 MP 系统通知里有、但 TG 没收到，"
+                "请到 设置→通知 里确认「插件」类型消息已勾选发往 Telegram。"
+            ),
+        )
+        logger.info(f"{self.plugin_name} 已发送测试通知")
 
     def _notify_disk(self, s: Dict[str, Any], used_gb: float, ratio: float,
                      label: str, start: datetime, now: datetime):
@@ -316,6 +381,15 @@ class GDriveUploadStat(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 3},
+                             "content": [{"component": "VSwitch", "props": {"model": "notify_change", "label": "变化即通知(无变化不发)"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3},
+                             "content": [{"component": "VSwitch", "props": {"model": "test_notify", "label": "发送测试通知"}}]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 4},
                              "content": [{"component": "VSelect", "props": {
                                  "model": "stat_mode", "label": "统计模式",
@@ -372,6 +446,8 @@ class GDriveUploadStat(_PluginBase):
             "day_boundary": "00:00",
             "rolling_hours": 24,
             "cron": "*/30 * * * *",
+            "notify_change": False,
+            "test_notify": False,
             "rules": "",
         }
 
