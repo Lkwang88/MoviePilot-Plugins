@@ -55,7 +55,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -72,6 +72,9 @@ class GDStrmHelper(_PluginBase):
     _onlyonce = False            # 立即全量扫描一次
     _onlyonce_incr = False       # 立即增量扫描一次
     _onlyonce_clean = False      # 立即清理孤儿strm一次
+    _onlyonce_dbcheck = False    # 立即检查数据库完整性
+    _onlyonce_dbrebuild = False  # 立即重建数据库
+    _onlyonce_dbvacuum = False   # 立即数据库瘦身
     _monitor = False             # 实时监控开关
     _notify = False              # 发送通知
     _cover = False               # 覆盖已存在的strm
@@ -184,6 +187,9 @@ class GDStrmHelper(_PluginBase):
             self._onlyonce = config.get("onlyonce")
             self._onlyonce_incr = config.get("onlyonce_incr")
             self._onlyonce_clean = config.get("onlyonce_clean")
+            self._onlyonce_dbcheck = config.get("onlyonce_dbcheck")
+            self._onlyonce_dbrebuild = config.get("onlyonce_dbrebuild")
+            self._onlyonce_dbvacuum = config.get("onlyonce_dbvacuum")
             self._monitor = config.get("monitor")
             self._notify = config.get("notify")
             self._cover = config.get("cover")
@@ -229,7 +235,8 @@ class GDStrmHelper(_PluginBase):
         # 初始化数据库
         self.__init_db()
 
-        if not (self._enabled or self._onlyonce or self._onlyonce_incr or self._onlyonce_clean):
+        if not (self._enabled or self._onlyonce or self._onlyonce_incr or self._onlyonce_clean
+                or self._onlyonce_dbcheck or self._onlyonce_dbrebuild or self._onlyonce_dbvacuum):
             return
 
         # 定时服务
@@ -282,6 +289,24 @@ class GDStrmHelper(_PluginBase):
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                                     name="GD网盘清理孤儿STRM")
             self._onlyonce_clean = False
+        if self._onlyonce_dbcheck:
+            logger.info("立即运行一次【数据库完整性检查】")
+            self._scheduler.add_job(func=self.db_integrity_check, trigger="date",
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                    name="GD网盘数据库完整性检查")
+            self._onlyonce_dbcheck = False
+        if self._onlyonce_dbrebuild:
+            logger.info("立即运行一次【重建数据库】")
+            self._scheduler.add_job(func=self.__rebuild_and_scan, trigger="date",
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                    name="GD网盘重建数据库")
+            self._onlyonce_dbrebuild = False
+        if self._onlyonce_dbvacuum:
+            logger.info("立即运行一次【数据库瘦身】")
+            self._scheduler.add_job(func=self.db_vacuum, trigger="date",
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                    name="GD网盘数据库瘦身")
+            self._onlyonce_dbvacuum = False
 
         self.__update_config()
 
@@ -348,7 +373,15 @@ class GDStrmHelper(_PluginBase):
 
     # ==================== SQLite ====================
     def __init_db(self):
-        """建表 + 全局PRAGMA调优。用独立连接完成。"""
+        """
+        建表 + 全局PRAGMA调优。用独立连接完成。
+        启动自愈：若已有旧库，先做完整性快检，损坏则备份坏库并重建，避免带病运行。
+        """
+        # 启动自愈：已存在旧库时先快检
+        if os.path.exists(self._db_path):
+            if not self.__db_integrity_ok():
+                logger.warn("检测到数据库损坏，备份坏库并重建")
+                self.__backup_corrupt_db()
         try:
             with self._db_lock:
                 conn = sqlite3.connect(self._db_path)
@@ -370,6 +403,156 @@ class GDStrmHelper(_PluginBase):
         except Exception as e:
             logger.error(f"初始化数据库失败：{e}")
 
+    def __db_integrity_ok(self) -> bool:
+        """
+        用SQLite内置 quick_check 快速校验数据库完整性(秒级)。
+        返回True=健康，False=损坏或无法打开。
+        """
+        conn = None
+        try:
+            with self._db_lock:
+                conn = sqlite3.connect(self._db_path, timeout=30)
+                row = conn.execute("PRAGMA quick_check").fetchone()
+                conn.close()
+                conn = None
+                return bool(row) and str(row[0]).lower() == "ok"
+        except Exception as e:
+            logger.warn(f"数据库完整性检查异常(视为损坏)：{e}")
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return False
+
+    def db_integrity_check(self) -> str:
+        """
+        完整性检查(供手动触发)：先 quick_check，健康再补一次 integrity_check。
+        返回可读结果字符串，同时写日志/通知。
+        """
+        detail = "ok"
+        conn = None
+        try:
+            with self._db_lock:
+                conn = sqlite3.connect(self._db_path, timeout=30)
+                quick = conn.execute("PRAGMA quick_check").fetchone()
+                quick_ok = bool(quick) and str(quick[0]).lower() == "ok"
+                if quick_ok:
+                    full = conn.execute("PRAGMA integrity_check").fetchone()
+                    detail = str(full[0]) if full else "ok"
+                else:
+                    detail = str(quick[0]) if quick else "malformed"
+                conn.close()
+                conn = None
+        except Exception as e:
+            detail = f"无法打开数据库：{e}"
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        healthy = detail.lower() == "ok"
+        cnt = self.__db_count() if healthy else -1
+        if healthy:
+            msg = f"数据库完整性：健康 ✓（记忆 {cnt} 条）"
+        else:
+            msg = f"数据库完整性：异常 ✗\n{detail}"
+        logger.info(f"【GD网盘Strm助手】{msg}")
+        if self._notify:
+            try:
+                self.post_message(mtype=NotificationType.Plugin,
+                                  title="GD网盘Strm助手 · 数据库完整性检查", text=msg)
+            except Exception:
+                pass
+        return msg
+
+    def __backup_corrupt_db(self):
+        """把损坏的库(及WAL/SHM)改名备份，保留现场供排查，让__init_db重建新库。"""
+        try:
+            with self._db_lock:
+                ts = datetime.now().strftime("%Y%m%d%H%M%S")
+                for suffix in ("", "-wal", "-shm"):
+                    p = self._db_path + suffix
+                    if os.path.exists(p):
+                        bak = f"{self._db_path}.corrupt.{ts}{suffix}"
+                        try:
+                            os.replace(p, bak)
+                            logger.warn(f"已备份损坏库文件：{p} -> {bak}")
+                        except Exception as e:
+                            logger.error(f"备份损坏库失败 {p}: {e}")
+                            # 备份失败则尝试直接删除，保证能重建
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+        except Exception as e:
+            logger.error(f"处理损坏库异常：{e}")
+
+    def db_rebuild(self):
+        """
+        重建数据库(供手动触发)：关闭连接 -> 删除库文件 -> 重新建表 -> 触发一次全量。
+        安全：DB仅为加速缓存，删后全量会凭本地已有产物补库，不会重复生成strm。
+        """
+        logger.info("开始重建数据库")
+        # 关闭全局写连接 + 当前线程只读连接
+        self.__db_close_write()
+        self.__close_read_conn()
+        try:
+            with self._db_lock:
+                for suffix in ("", "-wal", "-shm"):
+                    p = self._db_path + suffix
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception as e:
+                            logger.error(f"删除库文件失败 {p}: {e}")
+        except Exception as e:
+            logger.error(f"重建时删除库异常：{e}")
+        # 重新建表
+        self.__init_db()
+        logger.info("数据库已重建(空)，将触发一次全量扫描以补库")
+        if self._notify:
+            try:
+                self.post_message(mtype=NotificationType.Plugin,
+                                  title="GD网盘Strm助手 · 数据库已重建",
+                                  text="已清空并重建数据库，开始全量扫描补库（不会重复生成已有strm）")
+            except Exception:
+                pass
+
+    def db_vacuum(self):
+        """数据库瘦身(供手动触发)：先flush+checkpoint，再VACUUM回收碎片空间。"""
+        logger.info("开始数据库瘦身(VACUUM)")
+        self.__db_flush()
+        self.__db_checkpoint()
+        conn = None
+        try:
+            with self._db_lock:
+                conn = sqlite3.connect(self._db_path, timeout=60)
+                conn.execute("VACUUM")
+                conn.close()
+                conn = None
+            logger.info("数据库瘦身完成")
+            if self._notify:
+                try:
+                    self.post_message(mtype=NotificationType.Plugin,
+                                      title="GD网盘Strm助手 · 数据库瘦身完成",
+                                      text="已回收碎片空间并截断WAL")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"数据库瘦身失败：{e}")
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def __rebuild_and_scan(self):
+        """重建数据库后触发一次全量扫描补库(供手动开关调用)。"""
+        self.db_rebuild()
+        self.scan_full()
+
     # -------- 读写分离：写用全局唯一连接，读用线程本地连接 --------
     def __write_connection(self) -> sqlite3.Connection:
         """全局唯一写连接(调用方必须持有_write_lock)。"""
@@ -384,10 +567,17 @@ class GDStrmHelper(_PluginBase):
         return self._write_conn
 
     def __read_conn(self) -> sqlite3.Connection:
-        """当前线程的只读连接(线程本地，WAL下可并发读，全程复用)。"""
+        """
+        当前线程的只读连接(线程本地，WAL下可并发读，全程复用)。
+        isolation_level=None(自动提交)确保每次SELECT都看到最新已提交快照，
+        避免持久连接钉住旧读事务快照导致增量判断读到过时数据。
+        """
+        if self._tlocal is None:
+            self._tlocal = threading.local()
         conn = getattr(self._tlocal, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self._db_path, timeout=30, check_same_thread=False)
+            conn = sqlite3.connect(self._db_path, timeout=30, check_same_thread=False,
+                                   isolation_level=None)
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA cache_size=-8000")
             conn.execute("PRAGMA query_only=1")
@@ -1013,6 +1203,8 @@ class GDStrmHelper(_PluginBase):
                     deleted += 1
                 except Exception as e:
                     logger.error(f"删除孤儿STRM失败 {strm_path}: {e}")
+            # 删除记录立即落盘(避免崩溃窗口期删除丢失)
+            self.__db_flush()
             self._stat["deleted"] = self._stat.get("deleted", 0) + deleted
             logger.info(f"删除同步完成，共清理 {deleted} 个孤儿STRM")
             if self._notify and deleted > 0:
@@ -1239,6 +1431,9 @@ class GDStrmHelper(_PluginBase):
             "onlyonce": self._onlyonce,
             "onlyonce_incr": self._onlyonce_incr,
             "onlyonce_clean": self._onlyonce_clean,
+            "onlyonce_dbcheck": self._onlyonce_dbcheck,
+            "onlyonce_dbrebuild": self._onlyonce_dbrebuild,
+            "onlyonce_dbvacuum": self._onlyonce_dbvacuum,
             "monitor": self._monitor,
             "notify": self._notify,
             "cover": self._cover,
@@ -1340,6 +1535,18 @@ class GDStrmHelper(_PluginBase):
                              "content": [{"component": "VSwitch", "props": {"model": "onlyonce_incr", "label": "立即增量扫描一次"}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4},
                              "content": [{"component": "VSwitch", "props": {"model": "onlyonce_clean", "label": "立即清理孤儿STRM"}}]},
+                        ]
+                    },
+                    # 数据库维护行
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
+                             "content": [{"component": "VSwitch", "props": {"model": "onlyonce_dbcheck", "label": "检查数据库完整性"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
+                             "content": [{"component": "VSwitch", "props": {"model": "onlyonce_dbrebuild", "label": "重建数据库(清空重扫补库)"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
+                             "content": [{"component": "VSwitch", "props": {"model": "onlyonce_dbvacuum", "label": "数据库瘦身(VACUUM)"}}]},
                         ]
                     },
                     # 数值参数行1
@@ -1473,6 +1680,9 @@ class GDStrmHelper(_PluginBase):
             "onlyonce": False,
             "onlyonce_incr": False,
             "onlyonce_clean": False,
+            "onlyonce_dbcheck": False,
+            "onlyonce_dbrebuild": False,
+            "onlyonce_dbvacuum": False,
             "monitor": False,
             "notify": False,
             "cover": False,
