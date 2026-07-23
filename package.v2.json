@@ -1,13 +1,14 @@
 {
   "GDStrmHelper": {
     "name": "GD网盘Strm助手",
-    "description": "为rclone挂载的谷歌网盘生成STRM：异步全量+增量扫描、SQLite状态记忆(所有文件类型)、轮询/inotify可选监控、聚合刷新Emby、删除同步双保险、保存即预览路径映射。",
+    "description": "为rclone挂载的谷歌网盘生成STRM：异步全量+增量扫描、SQLite状态记忆(所有文件类型)、实时监控(轮询/inotify)、聚合刷新Emby、删除同步双保险、20-40万文件级性能优化。",
     "labels": "媒体库,工具",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "icon": "Google_cloud_A.png",
     "author": "lkwang88",
     "level": 1,
     "history": {
+      "v1.5.0": "大规模性能优化(20-40万文件/盘)：SQLite连接复用(消灭每文件建连)+读写分离(全局单写连接+线程本地只读连接)+批量提交(可靠换性能)+读己之写内存缓存+WAL调优(synchronous=NORMAL/busy_timeout/cache_size)+定期checkpoint回收WAL；扩展名预解析frozenset;有界队列背压限内存;删除同步流式游标查询(不再一次性载入全盘记录)。修复:只读连接WAL快照钉死导致读不到最新数据、写连接未关闭泄漏、ext集合未构建全线失效。",
       "v1.1.0": "修复：仅启用插件未开监控时首次全量不执行的bug；所有文件类型(含nfo/jpg等元数据)纳入SQLite记忆，二次扫描不再重复处理，本地已有的任何文件直接跳过；DB丢失后可凭本地产物跳过并补库；Emby刷新分批发送(每100个)防打挂；实时监控开关只控制watchdog、不影响全量扫描。",
       "v1.0.0": "首发版本：基于CloudStrmCompanion重构，rclone谷歌网盘专用。异步启动不阻塞MP、生产者-消费者线程池、SQLite增量状态记忆、scandir遍历、inotify优先监控、strm原子写入、Emby聚合刷新、通知聚合防轰炸、删除同步(挂载多次存活检查+数量熔断方案A)。",
       "v1.2.0": "实时监控新增「轮询/inotify」模式选择，默认轮询(PollingObserver，对rclone云端新增敏感、接近无延迟)并可配轮询间隔；增量扫描默认周期改为30分钟；统计页新增STRM路径预览(按配置展示源文件→strm文件→strm内容→Emby侧路径的映射，扫描后优先用真实样例)。",

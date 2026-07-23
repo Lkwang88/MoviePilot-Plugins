@@ -128,7 +128,24 @@ class GDStrmHelper(_PluginBase):
 
     # SQLite
     _db_path = None
-    _db_lock = threading.Lock()
+    _db_lock = threading.Lock()          # 仅用于建表/checkpoint等全局操作
+    _tlocal = None                       # 线程本地存储(每个线程一个只读连接)
+    _write_conn = None                   # 全局唯一写连接(SQLite单写，读写分离)
+    _write_lock = threading.Lock()       # 写入串行化 + 保护写连接/pending
+    _pending = 0                         # 待提交计数(批量提交)
+    _batch_size: int = 500               # 批量提交条数阈值
+    _last_commit = 0.0                   # 上次提交时间
+    _commit_interval: float = 3.0        # 批量提交时间阈值(秒)
+    _write_cache = {}                    # 读己之写缓存: path -> (size,mtime,strm_path)，保证未提交记录也能被查到
+
+    # 扩展名缓存(热路径避免反复split) frozenset
+    _media_ext_set = frozenset()
+    _other_ext_set = frozenset()
+    _sub_ext_set = frozenset([".srt", ".ass", ".ssa", ".sub", ".sup"])
+    _sub_ext_set = frozenset([".srt", ".ass", ".ssa", ".sub", ".sup"])
+
+    # 有界队列大小(背压：入队满则阻塞，限制内存峰值)
+    _queue_maxsize: int = 10000
 
     # 统计
     _stat = {}
@@ -155,6 +172,11 @@ class GDStrmHelper(_PluginBase):
             "errors": 0,
         }
         self._db_path = os.path.join(self.get_data_path(), "gdstrm.db")
+        self._tlocal = threading.local()
+        self._write_conn = None
+        self._write_cache = {}
+        self._pending = 0
+        self._last_commit = time.time()
         self.mediaserver_helper = MediaServerHelper()
 
         if config:
@@ -187,6 +209,9 @@ class GDStrmHelper(_PluginBase):
             self._other_mediaext = config.get("other_mediaext") \
                 or ".nfo, .jpg, .png, .json, .ass, .srt, .sup"
             self._exclude_keywords = config.get("exclude_keywords") or ""
+
+            # 预解析扩展名为frozenset(热路径避免反复split，40万文件级别显著提速)
+            self.__build_ext_sets()
 
             # 媒体库路径映射(strm在MP和Emby容器里的路径不一致时使用)
             if config.get("emby_path"):
@@ -306,12 +331,29 @@ class GDStrmHelper(_PluginBase):
             }
         logger.info(f"共解析到 {len(self._dir_conf)} 个网盘配置")
 
+    def __build_ext_sets(self):
+        """
+        预解析扩展名为frozenset(热路径避免反复split，40万文件级别显著提速)。
+        惰性兜底：只要字符串有值就重建，避免任何路径下ext集合为空导致全线失效。
+        """
+        self._media_ext_set = frozenset(
+            e.strip().lower() for e in str(self._rmt_mediaext or "").split(",") if e.strip())
+        self._other_ext_set = frozenset(
+            e.strip().lower() for e in str(self._other_mediaext or "").split(",") if e.strip())
+
+    def __ensure_ext_sets(self):
+        """热路径入口兜底：若ext集合为空但配置字符串非空，则重建。"""
+        if not self._media_ext_set and self._rmt_mediaext:
+            self.__build_ext_sets()
+
     # ==================== SQLite ====================
     def __init_db(self):
+        """建表 + 全局PRAGMA调优。用独立连接完成。"""
         try:
             with self._db_lock:
                 conn = sqlite3.connect(self._db_path)
                 conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS files (
                         path TEXT PRIMARY KEY,
@@ -328,65 +370,170 @@ class GDStrmHelper(_PluginBase):
         except Exception as e:
             logger.error(f"初始化数据库失败：{e}")
 
-    def __db_conn(self):
-        conn = sqlite3.connect(self._db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
+    # -------- 读写分离：写用全局唯一连接，读用线程本地连接 --------
+    def __write_connection(self) -> sqlite3.Connection:
+        """全局唯一写连接(调用方必须持有_write_lock)。"""
+        if self._write_conn is None:
+            conn = sqlite3.connect(self._db_path, timeout=30, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA cache_size=-16000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            self._write_conn = conn
+        return self._write_conn
+
+    def __read_conn(self) -> sqlite3.Connection:
+        """当前线程的只读连接(线程本地，WAL下可并发读，全程复用)。"""
+        conn = getattr(self._tlocal, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path, timeout=30, check_same_thread=False)
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA cache_size=-8000")
+            conn.execute("PRAGMA query_only=1")
+            self._tlocal.conn = conn
         return conn
 
-    def __db_get(self, path: str):
-        """返回 (size, mtime, strm_path) 或 None"""
-        try:
-            with self._db_lock:
-                conn = self.__db_conn()
-                cur = conn.execute("SELECT size, mtime, strm_path FROM files WHERE path=?", (path,))
-                row = cur.fetchone()
+    def __close_read_conn(self):
+        """关闭当前线程的只读连接(线程退出时调用)。"""
+        conn = getattr(self._tlocal, "conn", None)
+        if conn is not None:
+            try:
                 conn.close()
-                return row
+            except Exception:
+                pass
+            self._tlocal.conn = None
+
+    def __db_get(self, path: str):
+        """
+        返回 (size, mtime, strm_path) 或 None。
+        先查读己之写缓存(含未提交的批量写入)，未命中再查只读连接。
+        这样批量提交延迟不会导致刚处理过的文件被重复处理。
+        """
+        # 读己之写：优先命中内存缓存
+        cached = self._write_cache.get(path)
+        if cached is not None:
+            # 特殊标记 False 表示已删除
+            return None if cached is False else cached
+        try:
+            conn = self.__read_conn()
+            cur = conn.execute("SELECT size, mtime, strm_path FROM files WHERE path=?", (path,))
+            return cur.fetchone()
         except Exception as e:
             logger.debug(f"查询数据库失败 {path}: {e}")
             return None
 
     def __db_upsert(self, path: str, size: int, mtime: float, strm_path: str, mon_path: str):
+        """
+        写入记录。全局写连接 + _write_lock串行化，批量提交:
+        累计达_batch_size条或距上次提交超_commit_interval秒才commit一次。
+        可靠性换性能：崩溃时未提交的记录下次扫描会重做(不会出错)。
+        """
         try:
-            with self._db_lock:
-                conn = self.__db_conn()
+            with self._write_lock:
+                conn = self.__write_connection()
                 conn.execute(
                     "INSERT OR REPLACE INTO files(path, size, mtime, strm_path, mon_path, updated_at) "
                     "VALUES(?,?,?,?,?,?)",
                     (path, size, mtime, strm_path, mon_path, time.time()))
-                conn.commit()
-                conn.close()
+                # 读己之写缓存
+                self._write_cache[path] = (size, mtime, strm_path)
+                self._pending += 1
+                self.__maybe_commit(conn)
         except Exception as e:
             logger.debug(f"写入数据库失败 {path}: {e}")
 
     def __db_delete(self, path: str):
         try:
-            with self._db_lock:
-                conn = self.__db_conn()
+            with self._write_lock:
+                conn = self.__write_connection()
                 conn.execute("DELETE FROM files WHERE path=?", (path,))
-                conn.commit()
-                conn.close()
+                self._write_cache[path] = False  # 读己之写：标记已删
+                self._pending += 1
+                self.__maybe_commit(conn)
         except Exception as e:
             logger.debug(f"删除数据库记录失败 {path}: {e}")
 
-    def __db_all_by_mon(self, mon_path: str) -> Dict[str, str]:
-        """返回该监控目录下所有 {path: strm_path}"""
-        result = {}
+    def __maybe_commit(self, conn: sqlite3.Connection, force: bool = False):
+        """
+        批量提交：达条数/时间阈值或强制时commit。调用方需持_write_lock。
+        提交后清空读己之写缓存(数据已落盘，只读连接可见)，缓存因此最多只有
+        一个批次的量(约_batch_size条)，内存占用恒定极小。
+        """
+        now = time.time()
+        if force or self._pending >= self._batch_size or (now - self._last_commit) >= self._commit_interval:
+            try:
+                conn.commit()
+                self._write_cache.clear()
+            except Exception as e:
+                logger.debug(f"提交数据库失败: {e}")
+            self._pending = 0
+            self._last_commit = now
+
+    def __db_flush(self):
+        """强制提交挂起的写入(扫描/删除结束时调用)。"""
         try:
+            with self._write_lock:
+                if self._write_conn is not None:
+                    self.__maybe_commit(self._write_conn, force=True)
+        except Exception as e:
+            logger.debug(f"flush失败: {e}")
+
+    def __db_close_write(self):
+        """关闭全局写连接(stop_service时调用)。"""
+        try:
+            with self._write_lock:
+                if self._write_conn is not None:
+                    try:
+                        self._write_conn.commit()
+                        self._write_conn.close()
+                    except Exception:
+                        pass
+                    self._write_conn = None
+                    self._pending = 0
+        except Exception as e:
+            logger.debug(f"关闭写连接失败: {e}")
+
+    def __db_checkpoint(self):
+        """WAL检查点(TRUNCATE)，回收.db-wal文件，防止无限增长。"""
+        try:
+            self.__db_flush()
             with self._db_lock:
-                conn = self.__db_conn()
-                cur = conn.execute("SELECT path, strm_path FROM files WHERE mon_path=?", (mon_path,))
-                for path, strm_path in cur.fetchall():
-                    result[path] = strm_path
+                conn = sqlite3.connect(self._db_path, timeout=30)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 conn.close()
         except Exception as e:
-            logger.debug(f"查询数据库失败 {mon_path}: {e}")
-        return result
+            logger.debug(f"WAL checkpoint失败: {e}")
+
+    def __db_iter_by_mon(self, mon_path: str, batch: int = 1000):
+        """
+        流式迭代该盘所有记录，每次fetchmany(batch)，避免一次性把几十万条读进内存。
+        用独立只读连接，产出 (path, strm_path)。
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=30)
+            conn.execute("PRAGMA busy_timeout=30000")
+            cur = conn.execute("SELECT path, strm_path FROM files WHERE mon_path=?", (mon_path,))
+            while True:
+                rows = cur.fetchmany(batch)
+                if not rows:
+                    break
+                for row in rows:
+                    yield row
+        except Exception as e:
+            logger.debug(f"流式查询数据库失败 {mon_path}: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def __db_count(self) -> int:
         try:
             with self._db_lock:
-                conn = self.__db_conn()
+                conn = sqlite3.connect(self._db_path, timeout=30)
                 cur = conn.execute("SELECT COUNT(1) FROM files")
                 n = cur.fetchone()[0]
                 conn.close()
@@ -396,7 +543,8 @@ class GDStrmHelper(_PluginBase):
 
     # ==================== 工作线程池 ====================
     def __start_workers(self):
-        self._queue = Queue()
+        # 有界队列：入队满则阻塞，背压限制内存峰值(20-40万文件时防堆积)
+        self._queue = Queue(maxsize=self._queue_maxsize)
         self._event.clear()
         self._work_threads = []
         for i in range(max(1, self._workers)):
@@ -406,33 +554,52 @@ class GDStrmHelper(_PluginBase):
         logger.info(f"启动 {len(self._work_threads)} 个工作线程")
 
     def __worker_loop(self):
-        while not self._event.is_set():
-            try:
-                task = self._queue.get(timeout=1)
-            except Empty:
-                continue
-            if task is None:
-                self._queue.task_done()
-                break
-            event_path, mon_path = task
-            try:
-                self.__handle_file(event_path=event_path, mon_path=mon_path)
-            except Exception as e:
-                self._stat["errors"] = self._stat.get("errors", 0) + 1
-                logger.error(f"处理文件出错 {event_path}: {e} - {traceback.format_exc()}")
-            finally:
-                with self._inflight_lock:
-                    self._inflight.discard(event_path)
-                self._queue.task_done()
+        try:
+            while not self._event.is_set():
+                try:
+                    task = self._queue.get(timeout=1)
+                except Empty:
+                    continue
+                if task is None:
+                    self._queue.task_done()
+                    break
+                event_path, mon_path = task
+                try:
+                    self.__handle_file(event_path=event_path, mon_path=mon_path)
+                except Exception as e:
+                    self._stat["errors"] = self._stat.get("errors", 0) + 1
+                    logger.error(f"处理文件出错 {event_path}: {e} - {traceback.format_exc()}")
+                finally:
+                    with self._inflight_lock:
+                        self._inflight.discard(event_path)
+                    self._queue.task_done()
+        finally:
+            # worker退出：关闭本线程的只读连接(写由全局写连接统一管理)
+            self.__close_read_conn()
 
     def __enqueue(self, event_path: str, mon_path: str):
-        """入队，带在途去重"""
+        """
+        入队，带在途去重。有界队列(背压)：队列满时阻塞等待消费，
+        以带超时的循环put响应停止信号，避免停服时永久阻塞。
+        """
         with self._inflight_lock:
             if event_path in self._inflight:
                 return
             self._inflight.add(event_path)
-        if self._queue is not None:
-            self._queue.put((event_path, mon_path))
+        q = self._queue
+        if q is None:
+            with self._inflight_lock:
+                self._inflight.discard(event_path)
+            return
+        while not self._event.is_set():
+            try:
+                q.put((event_path, mon_path), timeout=1)
+                return
+            except Full:
+                continue
+        # 停止中：放弃入队并回收inflight标记
+        with self._inflight_lock:
+            self._inflight.discard(event_path)
 
     # ==================== 后台延迟启动 ====================
     def __delayed_startup(self):
@@ -582,6 +749,8 @@ class GDStrmHelper(_PluginBase):
     def __do_scan(self, full: bool):
         scan_type = "全量" if full else "增量"
         logger.info(f"开始{scan_type}扫描")
+        # 兜底：确保扩展名集合已构建(防止任何路径下ext集合为空导致不生成strm)
+        self.__ensure_ext_sets()
         start = time.time()
         total = 0
         for mon_path, conf in self._dir_conf.items():
@@ -605,7 +774,7 @@ class GDStrmHelper(_PluginBase):
                 except Exception:
                     continue
                 suffix = Path(path).suffix.lower()
-                is_media = suffix in self.__ext_list(self._rmt_mediaext)
+                is_media = suffix in self._media_ext_set
                 # 计算本地产物路径(媒体=strm，非媒体=复制目标)
                 target = path.replace(mon_path, conf["strm_dir"], 1)
                 product = (os.path.splitext(target)[0] + ".strm") if is_media else target
@@ -641,6 +810,10 @@ class GDStrmHelper(_PluginBase):
         # 等待队列消费完
         if self._queue:
             self._queue.join()
+        # 提交所有挂起写入，关闭扫描线程自己的只读连接，回收WAL
+        self.__db_flush()
+        self.__close_read_conn()
+        self.__db_checkpoint()
         elapsed = round(time.time() - start, 1)
         if full:
             self._stat["last_full_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -652,9 +825,6 @@ class GDStrmHelper(_PluginBase):
         if self._del_sync:
             self.clean_orphans()
 
-    def __ext_list(self, ext_str: str) -> List[str]:
-        return [e.strip().lower() for e in str(ext_str or "").split(",") if e.strip()]
-
     # ==================== 文件处理 ====================
     def __handle_file(self, event_path: str, mon_path: str):
         """处理单个文件(无全局锁)"""
@@ -664,6 +834,7 @@ class GDStrmHelper(_PluginBase):
         conf = self._dir_conf.get(mon_path)
         if not conf:
             return
+        self.__ensure_ext_sets()
         strm_dir = conf["strm_dir"]
         emby_play = conf["emby_play"]
 
@@ -672,7 +843,7 @@ class GDStrmHelper(_PluginBase):
 
         self._stat["processed"] = self._stat.get("processed", 0) + 1
 
-        if suffix in self.__ext_list(self._rmt_mediaext):
+        if suffix in self._media_ext_set:
             # 媒体文件 -> 生成strm
             # 记录真实样例(每个盘一条，供路径预览)
             if mon_path not in self._sample_media:
@@ -700,9 +871,9 @@ class GDStrmHelper(_PluginBase):
 
     def __wants_copy(self, suffix: str) -> bool:
         """该后缀是否会被复制到本地(据当前开关)"""
-        if self._copy_files and suffix in self.__ext_list(self._other_mediaext):
+        if self._copy_files and suffix in self._other_ext_set:
             return True
-        if self._copy_subtitles and suffix in [".srt", ".ass", ".ssa", ".sub", ".sup"]:
+        if self._copy_subtitles and suffix in self._sub_ext_set:
             return True
         return False
 
@@ -721,10 +892,10 @@ class GDStrmHelper(_PluginBase):
     def __handle_other_file(self, event_path: str, target_file: str):
         suffix = Path(event_path).suffix.lower()
         # 复制非媒体文件
-        if self._copy_files and suffix in self.__ext_list(self._other_mediaext):
+        if self._copy_files and suffix in self._other_ext_set:
             self.__copy_file(event_path, target_file)
         # 复制字幕
-        elif self._copy_subtitles and suffix in [".srt", ".ass", ".ssa", ".sub", ".sup"]:
+        elif self._copy_subtitles and suffix in self._sub_ext_set:
             self.__copy_file(event_path, target_file)
 
     def __copy_file(self, src: str, dst: str):
@@ -786,6 +957,8 @@ class GDStrmHelper(_PluginBase):
             return
         try:
             logger.info("开始清理孤儿STRM(删除同步)")
+            # 先提交挂起写入，确保读到最新DB状态(避免漏判/误判孤儿)
+            self.__db_flush()
             # 强制多次挂载存活检查
             times = max(1, self._del_check_times)
             for mon_path in self._dir_conf.keys():
@@ -797,11 +970,10 @@ class GDStrmHelper(_PluginBase):
                         time.sleep(2)
             logger.info(f"挂载存活检查通过(每盘{times}次)")
 
-            # 收集所有待删除的孤儿
+            # 收集所有待删除的孤儿(流式迭代DB，避免几十万条一次性进内存)
             orphans = []  # [(src_path, strm_path, mon_path)]
             for mon_path in self._dir_conf.keys():
-                db_files = self.__db_all_by_mon(mon_path)
-                for src_path, strm_path in db_files.items():
+                for src_path, strm_path in self.__db_iter_by_mon(mon_path):
                     if not os.path.exists(src_path):
                         orphans.append((src_path, strm_path, mon_path))
 
@@ -1568,6 +1740,9 @@ class GDStrmHelper(_PluginBase):
                 pass
         self._work_threads = []
         self._queue = None
+
+        # 提交并关闭全局写连接(worker已各自关闭只读连接)
+        self.__db_close_write()
 
         # 停止调度器
         if self._scheduler:
