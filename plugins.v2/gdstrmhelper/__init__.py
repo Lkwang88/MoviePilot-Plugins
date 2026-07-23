@@ -55,7 +55,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -824,11 +824,19 @@ class GDStrmHelper(_PluginBase):
             deleted = 0
             for src_path, strm_path, mon_path in orphans:
                 try:
+                    # STRM生成根目录(如 /media/LK01)，作为空目录清理的禁止越界边界
+                    conf = self._dir_conf.get(mon_path) or {}
+                    strm_root = conf.get("strm_dir")
                     if strm_path and os.path.exists(strm_path):
+                        # 安全校验：strm文件必须确实位于其所属盘的STRM生成根目录之内
+                        if strm_root and not self.__is_within(strm_path, strm_root):
+                            logger.warn(f"跳过删除(STRM不在生成目录内，疑似配置变更)：{strm_path}")
+                            continue
                         os.remove(strm_path)
                         logger.info(f"删除孤儿STRM {strm_path}")
-                        # 清理空目录
-                        self.__remove_empty_dir(os.path.dirname(strm_path))
+                        # 向上清理空目录，但绝不越过STRM生成根目录
+                        if strm_root:
+                            self.__cleanup_empty_dirs(os.path.dirname(strm_path), strm_root)
                     self.__db_delete(src_path)
                     deleted += 1
                 except Exception as e:
@@ -842,12 +850,56 @@ class GDStrmHelper(_PluginBase):
         finally:
             self._del_lock.release()
 
-    def __remove_empty_dir(self, dir_path: str):
+    @staticmethod
+    def __is_within(child: str, parent: str) -> bool:
+        """
+        严格判断 child 是否在 parent 目录之内(不含 parent 自身)。
+        用 commonpath 而非 startswith，避免 /media/LK01 误匹配 /media/LK011。
+        """
         try:
-            if os.path.isdir(dir_path) and not os.listdir(dir_path):
-                os.rmdir(dir_path)
+            child_abs = os.path.abspath(child)
+            parent_abs = os.path.abspath(parent)
+            if child_abs == parent_abs:
+                return False
+            return os.path.commonpath([child_abs, parent_abs]) == parent_abs
         except Exception:
-            pass
+            return False
+
+    def __cleanup_empty_dirs(self, start_dir: str, root_dir: str):
+        """
+        从 start_dir 开始向上逐层删除空目录，直到 root_dir 的下一层为止。
+        安全边界(生产级媒体库，破坏性操作，多重保护)：
+        - 绝不删除 STRM 生成根目录本身(root_dir，如 /media/LK01)，即使它是空的
+        - 绝不删除 root_dir 之外的任何目录(如 /media、/)
+        - 每层删除前都重新确认：目录存在、确实为空、且严格位于 root_dir 之内
+        """
+        try:
+            root_abs = os.path.abspath(root_dir)
+            cur = os.path.abspath(start_dir)
+        except Exception:
+            return
+        # 逐层向上，但只处理严格位于 root_dir 之内的目录
+        while self.__is_within(cur, root_abs):
+            try:
+                # 只删真正为空的目录
+                if not os.path.isdir(cur):
+                    break
+                if os.listdir(cur):
+                    break
+                # 双保险：删除前再次核验边界
+                if not self.__is_within(cur, root_abs):
+                    break
+                os.rmdir(cur)
+                logger.info(f"清理空目录 {cur}")
+            except OSError:
+                # 非空/无权限/竞态等，停止上溯
+                break
+            except Exception:
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
 
     # ==================== 通知聚合 ====================
     def __collect_media(self, strm_file: str):
