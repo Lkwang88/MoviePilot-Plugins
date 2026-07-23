@@ -1,4 +1,16 @@
 {
+  "GDStrmHelper": {
+    "name": "GD网盘Strm助手",
+    "description": "为rclone挂载的谷歌网盘生成STRM：异步全量+增量扫描、SQLite状态记忆、实时监控、聚合刷新Emby、删除同步双保险。",
+    "labels": "媒体库,工具",
+    "version": "1.0.0",
+    "icon": "Google_cloud_A.png",
+    "author": "lkwang88",
+    "level": 1,
+    "history": {
+      "v1.0.0": "首发版本：基于CloudStrmCompanion重构，rclone谷歌网盘专用。异步启动不阻塞MP、生产者-消费者线程池、SQLite增量状态记忆、scandir遍历、inotify优先监控、strm原子写入、Emby聚合刷新、通知聚合防轰炸、删除同步(挂载多次存活检查+数量熔断方案A)。"
+    }
+  },
   "GDriveUploadStat": {
     "name": "网盘上传量统计",
     "description": "按盘符统计整理记录的落盘数据量，达到自定义阈值走通知频道告警（自用/gclone多盘限额监控）。",
