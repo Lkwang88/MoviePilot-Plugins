@@ -55,7 +55,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -1304,6 +1304,74 @@ class GDStrmHelper(_PluginBase):
                 "real": "真实样例" if sample else "占位示例",
             })
         return previews
+
+    def __check_conf_issues(self) -> List[str]:
+        """
+        对当前配置做合理性校验，返回问题列表(不阻断运行，仅提醒)。
+        """
+        issues = []
+        for mon_path, conf in self._dir_conf.items():
+            strm_dir = conf["strm_dir"]
+            emby_play = conf["emby_play"]
+            # 监控目录不存在
+            if not os.path.exists(mon_path):
+                issues.append(f"监控目录不存在：{mon_path}（挂载未就绪？）")
+            # 监控目录存在但为空
+            elif not self.__check_mount(mon_path):
+                issues.append(f"监控目录为空：{mon_path}（挂载未就绪？删除同步会自动跳过）")
+            # strm目录是监控目录的子目录
+            try:
+                if Path(strm_dir).is_relative_to(Path(mon_path)):
+                    issues.append(f"STRM目录 {strm_dir} 是监控目录 {mon_path} 的子目录，会导致自我监控")
+            except Exception:
+                pass
+            # Emby播放路径看起来仍是MP本地路径(可能忘了改成Emby容器路径)
+            if emby_play == mon_path:
+                issues.append(f"盘 {mon_path} 的Emby播放路径与监控目录相同，"
+                              f"若Emby容器挂载路径不同请修正(否则Emby将无法播放)")
+        # 开启Emby刷新但没选服务器
+        if self._refresh_emby and not self._mediaservers:
+            issues.append("已开启【刷新Emby】但未选择媒体服务器")
+        return issues
+
+    def __validate_and_preview(self):
+        """
+        保存配置后立即校验并输出路径预览(在生成任何strm之前)。
+        结果同时写入日志和系统消息(右上角通知)，方便当场核对映射是否正确。
+        """
+        if not self._dir_conf:
+            return
+        previews = self.__preview_paths()
+        # 组装可读文本
+        lines = [f"【GD网盘Strm助手】路径预览（共{len(previews)}个盘，占位示例，非真实文件）："]
+        for i, pv in enumerate(previews, 1):
+            lines.append(
+                f"\n▎盘{i}: {pv['mon']}"
+                f"\n  源文件示例 : {pv['src']}"
+                f"\n  生成STRM   : {pv['strm_file']}"
+                f"\n  STRM内容   : {pv['strm_content']}"
+                f"\n  Emby侧STRM : {pv['emby_strm']}"
+            )
+        preview_text = "\n".join(lines)
+        # 输出到日志(逐行, 便于查看)
+        for line in preview_text.split("\n"):
+            logger.info(line)
+
+        # 配置问题提醒
+        issues = self.__check_conf_issues()
+        if issues:
+            warn_text = "配置提醒：\n" + "\n".join(f"• {x}" for x in issues)
+            logger.warn(f"【GD网盘Strm助手】{warn_text}")
+            try:
+                self.systemmessage.put(f"GD网盘Strm助手 配置提醒：\n{warn_text}")
+            except Exception:
+                pass
+
+        # 预览推送到系统消息(右上角)，方便保存后立刻核对
+        try:
+            self.systemmessage.put(preview_text)
+        except Exception:
+            pass
 
     def get_page(self) -> List[dict]:
         """统计页"""
