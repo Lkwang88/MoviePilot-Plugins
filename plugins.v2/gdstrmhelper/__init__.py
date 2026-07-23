@@ -55,7 +55,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -225,8 +225,9 @@ class GDStrmHelper(_PluginBase):
             except Exception as e:
                 logger.error(f"增量扫描cron [{self._incr_cron}] 无效：{e}")
 
-        # 后台异步启动：监控 + 首次全量(不阻塞MP启动)
-        if self._enabled and self._monitor:
+        # 后台异步启动：首次全量(+监控)，不阻塞MP启动
+        # 只要启用插件就跑首次全量；实时监控开关只决定是否起watchdog
+        if self._enabled and self._dir_conf:
             self._startup_thread = threading.Thread(target=self.__delayed_startup, daemon=True)
             self._startup_thread.start()
 
@@ -439,8 +440,9 @@ class GDStrmHelper(_PluginBase):
                         return
                     time.sleep(1)
                     waited += 1
-            # 先起监控(秒级，不等扫描)
-            self.__start_monitor()
+            # 先起监控(秒级，不等扫描)。仅在开启实时监控时启动
+            if self._monitor:
+                self.__start_monitor()
             # 再跑首次全量扫描
             logger.info("开始首次全量扫描(后台)")
             self.scan_full()
@@ -578,16 +580,37 @@ class GDStrmHelper(_PluginBase):
                     size, mtime = st.st_size, st.st_mtime
                 except Exception:
                     continue
+                suffix = Path(path).suffix.lower()
+                is_media = suffix in self.__ext_list(self._rmt_mediaext)
+                # 计算本地产物路径(媒体=strm，非媒体=复制目标)
+                target = path.replace(mon_path, conf["strm_dir"], 1)
+                product = (os.path.splitext(target)[0] + ".strm") if is_media else target
                 row = self.__db_get(path)
                 if row:
                     db_size, db_mtime, db_strm = row
-                    # 未变化则跳过；媒体文件还需strm仍存在
+                    # 大小/时间未变：只要本地产物已就位就跳过(核心：本地有的不重复处理)
                     if db_size == size and abs((db_mtime or 0) - mtime) < 1:
-                        suffix = Path(path).suffix.lower()
-                        if suffix in self.__ext_list(self._rmt_mediaext):
+                        if is_media:
+                            # 媒体：对应strm仍存在即跳过
                             if db_strm and os.path.exists(db_strm):
                                 continue
                         else:
+                            # 非媒体：当前不需要复制、或复制目标已存在，即跳过
+                            if not self.__wants_copy(suffix) or (db_strm and os.path.exists(db_strm)):
+                                continue
+                else:
+                    # DB无记录(如升级/删库)：若本地产物已存在，补写DB并跳过，避免重复处理
+                    if is_media:
+                        if os.path.exists(product):
+                            self.__db_upsert(path, size, mtime, product, mon_path)
+                            continue
+                    else:
+                        # 非媒体：不需要复制、或复制目标已存在，补记并跳过
+                        if not self.__wants_copy(suffix):
+                            self.__db_upsert(path, size, mtime, product, mon_path)
+                            continue
+                        if os.path.exists(product):
+                            self.__db_upsert(path, size, mtime, product, mon_path)
                             continue
                 self.__enqueue(path, mon_path)
                 total += 1
@@ -626,19 +649,35 @@ class GDStrmHelper(_PluginBase):
         self._stat["processed"] = self._stat.get("processed", 0) + 1
 
         if suffix in self.__ext_list(self._rmt_mediaext):
+            # 媒体文件 -> 生成strm
             # strm内容 = 把监控路径替换为Emby播放路径(即Emby容器看到的网盘挂载路径)
             strm_content = event_path.replace(mon_path, emby_play, 1).replace("\\", "/")
             strm_path = self.__create_strm(target_file, strm_content)
-            if strm_path:
-                try:
-                    st = os.stat(event_path)
-                    self.__db_upsert(event_path, st.st_size, st.st_mtime, strm_path, mon_path)
-                except Exception:
-                    pass
+            # 无论新生成还是已存在，都记录状态(纳入SQLite记忆，下次扫描直接跳过)
+            product = strm_path or (os.path.splitext(target_file)[0] + ".strm")
+            self.__record_state(event_path, product, mon_path)
             # 同名附属文件(nfo/jpg等)
             self.__handle_siblings(event_path, mon_path, strm_dir)
         else:
+            # 非媒体文件 -> 视开关复制，同样纳入SQLite记忆
             self.__handle_other_file(event_path, target_file)
+            self.__record_state(event_path, target_file, mon_path)
+
+    def __record_state(self, src_path: str, strm_path: str, mon_path: str):
+        """把已处理文件的状态写入SQLite，供增量扫描跳过"""
+        try:
+            st = os.stat(src_path)
+            self.__db_upsert(src_path, st.st_size, st.st_mtime, strm_path, mon_path)
+        except Exception:
+            pass
+
+    def __wants_copy(self, suffix: str) -> bool:
+        """该后缀是否会被复制到本地(据当前开关)"""
+        if self._copy_files and suffix in self.__ext_list(self._other_mediaext):
+            return True
+        if self._copy_subtitles and suffix in [".srt", ".ass", ".ssa", ".sub", ".sup"]:
+            return True
+        return False
 
     def __handle_siblings(self, event_path: str, mon_path: str, strm_dir: str):
         try:
@@ -882,20 +921,28 @@ class GDStrmHelper(_PluginBase):
         for f in strm_files:
             mapped = self.__map_emby_strm(f)
             updates.append({"Path": mapped, "UpdateType": "Created"})
+        # 分批发送，避免全量时单次payload过大打挂Emby
+        batch_size = 100
         for emby_name, emby_server in emby_servers.items():
             emby = emby_server.instance
-            try:
-                res = emby.post_data(
-                    url='[HOST]emby/Library/Media/Updated?api_key=[APIKEY]&reqformat=json',
-                    data=json.dumps({"Updates": updates}),
-                    headers={"Content-Type": "application/json"})
-                if res and res.status_code in [200, 204]:
-                    logger.info(f"已通知 {emby_name} 刷新 {len(updates)} 个STRM")
-                else:
-                    code = res.status_code if res else "无响应"
-                    logger.error(f"通知 {emby_name} 刷新失败，错误码：{code}")
-            except Exception as e:
-                logger.error(f"通知 {emby_name} 刷新出错：{e}")
+            ok, fail = 0, 0
+            for i in range(0, len(updates), batch_size):
+                batch = updates[i:i + batch_size]
+                try:
+                    res = emby.post_data(
+                        url='[HOST]emby/Library/Media/Updated?api_key=[APIKEY]&reqformat=json',
+                        data=json.dumps({"Updates": batch}),
+                        headers={"Content-Type": "application/json"})
+                    if res and res.status_code in [200, 204]:
+                        ok += len(batch)
+                    else:
+                        fail += len(batch)
+                        code = res.status_code if res else "无响应"
+                        logger.error(f"通知 {emby_name} 刷新失败(批{i // batch_size + 1})，错误码：{code}")
+                except Exception as e:
+                    fail += len(batch)
+                    logger.error(f"通知 {emby_name} 刷新出错(批{i // batch_size + 1})：{e}")
+            logger.info(f"已通知 {emby_name} 刷新STRM：成功{ok} 失败{fail}")
 
     def __map_emby_strm(self, strm_file: str) -> str:
         """把MP侧strm路径映射为Emby侧strm路径"""

@@ -1,13 +1,14 @@
 {
   "GDStrmHelper": {
     "name": "GD网盘Strm助手",
-    "description": "为rclone挂载的谷歌网盘生成STRM：异步全量+增量扫描、SQLite状态记忆、实时监控、聚合刷新Emby、删除同步双保险。",
+    "description": "为rclone挂载的谷歌网盘生成STRM：异步全量+增量扫描、SQLite状态记忆(所有文件类型)、实时监控、聚合刷新Emby、删除同步双保险。",
     "labels": "媒体库,工具",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "Google_cloud_A.png",
     "author": "lkwang88",
     "level": 1,
     "history": {
+      "v1.1.0": "修复：仅启用插件未开监控时首次全量不执行的bug；所有文件类型(含nfo/jpg等元数据)纳入SQLite记忆，二次扫描不再重复处理，本地已有的任何文件直接跳过；DB丢失后可凭本地产物跳过并补库；Emby刷新分批发送(每100个)防打挂；实时监控开关只控制watchdog、不影响全量扫描。",
       "v1.0.0": "首发版本：基于CloudStrmCompanion重构，rclone谷歌网盘专用。异步启动不阻塞MP、生产者-消费者线程池、SQLite增量状态记忆、scandir遍历、inotify优先监控、strm原子写入、Emby聚合刷新、通知聚合防轰炸、删除同步(挂载多次存活检查+数量熔断方案A)。"
     }
   },
@@ -40,7 +41,7 @@
       "v1.3": "MoviePilot V2 版本媒体库服务器刷新插件"
     }
   },
-    "wd88": {
+  "wd88": {
     "name": "wd88",
     "description": "wd基于CloudStrm的优化版：支持异步启动与聚合刷新，解决挂载卡顿与API轰炸问题。",
     "labels": "媒体库,工具",
@@ -52,7 +53,7 @@
       "v2.0.1": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
     }
   },
-    "wd99": {
+  "wd99": {
     "name": "芙服媒体库通知",
     "description": "消息通知。",
     "labels": "媒体库,工具",
@@ -64,7 +65,7 @@
       "v1.9.6": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
     }
   },
-    "Media88": {
+  "Media88": {
     "name": "Media88",
     "description": "消息通知。",
     "labels": "媒体库,工具",
