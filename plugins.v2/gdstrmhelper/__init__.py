@@ -19,13 +19,10 @@ from watchdog.observers.polling import PollingObserver
 
 from app.core.config import settings
 from app.core.event import eventmanager, Event
-from app.core.metainfo import MetaInfoPath
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import MediaInfo
-from app.schemas.types import EventType, NotificationType, MediaType
-from app.utils.string import StringUtils
+from app.schemas.types import EventType, NotificationType
 
 
 class FileMonitorHandler(FileSystemEventHandler):
@@ -55,7 +52,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.0"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -88,7 +85,6 @@ class GDStrmHelper(_PluginBase):
     _incr_cron: str = "*/30 * * * *"  # 增量扫描cron(默认30分钟)
     _monitor_mode = "polling"    # 实时监控模式：polling(轮询,rclone推荐) / inotify
     _poll_interval: int = 10     # 轮询监控间隔(秒)
-    _notify_delay: int = 10      # 通知聚合延迟(秒)
     _refresh_quiet: int = 30     # Emby刷新安静期(秒)
     _del_check_times: int = 3    # 删除前挂载存活检查次数
     _del_max: int = 10           # 单轮最大删除数(熔断阈值)
@@ -110,10 +106,6 @@ class GDStrmHelper(_PluginBase):
     _work_threads: List[threading.Thread] = []
     _inflight = set()            # 在途文件去重
     _inflight_lock = threading.Lock()
-
-    # 通知聚合
-    _medias = {}
-    _medias_lock = threading.Lock()
 
     # Emby刷新聚合
     _refresh_queue = set()
@@ -152,6 +144,8 @@ class GDStrmHelper(_PluginBase):
 
     # 统计
     _stat = {}
+    _stat_lock = threading.Lock()   # 保护并发计数(多worker累加)
+    _scan_run = None                # 本轮扫描汇总计数(每次扫描重建)
     # 每个盘的真实样例媒体路径(用于路径预览) mon_path -> src_path
     _sample_media = {}
 
@@ -160,7 +154,6 @@ class GDStrmHelper(_PluginBase):
         self._dir_conf = {}
         self._emby_paths = {}
         self._inflight = set()
-        self._medias = {}
         self._refresh_queue = set()
         self._sample_media = {}
         self._observers = []
@@ -174,6 +167,13 @@ class GDStrmHelper(_PluginBase):
             "deleted": 0,
             "errors": 0,
         }
+        # 累计统计需持久化，否则MP重启/插件重载会清零(DB仍在，计数却归零)
+        try:
+            saved = self.get_data("stat")
+            if isinstance(saved, dict):
+                self._stat.update({k: saved.get(k, self._stat[k]) for k in self._stat})
+        except Exception:
+            pass
         self._db_path = os.path.join(self.get_data_path(), "gdstrm.db")
         self._tlocal = threading.local()
         self._write_conn = None
@@ -203,7 +203,6 @@ class GDStrmHelper(_PluginBase):
             self._incr_cron = config.get("incr_cron") or "*/30 * * * *"
             self._monitor_mode = config.get("monitor_mode") or "polling"
             self._poll_interval = int(config.get("poll_interval") or 10)
-            self._notify_delay = int(config.get("notify_delay") or 10)
             self._refresh_quiet = int(config.get("refresh_quiet") or 30)
             self._del_check_times = int(config.get("del_check_times") or 3)
             self._del_max = int(config.get("del_max") or 10)
@@ -244,11 +243,6 @@ class GDStrmHelper(_PluginBase):
 
         # 启动工作线程池 + 队列
         self.__start_workers()
-
-        # 通知聚合发送
-        if self._notify:
-            self._scheduler.add_job(self.__send_msg, trigger="interval", seconds=5,
-                                    id="gdstrm_send_msg")
 
         # Emby聚合刷新
         if self._refresh_emby:
@@ -757,7 +751,7 @@ class GDStrmHelper(_PluginBase):
                 try:
                     self.__handle_file(event_path=event_path, mon_path=mon_path)
                 except Exception as e:
-                    self._stat["errors"] = self._stat.get("errors", 0) + 1
+                    self.__incr(stat_key="errors")
                     logger.error(f"处理文件出错 {event_path}: {e} - {traceback.format_exc()}")
                 finally:
                     with self._inflight_lock:
@@ -943,6 +937,11 @@ class GDStrmHelper(_PluginBase):
         self.__ensure_ext_sets()
         start = time.time()
         total = 0
+        # 本轮扫描汇总计数(线程安全由worker侧incr保证；扫描侧只写skip类)
+        self._scan_run = {
+            "strm_total": 0, "strm_created": 0, "strm_skipped": 0,
+            "meta_total": 0, "meta_copied": 0, "meta_skipped": 0,
+        }
         for mon_path, conf in self._dir_conf.items():
             if self._event.is_set():
                 logger.info("收到停止信号，中断扫描")
@@ -965,6 +964,11 @@ class GDStrmHelper(_PluginBase):
                     continue
                 suffix = Path(path).suffix.lower()
                 is_media = suffix in self._media_ext_set
+                # 汇总：区分STRM(媒体)与元数据(非媒体)的总处理数
+                if is_media:
+                    self._scan_run["strm_total"] += 1
+                else:
+                    self._scan_run["meta_total"] += 1
                 # 计算本地产物路径(媒体=strm，非媒体=复制目标)
                 target = path.replace(mon_path, conf["strm_dir"], 1)
                 product = (os.path.splitext(target)[0] + ".strm") if is_media else target
@@ -976,24 +980,29 @@ class GDStrmHelper(_PluginBase):
                         if is_media:
                             # 媒体：对应strm仍存在即跳过
                             if db_strm and os.path.exists(db_strm):
+                                self._scan_run["strm_skipped"] += 1
                                 continue
                         else:
                             # 非媒体：当前不需要复制、或复制目标已存在，即跳过
                             if not self.__wants_copy(suffix) or (db_strm and os.path.exists(db_strm)):
+                                self._scan_run["meta_skipped"] += 1
                                 continue
                 else:
                     # DB无记录(如升级/删库)：若本地产物已存在，补写DB并跳过，避免重复处理
                     if is_media:
                         if os.path.exists(product):
                             self.__db_upsert(path, size, mtime, product, mon_path)
+                            self._scan_run["strm_skipped"] += 1
                             continue
                     else:
                         # 非媒体：不需要复制、或复制目标已存在，补记并跳过
                         if not self.__wants_copy(suffix):
                             self.__db_upsert(path, size, mtime, product, mon_path)
+                            self._scan_run["meta_skipped"] += 1
                             continue
                         if os.path.exists(product):
                             self.__db_upsert(path, size, mtime, product, mon_path)
+                            self._scan_run["meta_skipped"] += 1
                             continue
                 self.__enqueue(path, mon_path)
                 total += 1
@@ -1010,10 +1019,44 @@ class GDStrmHelper(_PluginBase):
         else:
             self._stat["last_incr_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"{scan_type}扫描完成，入队 {total} 个变更文件，耗时 {elapsed}s")
+        self.__save_stat()
+        # 汇总通知(一刀切：整轮扫描只发一条，杜绝几十万文件的通知风暴)
+        self.__notify_scan_summary(scan_type, elapsed)
 
         # 增量/全量扫描后可选删除同步
         if self._del_sync:
             self.clean_orphans()
+
+    def __notify_scan_summary(self, scan_type: str, elapsed: float):
+        """整轮扫描结束发一条汇总通知。全量必发；增量仅在有新建/复制时才发(避免定时空跑骚扰)。"""
+        if not self._notify:
+            return
+        run = getattr(self, "_scan_run", None) or {}
+        strm_total = run.get("strm_total", 0)
+        strm_created = run.get("strm_created", 0)
+        strm_skipped = run.get("strm_skipped", 0)
+        meta_total = run.get("meta_total", 0)
+        meta_copied = run.get("meta_copied", 0)
+        meta_skipped = run.get("meta_skipped", 0)
+        # 增量且本轮无任何变更：不发通知
+        is_full = (scan_type == "全量")
+        if not is_full and strm_created == 0 and meta_copied == 0:
+            return
+        text = (
+            f"总耗时: {elapsed} 秒\n\n"
+            f"【STRM文件】共处理 {strm_total} 个，"
+            f"新建 {strm_created} 个，跳过 {strm_skipped} 个\n\n"
+            f"【元数据】共处理 {meta_total} 个，"
+            f"复制 {meta_copied} 个，跳过 {meta_skipped} 个"
+        )
+        try:
+            self.post_message(
+                mtype=NotificationType.Plugin,
+                title=f"GD网盘Strm助手 {scan_type}扫描完成",
+                text=text,
+                link=settings.MP_DOMAIN('#/history'))
+        except Exception as e:
+            logger.error(f"发送汇总通知失败：{e}")
 
     # ==================== 文件处理 ====================
     def __handle_file(self, event_path: str, mon_path: str):
@@ -1031,7 +1074,7 @@ class GDStrmHelper(_PluginBase):
         target_file = event_path.replace(mon_path, strm_dir, 1)
         suffix = Path(event_path).suffix.lower()
 
-        self._stat["processed"] = self._stat.get("processed", 0) + 1
+        self.__incr(stat_key="processed")
 
         if suffix in self._media_ext_set:
             # 媒体文件 -> 生成strm
@@ -1050,6 +1093,24 @@ class GDStrmHelper(_PluginBase):
             # 非媒体文件 -> 视开关复制，同样纳入SQLite记忆
             self.__handle_other_file(event_path, target_file)
             self.__record_state(event_path, target_file, mon_path)
+
+    def __incr(self, stat_key: str = None, run_key: str = None, n: int = 1):
+        """并发安全计数：worker多线程累加，d[k]=d.get(k)+1非原子会丢数，统一加锁。
+        stat_key写入累计_stat；run_key写入本轮_scan_run(供汇总通知)。"""
+        with self._stat_lock:
+            if stat_key:
+                self._stat[stat_key] = self._stat.get(stat_key, 0) + n
+            if run_key:
+                run = getattr(self, "_scan_run", None)
+                if isinstance(run, dict):
+                    run[run_key] = run.get(run_key, 0) + n
+
+    def __save_stat(self):
+        """持久化累计统计(不能每文件保存，只在扫描/删除结束及停止时调用)"""
+        try:
+            self.save_data("stat", self._stat)
+        except Exception as e:
+            logger.debug(f"保存统计失败：{e}")
 
     def __record_state(self, src_path: str, strm_path: str, mon_path: str):
         """把已处理文件的状态写入SQLite，供增量扫描跳过"""
@@ -1095,6 +1156,8 @@ class GDStrmHelper(_PluginBase):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
             logger.debug(f"复制文件 {src} -> {dst}")
+            # 并发安全计数(元数据复制)
+            self.__incr(run_key="meta_copied")
         except Exception as e:
             logger.error(f"复制文件失败 {src}: {e}")
 
@@ -1123,12 +1186,10 @@ class GDStrmHelper(_PluginBase):
                 f.write(strm_content)
             os.replace(tmp, strm_file)
 
-            self._stat["created"] = self._stat.get("created", 0) + 1
+            # 并发安全计数(累计 + 本轮汇总)
+            self.__incr(stat_key="created", run_key="strm_created")
             logger.info(f"生成STRM {strm_file}")
 
-            # 聚合通知
-            if self._notify:
-                self.__collect_media(strm_file)
             # 聚合刷新Emby
             if self._refresh_emby and self._mediaservers:
                 with self._refresh_lock:
@@ -1265,79 +1326,6 @@ class GDStrmHelper(_PluginBase):
                 break
             cur = parent
 
-    # ==================== 通知聚合 ====================
-    def __collect_media(self, strm_file: str):
-        try:
-            file_meta = MetaInfoPath(Path(strm_file))
-            key = f"{file_meta.cn_name} ({file_meta.year}){f' {file_meta.season}' if file_meta.season else ''}"
-            with self._medias_lock:
-                media_list = self._medias.get(key) or {}
-                if media_list:
-                    episodes = media_list.get("episodes") or []
-                    if file_meta.begin_episode and int(file_meta.begin_episode) not in episodes:
-                        episodes.append(int(file_meta.begin_episode))
-                    media_list.update({"episodes": episodes, "file_meta": file_meta,
-                                       "type": "tv" if file_meta.season else "movie",
-                                       "time": datetime.now()})
-                else:
-                    media_list = {
-                        "episodes": [int(file_meta.begin_episode)] if file_meta.begin_episode else [],
-                        "file_meta": file_meta,
-                        "type": "tv" if file_meta.season else "movie",
-                        "time": datetime.now(),
-                    }
-                self._medias[key] = media_list
-        except Exception as e:
-            logger.debug(f"收集通知信息失败 {strm_file}: {e}")
-
-    def __send_msg(self):
-        """定时检查聚合的媒体，安静期后发送汇总通知"""
-        if not self._medias:
-            return
-        with self._medias_lock:
-            keys = list(self._medias.keys())
-        for key in keys:
-            with self._medias_lock:
-                media_list = self._medias.get(key)
-            if not media_list:
-                continue
-            last_time = media_list.get("time")
-            mtype = media_list.get("type")
-            episodes = media_list.get("episodes")
-            file_meta = media_list.get("file_meta")
-            if not last_time:
-                continue
-            # 剧集需静默超过notify_delay，电影直接发
-            if (datetime.now() - last_time).total_seconds() > int(self._notify_delay) or str(mtype) == "movie":
-                try:
-                    if str(mtype) == "tv":
-                        season_episode = f"{key} {StringUtils.format_ep(episodes)}"
-                        media_type = MediaType.TV
-                        file_count = len(episodes) if episodes else 1
-                    else:
-                        season_episode = key
-                        media_type = MediaType.MOVIE
-                        file_count = 1
-                    image = None
-                    try:
-                        mediainfo: MediaInfo = self.chain.recognize_media(
-                            meta=file_meta, mtype=media_type, tmdbid=file_meta.tmdbid)
-                        if mediainfo:
-                            image = mediainfo.backdrop_path or mediainfo.poster_path
-                    except Exception:
-                        pass
-                    self.post_message(
-                        mtype=NotificationType.Plugin,
-                        title=f"{season_episode} STRM已生成",
-                        text=f"共{file_count}个文件",
-                        image=image,
-                        link=settings.MP_DOMAIN('#/history'))
-                except Exception as e:
-                    logger.error(f"发送通知失败 {key}: {e}")
-                finally:
-                    with self._medias_lock:
-                        self._medias.pop(key, None)
-
     # ==================== Emby聚合刷新 ====================
     def __flush_refresh(self):
         """安静期后合并刷新Emby"""
@@ -1446,7 +1434,6 @@ class GDStrmHelper(_PluginBase):
             "incr_cron": self._incr_cron,
             "monitor_mode": self._monitor_mode,
             "poll_interval": self._poll_interval,
-            "notify_delay": self._notify_delay,
             "refresh_quiet": self._refresh_quiet,
             "del_check_times": self._del_check_times,
             "del_max": self._del_max,
@@ -1553,13 +1540,11 @@ class GDStrmHelper(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 3},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
                              "content": [{"component": "VTextField", "props": {"model": "startup_delay", "label": "启动延迟(秒)", "placeholder": "60", "type": "number"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3},
-                             "content": [{"component": "VTextField", "props": {"model": "workers", "label": "工作线程数", "placeholder": "4", "type": "number"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3},
-                             "content": [{"component": "VTextField", "props": {"model": "notify_delay", "label": "通知聚合延迟(秒)", "placeholder": "10", "type": "number"}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
+                             "content": [{"component": "VTextField", "props": {"model": "workers", "label": "工作线程数(默认4，rclone网盘建议不超过8)", "placeholder": "4", "type": "number"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
                              "content": [{"component": "VTextField", "props": {"model": "refresh_quiet", "label": "Emby刷新安静期(秒)", "placeholder": "30", "type": "number"}}]},
                         ]
                     },
@@ -1695,7 +1680,6 @@ class GDStrmHelper(_PluginBase):
             "monitor_mode": "polling",
             "poll_interval": 10,
             "incr_cron": "*/30 * * * *",
-            "notify_delay": 10,
             "refresh_quiet": 30,
             "del_check_times": 3,
             "del_max": 10,
