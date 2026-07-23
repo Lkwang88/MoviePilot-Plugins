@@ -52,7 +52,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.7.0"
+    plugin_version = "1.8.0"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -74,6 +74,7 @@ class GDStrmHelper(_PluginBase):
     _onlyonce_dbvacuum = False   # 立即数据库瘦身
     _monitor = False             # 实时监控开关
     _notify = False              # 发送通知
+    _notify_on_change = True     # 仅在有变化时通知(自动扫描无新建/复制则静默；手动触发必发)
     _cover = False               # 覆盖已存在的strm
     _copy_files = False          # 复制非媒体文件(nfo/jpg等)
     _copy_subtitles = False      # 复制字幕文件
@@ -164,6 +165,7 @@ class GDStrmHelper(_PluginBase):
             "last_incr_scan": None,
             "processed": 0,
             "created": 0,
+            "copied": 0,
             "deleted": 0,
             "errors": 0,
         }
@@ -192,6 +194,7 @@ class GDStrmHelper(_PluginBase):
             self._onlyonce_dbvacuum = config.get("onlyonce_dbvacuum")
             self._monitor = config.get("monitor")
             self._notify = config.get("notify")
+            self._notify_on_change = config.get("notify_on_change") if config.get("notify_on_change") is not None else True
             self._cover = config.get("cover")
             self._copy_files = config.get("copy_files")
             self._copy_subtitles = config.get("copy_subtitles")
@@ -267,13 +270,13 @@ class GDStrmHelper(_PluginBase):
         # 立即执行(一次性开关)
         if self._onlyonce:
             logger.info("立即运行一次【全量扫描】")
-            self._scheduler.add_job(func=self.scan_full, trigger="date",
+            self._scheduler.add_job(func=lambda: self.scan_full(manual=True), trigger="date",
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                                     name="GD网盘全量扫描")
             self._onlyonce = False
         if self._onlyonce_incr:
             logger.info("立即运行一次【增量扫描】")
-            self._scheduler.add_job(func=self.scan_incr, trigger="date",
+            self._scheduler.add_job(func=lambda: self.scan_incr(manual=True), trigger="date",
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                                     name="GD网盘增量扫描")
             self._onlyonce_incr = False
@@ -545,7 +548,7 @@ class GDStrmHelper(_PluginBase):
     def __rebuild_and_scan(self):
         """重建数据库后触发一次全量扫描补库(供手动开关调用)。"""
         self.db_rebuild()
-        self.scan_full()
+        self.scan_full(manual=True)
 
     # -------- 读写分离：写用全局唯一连接，读用线程本地连接 --------
     def __write_connection(self) -> sqlite3.Connection:
@@ -747,9 +750,9 @@ class GDStrmHelper(_PluginBase):
                 if task is None:
                     self._queue.task_done()
                     break
-                event_path, mon_path = task
+                event_path, mon_path, do_siblings = task
                 try:
-                    self.__handle_file(event_path=event_path, mon_path=mon_path)
+                    self.__handle_file(event_path=event_path, mon_path=mon_path, do_siblings=do_siblings)
                 except Exception as e:
                     self.__incr(stat_key="errors")
                     logger.error(f"处理文件出错 {event_path}: {e} - {traceback.format_exc()}")
@@ -761,10 +764,13 @@ class GDStrmHelper(_PluginBase):
             # worker退出：关闭本线程的只读连接(写由全局写连接统一管理)
             self.__close_read_conn()
 
-    def __enqueue(self, event_path: str, mon_path: str):
+    def __enqueue(self, event_path: str, mon_path: str, do_siblings: bool = False):
         """
         入队，带在途去重。有界队列(背压)：队列满时阻塞等待消费，
         以带超时的循环put响应停止信号，避免停服时永久阻塞。
+        do_siblings: 是否处理同名附属文件(nfo/jpg等)。
+          - 扫描入队时为False：附属文件本身会作为独立entry被扫到，无需再当siblings处理(否则重复复制)。
+          - 实时监控事件为True：需把旁边早已存在的附属文件一并带过去。
         """
         with self._inflight_lock:
             if event_path in self._inflight:
@@ -777,7 +783,7 @@ class GDStrmHelper(_PluginBase):
             return
         while not self._event.is_set():
             try:
-                q.put((event_path, mon_path), timeout=1)
+                q.put((event_path, mon_path, do_siblings), timeout=1)
                 return
             except Full:
                 continue
@@ -870,7 +876,7 @@ class GDStrmHelper(_PluginBase):
         if self.__is_skip(event_path):
             return
         logger.debug(f"监控到文件{text}：{event_path}")
-        self.__enqueue(event_path, mon_path)
+        self.__enqueue(event_path, mon_path, do_siblings=True)
 
     def __is_skip(self, path: str) -> bool:
         """临时文件/回收站/隐藏文件跳过"""
@@ -922,26 +928,28 @@ class GDStrmHelper(_PluginBase):
             except Exception as e:
                 logger.debug(f"遍历目录失败 {cur}: {e}")
 
-    def scan_full(self):
+    def scan_full(self, manual: bool = False):
         """全量扫描：借助SQLite做增量跳过"""
-        self.__do_scan(full=True)
+        self.__do_scan(full=True, manual=manual)
 
-    def scan_incr(self):
+    def scan_incr(self, manual: bool = False):
         """增量扫描"""
-        self.__do_scan(full=False)
+        self.__do_scan(full=False, manual=manual)
 
-    def __do_scan(self, full: bool):
+    def __do_scan(self, full: bool, manual: bool = False):
         scan_type = "全量" if full else "增量"
         logger.info(f"开始{scan_type}扫描")
         # 兜底：确保扩展名集合已构建(防止任何路径下ext集合为空导致不生成strm)
         self.__ensure_ext_sets()
-        start = time.time()
         total = 0
-        # 本轮扫描汇总计数(线程安全由worker侧incr保证；扫描侧只写skip类)
-        self._scan_run = {
-            "strm_total": 0, "strm_created": 0, "strm_skipped": 0,
-            "meta_total": 0, "meta_copied": 0, "meta_skipped": 0,
-        }
+        # 每盘一份汇总计数(按盘分开发通知)。worker侧计数按文件所属盘归位。
+        # 用 _cur_mon 记录当前正在扫描/入队的盘，供worker侧__incr归位。
+        self._scan_run = {}
+        for mon_path in self._dir_conf.keys():
+            self._scan_run[mon_path] = {
+                "strm_total": 0, "strm_created": 0, "strm_skipped": 0,
+                "meta_total": 0, "meta_copied": 0, "meta_skipped": 0,
+            }
         for mon_path, conf in self._dir_conf.items():
             if self._event.is_set():
                 logger.info("收到停止信号，中断扫描")
@@ -949,6 +957,9 @@ class GDStrmHelper(_PluginBase):
             if not self.__check_mount(mon_path):
                 logger.warn(f"挂载未就绪或为空，跳过扫描：{mon_path}")
                 continue
+            run = self._scan_run[mon_path]
+            mon_start = time.time()
+            mon_total = 0
             for entry in self.__iter_files(mon_path):
                 if self._event.is_set():
                     logger.info("收到停止信号，中断扫描")
@@ -966,9 +977,9 @@ class GDStrmHelper(_PluginBase):
                 is_media = suffix in self._media_ext_set
                 # 汇总：区分STRM(媒体)与元数据(非媒体)的总处理数
                 if is_media:
-                    self._scan_run["strm_total"] += 1
+                    run["strm_total"] += 1
                 else:
-                    self._scan_run["meta_total"] += 1
+                    run["meta_total"] += 1
                 # 计算本地产物路径(媒体=strm，非媒体=复制目标)
                 target = path.replace(mon_path, conf["strm_dir"], 1)
                 product = (os.path.splitext(target)[0] + ".strm") if is_media else target
@@ -980,69 +991,83 @@ class GDStrmHelper(_PluginBase):
                         if is_media:
                             # 媒体：对应strm仍存在即跳过
                             if db_strm and os.path.exists(db_strm):
-                                self._scan_run["strm_skipped"] += 1
+                                run["strm_skipped"] += 1
                                 continue
                         else:
                             # 非媒体：当前不需要复制、或复制目标已存在，即跳过
                             if not self.__wants_copy(suffix) or (db_strm and os.path.exists(db_strm)):
-                                self._scan_run["meta_skipped"] += 1
+                                run["meta_skipped"] += 1
                                 continue
                 else:
                     # DB无记录(如升级/删库)：若本地产物已存在，补写DB并跳过，避免重复处理
                     if is_media:
                         if os.path.exists(product):
                             self.__db_upsert(path, size, mtime, product, mon_path)
-                            self._scan_run["strm_skipped"] += 1
+                            run["strm_skipped"] += 1
                             continue
                     else:
                         # 非媒体：不需要复制、或复制目标已存在，补记并跳过
                         if not self.__wants_copy(suffix):
                             self.__db_upsert(path, size, mtime, product, mon_path)
-                            self._scan_run["meta_skipped"] += 1
+                            run["meta_skipped"] += 1
                             continue
                         if os.path.exists(product):
                             self.__db_upsert(path, size, mtime, product, mon_path)
-                            self._scan_run["meta_skipped"] += 1
+                            run["meta_skipped"] += 1
                             continue
                 self.__enqueue(path, mon_path)
                 total += 1
-        # 等待队列消费完
-        if self._queue:
-            self._queue.join()
-        # 提交所有挂起写入，关闭扫描线程自己的只读连接，回收WAL
-        self.__db_flush()
+                mon_total += 1
+            # 该盘遍历完，等待其入队任务全部消费完再统计+发通知(按盘分开)
+            if self._queue:
+                self._queue.join()
+            self.__db_flush()
+            mon_elapsed = round(time.time() - mon_start, 1)
+            logger.info(f"[{self.__mon_label(mon_path)}] {scan_type}扫描完成，"
+                        f"入队 {mon_total} 个变更文件，耗时 {mon_elapsed}s")
+            self.__notify_scan_summary(mon_path, scan_type, mon_elapsed, manual)
+        # 全部盘扫描收尾：关闭扫描线程自己的只读连接，回收WAL
         self.__close_read_conn()
         self.__db_checkpoint()
-        elapsed = round(time.time() - start, 1)
         if full:
             self._stat["last_full_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         else:
             self._stat["last_incr_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"{scan_type}扫描完成，入队 {total} 个变更文件，耗时 {elapsed}s")
+        logger.info(f"{scan_type}扫描完成，共入队 {total} 个变更文件")
         self.__save_stat()
-        # 汇总通知(一刀切：整轮扫描只发一条，杜绝几十万文件的通知风暴)
-        self.__notify_scan_summary(scan_type, elapsed)
 
         # 增量/全量扫描后可选删除同步
         if self._del_sync:
             self.clean_orphans()
 
-    def __notify_scan_summary(self, scan_type: str, elapsed: float):
-        """整轮扫描结束发一条汇总通知。全量必发；增量仅在有新建/复制时才发(避免定时空跑骚扰)。"""
+    def __mon_label(self, mon_path: str) -> str:
+        """通知用的盘标签：取STRM生成目录最后一段(如 /media/LK01 -> LK01)，取不到则用监控目录名。"""
+        conf = self._dir_conf.get(mon_path) or {}
+        strm_dir = conf.get("strm_dir") or ""
+        label = os.path.basename(strm_dir.rstrip("/")) or os.path.basename(mon_path.rstrip("/"))
+        return label or mon_path
+
+    def __notify_scan_summary(self, mon_path: str, scan_type: str, elapsed: float, manual: bool):
+        """单个盘扫描结束发一条汇总通知。
+        - 手动触发(manual=True)：必发，作为回执。
+        - 自动触发 + 开启"仅在有变化时通知"：该盘本次无新建STRM、无复制元数据则静默。
+        - 自动触发 + 关闭该开关：每次都发。"""
         if not self._notify:
             return
-        run = getattr(self, "_scan_run", None) or {}
+        run = (getattr(self, "_scan_run", None) or {}).get(mon_path) or {}
         strm_total = run.get("strm_total", 0)
         strm_created = run.get("strm_created", 0)
         strm_skipped = run.get("strm_skipped", 0)
         meta_total = run.get("meta_total", 0)
         meta_copied = run.get("meta_copied", 0)
         meta_skipped = run.get("meta_skipped", 0)
-        # 增量且本轮无任何变更：不发通知
-        is_full = (scan_type == "全量")
-        if not is_full and strm_created == 0 and meta_copied == 0:
+        # 无变化静默：仅在"自动触发 且 开启notify_on_change开关 且 本盘无任何新建/复制"时跳过
+        changed = (strm_created > 0 or meta_copied > 0)
+        if not manual and self._notify_on_change and not changed:
             return
+        label = self.__mon_label(mon_path)
         text = (
+            f"监控目录: {mon_path}\n"
             f"总耗时: {elapsed} 秒\n\n"
             f"【STRM文件】共处理 {strm_total} 个，"
             f"新建 {strm_created} 个，跳过 {strm_skipped} 个\n\n"
@@ -1052,15 +1077,18 @@ class GDStrmHelper(_PluginBase):
         try:
             self.post_message(
                 mtype=NotificationType.Plugin,
-                title=f"GD网盘Strm助手 {scan_type}扫描完成",
+                title=f"GD网盘Strm助手 · {label} {scan_type}扫描完成",
                 text=text,
                 link=settings.MP_DOMAIN('#/history'))
         except Exception as e:
             logger.error(f"发送汇总通知失败：{e}")
 
     # ==================== 文件处理 ====================
-    def __handle_file(self, event_path: str, mon_path: str):
-        """处理单个文件(无全局锁)"""
+    def __handle_file(self, event_path: str, mon_path: str, do_siblings: bool = True):
+        """处理单个文件(无全局锁)。
+        do_siblings：是否顺带处理同名附属文件(nfo/jpg等)。
+        - 实时监控/事件驱动：True(把旁边早已存在的附属文件一并带过去)。
+        - 全量/增量扫描：False(附属文件本身会作为独立entry被扫到，再带siblings会重复复制+计数)。"""
         # 慢I/O放在锁外
         if not os.path.exists(event_path):
             return
@@ -1083,27 +1111,30 @@ class GDStrmHelper(_PluginBase):
                 self._sample_media[mon_path] = event_path
             # strm内容 = 把监控路径替换为Emby播放路径(即Emby容器看到的网盘挂载路径)
             strm_content = event_path.replace(mon_path, emby_play, 1).replace("\\", "/")
-            strm_path = self.__create_strm(target_file, strm_content)
+            strm_path = self.__create_strm(target_file, strm_content, mon_path)
             # 无论新生成还是已存在，都记录状态(纳入SQLite记忆，下次扫描直接跳过)
             product = strm_path or (os.path.splitext(target_file)[0] + ".strm")
             self.__record_state(event_path, product, mon_path)
-            # 同名附属文件(nfo/jpg等)
-            self.__handle_siblings(event_path, mon_path, strm_dir)
+            # 同名附属文件(nfo/jpg等)：仅事件驱动时处理，扫描时附属文件会被独立扫到
+            if do_siblings:
+                self.__handle_siblings(event_path, mon_path, strm_dir)
         else:
             # 非媒体文件 -> 视开关复制，同样纳入SQLite记忆
-            self.__handle_other_file(event_path, target_file)
+            self.__handle_other_file(event_path, target_file, mon_path)
             self.__record_state(event_path, target_file, mon_path)
 
-    def __incr(self, stat_key: str = None, run_key: str = None, n: int = 1):
+    def __incr(self, stat_key: str = None, run_key: str = None, mon_path: str = None, n: int = 1):
         """并发安全计数：worker多线程累加，d[k]=d.get(k)+1非原子会丢数，统一加锁。
-        stat_key写入累计_stat；run_key写入本轮_scan_run(供汇总通知)。"""
+        stat_key写入累计_stat；run_key写入本轮_scan_run[mon_path](按盘分开，供汇总通知)。"""
         with self._stat_lock:
             if stat_key:
                 self._stat[stat_key] = self._stat.get(stat_key, 0) + n
-            if run_key:
+            if run_key and mon_path:
                 run = getattr(self, "_scan_run", None)
                 if isinstance(run, dict):
-                    run[run_key] = run.get(run_key, 0) + n
+                    per = run.get(mon_path)
+                    if isinstance(per, dict):
+                        per[run_key] = per.get(run_key, 0) + n
 
     def __save_stat(self):
         """持久化累计统计(不能每文件保存，只在扫描/删除结束及停止时调用)"""
@@ -1136,32 +1167,32 @@ class GDStrmHelper(_PluginBase):
                 if str(f) == event_path:
                     continue
                 target = str(f).replace(mon_path, strm_dir, 1)
-                self.__handle_other_file(str(f), target)
+                self.__handle_other_file(str(f), target, mon_path)
         except Exception as e:
             logger.debug(f"处理同名附属文件失败 {event_path}: {e}")
 
-    def __handle_other_file(self, event_path: str, target_file: str):
+    def __handle_other_file(self, event_path: str, target_file: str, mon_path: str = None):
         suffix = Path(event_path).suffix.lower()
         # 复制非媒体文件
         if self._copy_files and suffix in self._other_ext_set:
-            self.__copy_file(event_path, target_file)
+            self.__copy_file(event_path, target_file, mon_path)
         # 复制字幕
         elif self._copy_subtitles and suffix in self._sub_ext_set:
-            self.__copy_file(event_path, target_file)
+            self.__copy_file(event_path, target_file, mon_path)
 
-    def __copy_file(self, src: str, dst: str):
+    def __copy_file(self, src: str, dst: str, mon_path: str = None):
         try:
             if os.path.exists(dst) and not self._cover:
                 return
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
             logger.debug(f"复制文件 {src} -> {dst}")
-            # 并发安全计数(元数据复制)
-            self.__incr(run_key="meta_copied")
+            # 并发安全计数(元数据复制，累计 + 本轮按盘汇总)
+            self.__incr(stat_key="copied", run_key="meta_copied", mon_path=mon_path)
         except Exception as e:
             logger.error(f"复制文件失败 {src}: {e}")
 
-    def __create_strm(self, strm_file: str, strm_content: str) -> Optional[str]:
+    def __create_strm(self, strm_file: str, strm_content: str, mon_path: str = None) -> Optional[str]:
         """原子写入strm，返回strm路径；无变化则跳过"""
         try:
             strm_file = os.path.splitext(strm_file)[0] + ".strm"
@@ -1186,8 +1217,8 @@ class GDStrmHelper(_PluginBase):
                 f.write(strm_content)
             os.replace(tmp, strm_file)
 
-            # 并发安全计数(累计 + 本轮汇总)
-            self.__incr(stat_key="created", run_key="strm_created")
+            # 并发安全计数(累计 + 本轮按盘汇总)
+            self.__incr(stat_key="created", run_key="strm_created", mon_path=mon_path)
             logger.info(f"生成STRM {strm_file}")
 
             # 聚合刷新Emby
@@ -1410,7 +1441,7 @@ class GDStrmHelper(_PluginBase):
         if not mon_path:
             logger.error(f"未找到 {file_path} 对应的监控目录")
             return
-        self.__enqueue(file_path, mon_path)
+        self.__enqueue(file_path, mon_path, do_siblings=True)
 
     # ==================== 配置回写 ====================
     def __update_config(self):
@@ -1424,6 +1455,7 @@ class GDStrmHelper(_PluginBase):
             "onlyonce_dbvacuum": self._onlyonce_dbvacuum,
             "monitor": self._monitor,
             "notify": self._notify,
+            "notify_on_change": self._notify_on_change,
             "cover": self._cover,
             "copy_files": self._copy_files,
             "copy_subtitles": self._copy_subtitles,
@@ -1510,6 +1542,15 @@ class GDStrmHelper(_PluginBase):
                              "content": [{"component": "VSwitch", "props": {"model": "copy_subtitles", "label": "复制字幕"}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 3},
                              "content": [{"component": "VSwitch", "props": {"model": "del_sync", "label": "删除同步"}}]},
+                        ]
+                    },
+                    # 通知策略行
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 12},
+                             "content": [{"component": "VSwitch", "props": {"model": "notify_on_change",
+                                          "label": "仅在有变化时通知（自动扫描无新建STRM/复制元数据则静默；手动触发按盘必发回执）"}}]},
                         ]
                     },
                     # 一次性操作行
@@ -1670,6 +1711,7 @@ class GDStrmHelper(_PluginBase):
             "onlyonce_dbvacuum": False,
             "monitor": False,
             "notify": False,
+            "notify_on_change": True,
             "cover": False,
             "copy_files": False,
             "copy_subtitles": False,
@@ -1805,6 +1847,7 @@ class GDStrmHelper(_PluginBase):
             ("上次增量扫描", stat.get("last_incr_scan") or "-"),
             ("累计处理文件", str(stat.get("processed", 0))),
             ("累计生成STRM", str(stat.get("created", 0))),
+            ("累计复制元数据", str(stat.get("copied", 0))),
             ("累计删除STRM", str(stat.get("deleted", 0))),
             ("累计错误数", str(stat.get("errors", 0))),
         ]
