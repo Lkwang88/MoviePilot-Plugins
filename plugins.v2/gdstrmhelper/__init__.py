@@ -55,7 +55,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -82,7 +82,9 @@ class GDStrmHelper(_PluginBase):
 
     _startup_delay: int = 60     # 启动延迟(秒)
     _workers: int = 4            # 工作线程数
-    _incr_cron: str = "*/5 * * * *"   # 增量扫描cron
+    _incr_cron: str = "*/30 * * * *"  # 增量扫描cron(默认30分钟)
+    _monitor_mode = "polling"    # 实时监控模式：polling(轮询,rclone推荐) / inotify
+    _poll_interval: int = 10     # 轮询监控间隔(秒)
     _notify_delay: int = 10      # 通知聚合延迟(秒)
     _refresh_quiet: int = 30     # Emby刷新安静期(秒)
     _del_check_times: int = 3    # 删除前挂载存活检查次数
@@ -130,6 +132,8 @@ class GDStrmHelper(_PluginBase):
 
     # 统计
     _stat = {}
+    # 每个盘的真实样例媒体路径(用于路径预览) mon_path -> src_path
+    _sample_media = {}
 
     def init_plugin(self, config: dict = None):
         # 重置运行时状态
@@ -138,6 +142,7 @@ class GDStrmHelper(_PluginBase):
         self._inflight = set()
         self._medias = {}
         self._refresh_queue = set()
+        self._sample_media = {}
         self._observers = []
         self._work_threads = []
         self._last_refresh_time = 0
@@ -167,7 +172,9 @@ class GDStrmHelper(_PluginBase):
 
             self._startup_delay = int(config.get("startup_delay") or 60)
             self._workers = int(config.get("workers") or 4)
-            self._incr_cron = config.get("incr_cron") or "*/5 * * * *"
+            self._incr_cron = config.get("incr_cron") or "*/30 * * * *"
+            self._monitor_mode = config.get("monitor_mode") or "polling"
+            self._poll_interval = int(config.get("poll_interval") or 10)
             self._notify_delay = int(config.get("notify_delay") or 10)
             self._refresh_quiet = int(config.get("refresh_quiet") or 30)
             self._del_check_times = int(config.get("del_check_times") or 3)
@@ -451,7 +458,13 @@ class GDStrmHelper(_PluginBase):
 
     # ==================== 实时监控 ====================
     def __start_monitor(self):
-        """为每个监控目录启动watchdog，优先inotify，失败回退轮询"""
+        """
+        为每个监控目录启动watchdog。
+        - polling模式(默认，rclone GD推荐)：PollingObserver，对云端新增敏感(不依赖inotify事件)
+        - inotify模式：Observer，省CPU、可休眠，仅适合本地磁盘/只有本机写入的场景
+        """
+        mode = self._monitor_mode or "polling"
+        interval = max(1, int(self._poll_interval or 10))
         for mon_path in self._dir_conf.keys():
             if self._event.is_set():
                 return
@@ -460,31 +473,42 @@ class GDStrmHelper(_PluginBase):
                 continue
             observer = None
             try:
-                # 优先inotify(省CPU、可休眠)
-                observer = Observer(timeout=10)
-                observer.schedule(FileMonitorHandler(mon_path, self), path=mon_path, recursive=True)
-                observer.daemon = True
-                observer.start()
-                logger.info(f"{mon_path} 实时监控(inotify)已启动")
-            except Exception as e:
-                err = str(e)
-                logger.warn(f"{mon_path} inotify监控启动失败，尝试轮询模式：{err}")
-                try:
-                    observer = PollingObserver(timeout=10)
+                if mode == "inotify":
+                    observer = Observer(timeout=10)
                     observer.schedule(FileMonitorHandler(mon_path, self), path=mon_path, recursive=True)
                     observer.daemon = True
                     observer.start()
-                    logger.info(f"{mon_path} 实时监控(轮询)已启动")
-                except Exception as e2:
-                    err2 = str(e2)
-                    if "inotify" in err2 and "reached" in err2:
-                        logger.warn(
-                            "inotify监控数量已达上限，请在宿主机执行：\n"
-                            "echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf\n"
-                            "echo fs.inotify.max_user_instances=524288 | sudo tee -a /etc/sysctl.conf\n"
-                            "sudo sysctl -p")
-                    logger.error(f"{mon_path} 监控启动失败：{err2}")
-                    self.systemmessage.put(f"{mon_path} 监控启动失败：{err2}")
+                    logger.info(f"{mon_path} 实时监控(inotify)已启动")
+                else:
+                    # 轮询模式：对rclone挂载的云端新增敏感
+                    observer = PollingObserver(timeout=interval)
+                    observer.schedule(FileMonitorHandler(mon_path, self), path=mon_path, recursive=True)
+                    observer.daemon = True
+                    observer.start()
+                    logger.info(f"{mon_path} 实时监控(轮询，间隔{interval}s)已启动")
+            except Exception as e:
+                err = str(e)
+                if "inotify" in err and "reached" in err:
+                    logger.warn(
+                        "inotify监控数量已达上限，请在宿主机执行：\n"
+                        "echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf\n"
+                        "echo fs.inotify.max_user_instances=524288 | sudo tee -a /etc/sysctl.conf\n"
+                        "sudo sysctl -p")
+                # inotify失败时兜底尝试轮询
+                if mode == "inotify":
+                    try:
+                        observer = PollingObserver(timeout=interval)
+                        observer.schedule(FileMonitorHandler(mon_path, self), path=mon_path, recursive=True)
+                        observer.daemon = True
+                        observer.start()
+                        logger.info(f"{mon_path} inotify失败，已回退轮询(间隔{interval}s)")
+                    except Exception as e2:
+                        logger.error(f"{mon_path} 监控启动失败：{e2}")
+                        self.systemmessage.put(f"{mon_path} 监控启动失败：{e2}")
+                        continue
+                else:
+                    logger.error(f"{mon_path} 监控启动失败：{err}")
+                    self.systemmessage.put(f"{mon_path} 监控启动失败：{err}")
                     continue
             self._observers.append(observer)
 
@@ -650,6 +674,9 @@ class GDStrmHelper(_PluginBase):
 
         if suffix in self.__ext_list(self._rmt_mediaext):
             # 媒体文件 -> 生成strm
+            # 记录真实样例(每个盘一条，供路径预览)
+            if mon_path not in self._sample_media:
+                self._sample_media[mon_path] = event_path
             # strm内容 = 把监控路径替换为Emby播放路径(即Emby容器看到的网盘挂载路径)
             strm_content = event_path.replace(mon_path, emby_play, 1).replace("\\", "/")
             strm_path = self.__create_strm(target_file, strm_content)
@@ -998,6 +1025,8 @@ class GDStrmHelper(_PluginBase):
             "startup_delay": self._startup_delay,
             "workers": self._workers,
             "incr_cron": self._incr_cron,
+            "monitor_mode": self._monitor_mode,
+            "poll_interval": self._poll_interval,
             "notify_delay": self._notify_delay,
             "refresh_quiet": self._refresh_quiet,
             "del_check_times": self._del_check_times,
@@ -1103,12 +1132,28 @@ class GDStrmHelper(_PluginBase):
                              "content": [{"component": "VTextField", "props": {"model": "refresh_quiet", "label": "Emby刷新安静期(秒)", "placeholder": "30", "type": "number"}}]},
                         ]
                     },
+                    # 监控模式行
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6},
+                             "content": [{"component": "VSelect", "props": {
+                                 "model": "monitor_mode", "label": "实时监控模式",
+                                 "items": [
+                                     {"title": "轮询(推荐rclone网盘，对云端新增敏感)", "value": "polling"},
+                                     {"title": "inotify(省CPU，仅适合本地磁盘/本机写入)", "value": "inotify"},
+                                 ]}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6},
+                             "content": [{"component": "VTextField", "props": {
+                                 "model": "poll_interval", "label": "轮询间隔(秒，仅轮询模式)", "placeholder": "10", "type": "number"}}]},
+                        ]
+                    },
                     # 数值参数行2
                     {
                         "component": "VRow",
                         "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 4},
-                             "content": [{"component": "VTextField", "props": {"model": "incr_cron", "label": "增量扫描周期(cron)", "placeholder": "*/5 * * * *"}}]},
+                             "content": [{"component": "VTextField", "props": {"model": "incr_cron", "label": "增量扫描周期(cron)", "placeholder": "*/30 * * * *"}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4},
                              "content": [{"component": "VTextField", "props": {"model": "del_check_times", "label": "删除前挂载检查次数", "placeholder": "3", "type": "number"}}]},
                             {"component": "VCol", "props": {"cols": 12, "md": 4},
@@ -1213,7 +1258,9 @@ class GDStrmHelper(_PluginBase):
             "del_sync": False,
             "startup_delay": 60,
             "workers": 4,
-            "incr_cron": "*/5 * * * *",
+            "monitor_mode": "polling",
+            "poll_interval": 10,
+            "incr_cron": "*/30 * * * *",
             "notify_delay": 10,
             "refresh_quiet": 30,
             "del_check_times": 3,
@@ -1225,6 +1272,38 @@ class GDStrmHelper(_PluginBase):
             "exclude_keywords": "",
             "emby_path": "",
         }
+
+    def __preview_paths(self) -> List[Dict[str, str]]:
+        """
+        按当前目录配置，给每个盘生成一条STRM映射预览。
+        优先用扫描时真实抓到的样例(_sample_media)，没有则用占位示例。
+        """
+        previews = []
+        for mon_path, conf in self._dir_conf.items():
+            strm_dir = conf["strm_dir"]
+            emby_play = conf["emby_play"]
+            emby_strm = conf["emby_strm"]
+            # 取真实样例；没有则用占位
+            sample = (self._sample_media or {}).get(mon_path)
+            if sample:
+                src = sample
+            else:
+                src = f"{mon_path}/国产剧集/剧名 (2026) {{tmdb=123456}}/Season 01/剧名 - S01E01.mp4"
+            # strm文件路径
+            strm_file = os.path.splitext(src.replace(mon_path, strm_dir, 1))[0] + ".strm"
+            # strm内容(Emby播放路径)
+            strm_content = src.replace(mon_path, emby_play, 1).replace("\\", "/")
+            # Emby侧strm路径(用于刷新)
+            emby_strm_path = strm_file.replace(strm_dir, emby_strm, 1) if strm_dir != emby_strm else strm_file
+            previews.append({
+                "mon": mon_path,
+                "src": src,
+                "strm_file": strm_file,
+                "strm_content": strm_content,
+                "emby_strm": emby_strm_path,
+                "real": "真实样例" if sample else "占位示例",
+            })
+        return previews
 
     def get_page(self) -> List[dict]:
         """统计页"""
@@ -1243,7 +1322,55 @@ class GDStrmHelper(_PluginBase):
             ("累计删除STRM", str(stat.get("deleted", 0))),
             ("累计错误数", str(stat.get("errors", 0))),
         ]
-        return [{
+
+        # ===== STRM路径预览卡片 =====
+        preview_cards = []
+        for pv in self.__preview_paths():
+            preview_cards.append({
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-3"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "props": {"class": "text-subtitle-1"},
+                        "text": f"📁 {pv['mon']}  （{pv['real']}）"
+                    },
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "VTable",
+                                "props": {"density": "compact"},
+                                "content": [{
+                                    "component": "tbody",
+                                    "content": [
+                                        {
+                                            "component": "tr",
+                                            "content": [
+                                                {"component": "td",
+                                                 "props": {"class": "text-medium-emphasis",
+                                                           "style": "width:130px;white-space:nowrap"},
+                                                 "text": label},
+                                                {"component": "td",
+                                                 "props": {"style": "word-break:break-all;font-family:monospace;font-size:12px"},
+                                                 "text": val},
+                                            ]
+                                        }
+                                        for label, val in [
+                                            ("源文件", pv["src"]),
+                                            ("生成STRM", pv["strm_file"]),
+                                            ("STRM内容", pv["strm_content"]),
+                                            ("Emby侧STRM", pv["emby_strm"]),
+                                        ]
+                                    ]
+                                }]
+                            }
+                        ]
+                    }
+                ]
+            })
+
+        stat_table = {
             "component": "VTable",
             "props": {"hover": True},
             "content": [
@@ -1270,6 +1397,26 @@ class GDStrmHelper(_PluginBase):
                     ]
                 }
             ]
+        }
+
+        content = []
+        if preview_cards:
+            content.append({
+                "component": "div",
+                "props": {"class": "text-h6 mb-2"},
+                "text": "STRM 路径预览"
+            })
+            content.extend(preview_cards)
+        content.append({
+            "component": "div",
+            "props": {"class": "text-h6 mb-2 mt-2"},
+            "text": "运行统计"
+        })
+        content.append(stat_table)
+
+        return [{
+            "component": "div",
+            "content": content
         }]
 
     def stop_service(self):
