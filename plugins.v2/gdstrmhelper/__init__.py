@@ -52,7 +52,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.8.0"
+    plugin_version = "1.9.0"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -113,6 +113,12 @@ class GDStrmHelper(_PluginBase):
     _refresh_lock = threading.Lock()
     _last_refresh_time = 0
 
+    # 实时监控生成通知聚合(攒批后按盘+按目录归拢发一条，避免逐文件通知风暴)
+    _monitor_pending = []            # [(mon_path, strm_file), ...]
+    _monitor_lock = threading.Lock()
+    _last_monitor_time = 0           # 最后一次监控生成strm的时间
+    _monitor_notify_interval: int = 300  # 监控通知聚合间隔(秒)
+
     # 删除同步锁(避免和扫描/其它删除并发)
     _del_lock = threading.Lock()
 
@@ -160,6 +166,8 @@ class GDStrmHelper(_PluginBase):
         self._observers = []
         self._work_threads = []
         self._last_refresh_time = 0
+        self._monitor_pending = []
+        self._last_monitor_time = 0
         self._stat = {
             "last_full_scan": None,
             "last_incr_scan": None,
@@ -206,6 +214,7 @@ class GDStrmHelper(_PluginBase):
             self._incr_cron = config.get("incr_cron") or "*/30 * * * *"
             self._monitor_mode = config.get("monitor_mode") or "polling"
             self._poll_interval = int(config.get("poll_interval") or 10)
+            self._monitor_notify_interval = int(config.get("monitor_notify_interval") or 300)
             self._refresh_quiet = int(config.get("refresh_quiet") or 30)
             self._del_check_times = int(config.get("del_check_times") or 3)
             self._del_max = int(config.get("del_max") or 10)
@@ -251,6 +260,11 @@ class GDStrmHelper(_PluginBase):
         if self._refresh_emby:
             self._scheduler.add_job(self.__flush_refresh, trigger="interval", seconds=5,
                                     id="gdstrm_flush_refresh")
+
+        # 实时监控通知聚合(仅开启监控+通知时)：每5秒检查，安静期到则汇总发送
+        if self._monitor and self._notify:
+            self._scheduler.add_job(self.__flush_monitor_notify, trigger="interval", seconds=5,
+                                    id="gdstrm_flush_monitor_notify")
 
         # 增量扫描cron(仅在启用+有配置时)
         if self._enabled and self._dir_conf:
@@ -1111,7 +1125,7 @@ class GDStrmHelper(_PluginBase):
                 self._sample_media[mon_path] = event_path
             # strm内容 = 把监控路径替换为Emby播放路径(即Emby容器看到的网盘挂载路径)
             strm_content = event_path.replace(mon_path, emby_play, 1).replace("\\", "/")
-            strm_path = self.__create_strm(target_file, strm_content, mon_path)
+            strm_path = self.__create_strm(target_file, strm_content, mon_path, monitor=do_siblings)
             # 无论新生成还是已存在，都记录状态(纳入SQLite记忆，下次扫描直接跳过)
             product = strm_path or (os.path.splitext(target_file)[0] + ".strm")
             self.__record_state(event_path, product, mon_path)
@@ -1192,8 +1206,10 @@ class GDStrmHelper(_PluginBase):
         except Exception as e:
             logger.error(f"复制文件失败 {src}: {e}")
 
-    def __create_strm(self, strm_file: str, strm_content: str, mon_path: str = None) -> Optional[str]:
-        """原子写入strm，返回strm路径；无变化则跳过"""
+    def __create_strm(self, strm_file: str, strm_content: str, mon_path: str = None,
+                      monitor: bool = False) -> Optional[str]:
+        """原子写入strm，返回strm路径；无变化则跳过。
+        monitor=True 表示由实时监控/事件驱动触发，真正新生成时攒入监控聚合缓冲。"""
         try:
             strm_file = os.path.splitext(strm_file)[0] + ".strm"
             parent = os.path.dirname(strm_file)
@@ -1220,6 +1236,12 @@ class GDStrmHelper(_PluginBase):
             # 并发安全计数(累计 + 本轮按盘汇总)
             self.__incr(stat_key="created", run_key="strm_created", mon_path=mon_path)
             logger.info(f"生成STRM {strm_file}")
+
+            # 实时监控/事件驱动触发的新增：攒入监控聚合缓冲(定时汇总一条通知，避免逐文件风暴)
+            if monitor:
+                with self._monitor_lock:
+                    self._monitor_pending.append((mon_path, strm_file))
+                    self._last_monitor_time = time.time()
 
             # 聚合刷新Emby
             if self._refresh_emby and self._mediaservers:
@@ -1357,6 +1379,57 @@ class GDStrmHelper(_PluginBase):
                 break
             cur = parent
 
+    # ==================== 实时监控通知聚合 ====================
+    def __flush_monitor_notify(self):
+        """聚合间隔到达后，把这段时间实时监控新增的STRM按盘+按父目录汇总发一条通知。
+        无新增则静默；由调度器每5秒轮询一次。"""
+        if not self._monitor_pending:
+            return
+        with self._monitor_lock:
+            # 聚合间隔未到则继续等待攒批
+            if time.time() - self._last_monitor_time < int(self._monitor_notify_interval):
+                return
+            pending = self._monitor_pending
+            self._monitor_pending = []
+        if not pending:
+            return
+        # 按盘分组，盘内再按STRM父目录归拢计数
+        by_mon = {}  # mon_path -> {dir_label: count}
+        for mon_path, strm_file in pending:
+            dirs = by_mon.setdefault(mon_path, {})
+            # 目录标签：STRM生成目录之下的相对父目录(取不到就用父目录名)
+            conf = self._dir_conf.get(mon_path) or {}
+            strm_dir = conf.get("strm_dir") or ""
+            parent = os.path.dirname(strm_file)
+            label = os.path.relpath(parent, strm_dir) if strm_dir and parent.startswith(strm_dir) \
+                else os.path.basename(parent)
+            if label in (".", ""):
+                label = os.path.basename(strm_dir.rstrip("/")) or parent
+            dirs[label] = dirs.get(label, 0) + 1
+        # 每盘发一条汇总
+        for mon_path, dirs in by_mon.items():
+            total = sum(dirs.values())
+            label = self.__mon_label(mon_path)
+            logger.info(f"[{label}] 实时监控本轮新增 {total} 个STRM，涉及 {len(dirs)} 个目录")
+            if not self._notify:
+                continue
+            # 目录明细：多则只列前若干，其余折叠
+            items = sorted(dirs.items(), key=lambda x: (-x[1], x[0]))
+            max_lines = 20
+            lines = [f"{d}：{c} 个" for d, c in items[:max_lines]]
+            if len(items) > max_lines:
+                rest = len(items) - max_lines
+                lines.append(f"…等另外 {rest} 个目录")
+            text = f"实时监控共计生成 {total} 条STRM\n其中：\n" + "\n".join(lines)
+            try:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title=f"GD网盘Strm助手 · {label} 实时监控新增",
+                    text=text,
+                    link=settings.MP_DOMAIN('#/history'))
+            except Exception as e:
+                logger.error(f"发送实时监控汇总通知失败：{e}")
+
     # ==================== Emby聚合刷新 ====================
     def __flush_refresh(self):
         """安静期后合并刷新Emby"""
@@ -1467,6 +1540,7 @@ class GDStrmHelper(_PluginBase):
             "monitor_mode": self._monitor_mode,
             "poll_interval": self._poll_interval,
             "refresh_quiet": self._refresh_quiet,
+            "monitor_notify_interval": self._monitor_notify_interval,
             "del_check_times": self._del_check_times,
             "del_max": self._del_max,
             "monitor_confs": self._monitor_confs,
@@ -1593,16 +1667,19 @@ class GDStrmHelper(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 6},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
                              "content": [{"component": "VSelect", "props": {
                                  "model": "monitor_mode", "label": "实时监控模式",
                                  "items": [
                                      {"title": "轮询(推荐rclone网盘，对云端新增敏感)", "value": "polling"},
                                      {"title": "inotify(省CPU，仅适合本地磁盘/本机写入)", "value": "inotify"},
                                  ]}}]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
                              "content": [{"component": "VTextField", "props": {
                                  "model": "poll_interval", "label": "轮询间隔(秒，仅轮询模式)", "placeholder": "10", "type": "number"}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 4},
+                             "content": [{"component": "VTextField", "props": {
+                                 "model": "monitor_notify_interval", "label": "实时监控通知聚合间隔(秒)", "placeholder": "300", "type": "number"}}]},
                         ]
                     },
                     # 数值参数行2
@@ -1723,6 +1800,7 @@ class GDStrmHelper(_PluginBase):
             "poll_interval": 10,
             "incr_cron": "*/30 * * * *",
             "refresh_quiet": 30,
+            "monitor_notify_interval": 300,
             "del_check_times": 3,
             "del_max": 10,
             "monitor_confs": "",
