@@ -52,7 +52,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.9.1"
+    plugin_version = "1.9.2"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -116,7 +116,7 @@ class GDStrmHelper(_PluginBase):
     # 实时监控生成通知聚合(攒批后按盘+按目录归拢发一条，避免逐文件通知风暴)
     _monitor_pending = []            # [(mon_path, strm_file), ...]
     _monitor_lock = threading.Lock()
-    _last_monitor_time = 0           # 最后一次监控生成strm的时间
+    _monitor_batch_start = 0         # 当前攒批窗口起点(本批第一条新增的时间)
     _monitor_notify_interval: int = 300  # 监控通知聚合间隔(秒)
 
     # 删除同步锁(避免和扫描/其它删除并发)
@@ -171,7 +171,7 @@ class GDStrmHelper(_PluginBase):
         # (表现为：实时监控关不掉、每次保存配置都多起一份监控)。stop_service 末尾会自行重置。
         self._last_refresh_time = 0
         self._monitor_pending = []
-        self._last_monitor_time = 0
+        self._monitor_batch_start = 0
         self._stat = {
             "last_full_scan": None,
             "last_incr_scan": None,
@@ -1267,8 +1267,11 @@ class GDStrmHelper(_PluginBase):
             # 实时监控/事件驱动触发的新增：攒入监控聚合缓冲(定时汇总一条通知，避免逐文件风暴)
             if monitor:
                 with self._monitor_lock:
+                    # 固定窗口：仅在本批第一条新增时记窗口起点。
+                    # 不能每条都刷新时间(否则rclone涓流式持续新增会把窗口无限后推、永远发不出)。
+                    if not self._monitor_pending:
+                        self._monitor_batch_start = time.time()
                     self._monitor_pending.append((mon_path, strm_file))
-                    self._last_monitor_time = time.time()
 
             # 聚合刷新Emby
             if self._refresh_emby and self._mediaservers:
@@ -1413,11 +1416,12 @@ class GDStrmHelper(_PluginBase):
         if not self._monitor_pending:
             return
         with self._monitor_lock:
-            # 聚合间隔未到则继续等待攒批
-            if time.time() - self._last_monitor_time < int(self._monitor_notify_interval):
+            # 固定窗口：距本批第一条新增未满聚合间隔则继续攒批
+            if time.time() - self._monitor_batch_start < int(self._monitor_notify_interval):
                 return
             pending = self._monitor_pending
             self._monitor_pending = []
+            self._monitor_batch_start = 0
         if not pending:
             return
         # 按盘分组，盘内再按STRM父目录归拢计数
