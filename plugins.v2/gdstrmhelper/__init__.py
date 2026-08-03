@@ -52,7 +52,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.9.0"
+    plugin_version = "1.9.1"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -127,6 +127,8 @@ class GDStrmHelper(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
     _event = threading.Event()
     _startup_thread: Optional[threading.Thread] = None
+    _generation = 0                  # 运行代际：每次init_plugin自增，旧后台线程据此自我终结
+    _generation_lock = threading.Lock()
 
     # SQLite
     _db_path = None
@@ -163,8 +165,10 @@ class GDStrmHelper(_PluginBase):
         self._inflight = set()
         self._refresh_queue = set()
         self._sample_media = {}
-        self._observers = []
-        self._work_threads = []
+        # 注意：_observers / _work_threads / _queue 绝不能在这里清空！
+        # 它们是"旧一代"的资源引用，必须留给下面的 stop_service() 去 stop/join，
+        # 提前置空会导致 stop_service 遍历到空列表，旧的watchdog和worker线程永远停不掉
+        # (表现为：实时监控关不掉、每次保存配置都多起一份监控)。stop_service 末尾会自行重置。
         self._last_refresh_time = 0
         self._monitor_pending = []
         self._last_monitor_time = 0
@@ -240,6 +244,12 @@ class GDStrmHelper(_PluginBase):
         # 停止现有任务
         self.stop_service()
 
+        # 代际自增：上一代残留的后台线程(可能正卡在启动延迟sleep里)据此自我终结。
+        # 不能只靠 _event，因为随后 __start_workers 会 clear 它，旧线程会误以为可以继续。
+        with self._generation_lock:
+            GDStrmHelper._generation += 1
+            my_generation = GDStrmHelper._generation
+
         # 解析目录配置
         self.__parse_confs()
 
@@ -278,7 +288,8 @@ class GDStrmHelper(_PluginBase):
         # 后台异步启动：首次全量(+监控)，不阻塞MP启动
         # 只要启用插件就跑首次全量；实时监控开关只决定是否起watchdog
         if self._enabled and self._dir_conf:
-            self._startup_thread = threading.Thread(target=self.__delayed_startup, daemon=True)
+            self._startup_thread = threading.Thread(
+                target=self.__delayed_startup, args=(my_generation,), daemon=True)
             self._startup_thread.start()
 
         # 立即执行(一次性开关)
@@ -806,34 +817,50 @@ class GDStrmHelper(_PluginBase):
             self._inflight.discard(event_path)
 
     # ==================== 后台延迟启动 ====================
-    def __delayed_startup(self):
-        """延迟后启动监控 + 首次全量扫描(后台线程，不阻塞MP)"""
+    def __delayed_startup(self, generation: int = 0):
+        """延迟后启动监控 + 首次全量扫描(后台线程，不阻塞MP)。
+        generation: 本线程所属运行代际。init_plugin被重新调用(改配置/重载)会自增代际，
+        本线程一旦发现自己已不是当代就立即退出——避免旧线程在新配置下把监控又拉起来
+        (只靠 _event 不行：__start_workers 会 clear 它)。"""
         try:
             if self._startup_delay > 0:
                 logger.info(f"等待 {self._startup_delay}s 后启动监控与全量扫描...")
-                # 分段sleep以便及时响应停止
+                # 分段sleep以便及时响应停止/代际失效
                 waited = 0
                 while waited < self._startup_delay:
-                    if self._event.is_set():
+                    if self._event.is_set() or generation != GDStrmHelper._generation:
+                        logger.info("启动等待期间配置已变更或收到停止信号，放弃本次后台启动")
                         return
                     time.sleep(1)
                     waited += 1
+            # 过期代际直接退出，绝不碰监控/扫描
+            if generation != GDStrmHelper._generation:
+                logger.info("配置已变更(代际过期)，放弃本次后台启动")
+                return
             # 先起监控(秒级，不等扫描)。仅在开启实时监控时启动
             if self._monitor:
-                self.__start_monitor()
+                self.__start_monitor(generation)
             # 再跑首次全量扫描
+            if generation != GDStrmHelper._generation:
+                return
             logger.info("开始首次全量扫描(后台)")
             self.scan_full()
         except Exception as e:
             logger.error(f"后台启动失败：{e} - {traceback.format_exc()}")
 
     # ==================== 实时监控 ====================
-    def __start_monitor(self):
+    def __start_monitor(self, generation: int = None):
         """
         为每个监控目录启动watchdog。
         - polling模式(默认，rclone GD推荐)：PollingObserver，对云端新增敏感(不依赖inotify事件)
         - inotify模式：Observer，省CPU、可休眠，仅适合本地磁盘/只有本机写入的场景
+        generation: 调用方所属代际；与当前代际不符则拒绝启动(防止过期线程起监控)。
         """
+        if generation is not None and generation != GDStrmHelper._generation:
+            logger.info("检测到配置已更新(代际过期)，放弃启动实时监控")
+            return
+        if not self._monitor:
+            return
         mode = self._monitor_mode or "polling"
         interval = max(1, int(self._poll_interval or 10))
         for mon_path in self._dir_conf.keys():
@@ -2055,6 +2082,10 @@ class GDStrmHelper(_PluginBase):
                 pass
         self._work_threads = []
         self._queue = None
+
+        # 清空监控攒批缓冲(避免跨代残留导致旧数据混入新一轮汇总)
+        with self._monitor_lock:
+            self._monitor_pending = []
 
         # 提交并关闭全局写连接(worker已各自关闭只读连接)
         self.__db_close_write()
