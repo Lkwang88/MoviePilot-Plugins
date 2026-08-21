@@ -52,7 +52,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.9.2"
+    plugin_version = "1.9.3"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -1482,18 +1482,41 @@ class GDStrmHelper(_PluginBase):
         if not emby_servers:
             logger.error("未配置Emby媒体服务器，跳过刷新")
             return
-        # 组装Updates(应用strm路径映射)
-        updates = []
-        for f in strm_files:
+
+        # 先沿用现有MP->Emby路径映射，再按媒体库目录归并。
+        # 例如：8个 /media/LK01/Lk01媒体库/国产剧集/.../*.strm
+        # 只提交1个 /media/LK01/Lk01媒体库/国产剧集，避免Emby重复刷新同一媒体库。
+        library_counts = {}
+        fallback_count = 0
+        for f in sorted(strm_files):
             mapped = self.__map_emby_strm(f)
-            updates.append({"Path": mapped, "UpdateType": "Created"})
+            refresh_path, matched = self.__get_emby_refresh_path(mapped)
+            library_counts[refresh_path] = library_counts.get(refresh_path, 0) + 1
+            if not matched:
+                fallback_count += 1
+
+        updates = [{"Path": path, "UpdateType": "Created"}
+                   for path in library_counts]
+        logger.info(
+            f"[Emby刷新] 本轮收到 {len(strm_files)} 个STRM，"
+            f"媒体库归并后 {len(updates)} 个刷新项，"
+            f"未识别媒体库回退文件级 {fallback_count} 个")
+        for path, count in library_counts.items():
+            logger.info(f"[Emby刷新] {path}：归并 {count} 个STRM，提交1个刷新项")
+
         # 分批发送，避免全量时单次payload过大打挂Emby
         batch_size = 100
+        batch_count = (len(updates) + batch_size - 1) // batch_size
         for emby_name, emby_server in emby_servers.items():
             emby = emby_server.instance
             ok, fail = 0, 0
+            started = time.monotonic()
+            logger.info(
+                f"[Emby刷新][{emby_name}] 准备发送：原始STRM={len(strm_files)}，"
+                f"最终Updates={len(updates)}，HTTP请求={batch_count}")
             for i in range(0, len(updates), batch_size):
                 batch = updates[i:i + batch_size]
+                batch_no = i // batch_size + 1
                 try:
                     res = emby.post_data(
                         url='[HOST]emby/Library/Media/Updated?api_key=[APIKEY]&reqformat=json',
@@ -1501,14 +1524,39 @@ class GDStrmHelper(_PluginBase):
                         headers={"Content-Type": "application/json"})
                     if res and res.status_code in [200, 204]:
                         ok += len(batch)
+                        logger.info(
+                            f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}成功："
+                            f"Updates={len(batch)}，响应={res.status_code}")
                     else:
                         fail += len(batch)
                         code = res.status_code if res else "无响应"
-                        logger.error(f"通知 {emby_name} 刷新失败(批{i // batch_size + 1})，错误码：{code}")
+                        logger.error(
+                            f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}失败："
+                            f"Updates={len(batch)}，错误码={code}")
                 except Exception as e:
                     fail += len(batch)
-                    logger.error(f"通知 {emby_name} 刷新出错(批{i // batch_size + 1})：{e}")
-            logger.info(f"已通知 {emby_name} 刷新STRM：成功{ok} 失败{fail}")
+                    logger.error(
+                        f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}出错：{e}")
+            elapsed_ms = (time.monotonic() - started) * 1000
+            logger.info(
+                f"[Emby刷新][{emby_name}] 完成：成功Updates={ok}，失败Updates={fail}，"
+                f"HTTP请求={batch_count}，耗时={elapsed_ms:.0f}ms")
+
+    @staticmethod
+    def __get_emby_refresh_path(mapped_path: str) -> Tuple[str, bool]:
+        """从已有Emby侧STRM真实路径提取媒体库刷新路径。
+
+        当前目录布局为 ``<盘根>/<盘媒体库>/<媒体库>/<作品>/...``，例如：
+        ``/media/LK01/Lk01媒体库/国产剧集/剧集/Season 01/E01.strm``。
+        只识别路径中明确以“媒体库”结尾的盘媒体库目录，并取其下一级媒体库目录；
+        无法识别时返回原文件路径，保持原有刷新行为，绝不猜路径。
+        """
+        parts = Path(mapped_path).parts
+        for i, part in enumerate(parts[:-1]):
+            if part.endswith("媒体库") and i + 1 < len(parts):
+                library_path = os.path.join(*parts[:i + 2])
+                return library_path, True
+        return mapped_path, False
 
     def __map_emby_strm(self, strm_file: str) -> str:
         """把MP侧strm路径映射为Emby侧strm路径"""
