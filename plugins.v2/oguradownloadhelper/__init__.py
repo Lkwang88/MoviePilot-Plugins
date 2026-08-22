@@ -53,7 +53,7 @@ class OguraDownloadHelper(_PluginBase):
     plugin_name = "小仓酱的下载助手"
     plugin_desc = "手动下载去重守护：综合下载/整理/媒体库数据，拦截重复下载并提供洗版对比提示与TG交互放行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradownloadhelper_"
@@ -369,6 +369,21 @@ class OguraDownloadHelper(_PluginBase):
             return f"{size:.2f} {units[idx]}"
         except Exception:
             return "未知"
+
+    @staticmethod
+    def _torrent_size_bytes(size) -> Optional[float]:
+        """
+        torrent.size → 字节
+        不同站点单位可能不同（部分站点返回 KB，部分返回 bytes），启发式兼容：
+        按 KB 解释后超过 1TB（现实无此大小种子）→ 按 bytes 解释
+        """
+        if not size or float(size) <= 0:
+            return None
+        size = float(size)
+        kb_interpret = size * 1024
+        if kb_interpret > 1024 * 1024 * 1024 * 1024:  # 1 TB
+            return size
+        return kb_interpret
 
     @staticmethod
     def _sum_file_sizes(item: Any) -> Optional[float]:
@@ -744,16 +759,20 @@ class OguraDownloadHelper(_PluginBase):
     def _volume_hint(self, records: List[dict], torrent: Any) -> str:
         """
         新旧体积对比提示（仅提示，不决策）
-        旧体积只取「整理入库」记录——整理成功才是真正落盘；下载记录可能被取消，不作数。
+        旧体积 = 整理入库记录「按集去重累加」——整理成功才是真正落盘；下载记录可能被取消，不作数。
         """
-        new_size = getattr(torrent, "size", None)  # KB
-        # 新体积转字节（与整理记录同单位）
-        new_bytes = float(new_size) * 1024 if new_size else None
-        old_size = None
+        new_bytes = self._torrent_size_bytes(getattr(torrent, "size", None))
+        # 落盘体积累加：同集多条记录取最大（防重复整理叠加），不同集累加
+        seen: Dict[str, float] = {}
         for rec in records:
-            if rec.get("source_type") == "transfer" and rec.get("size"):
-                old_size = rec.get("size")
-                break
+            if rec.get("source_type") != "transfer":
+                continue
+            sz = rec.get("size")
+            if not sz or float(sz) <= 0:
+                continue
+            key = rec.get("episodes") or f"__{rec.get('torrent_name') or rec.get('date') or ''}"
+            seen[key] = max(seen.get(key, 0), float(sz))
+        old_size = sum(seen.values()) or None
         new_txt = self._format_size(new_bytes)
         old_txt = self._format_size(old_size)
         if old_size is None:
