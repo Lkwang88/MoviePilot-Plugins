@@ -53,7 +53,7 @@ class OguraDownloadHelper(_PluginBase):
     plugin_name = "小仓酱的下载助手"
     plugin_desc = "手动下载去重守护：综合下载/整理/媒体库数据，拦截重复下载并提供洗版对比提示与TG交互放行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradownloadhelper_"
@@ -69,6 +69,7 @@ class OguraDownloadHelper(_PluginBase):
     _match_mode = "identity"      # identity: 媒体身份优先 / title: 标题年份 / soft: 仅提示不拦截
     _bypass_hours = 24            # 放行有效期（小时）
     _volume_ratio = _DEFAULT_VOLUME_RATIO
+    _disk_prefixes = ["/ptdownload/"]  # 盘路径前缀（用于显示精简与盘名提取）
 
     _bot = None
     _bot_thread = None
@@ -87,6 +88,9 @@ class OguraDownloadHelper(_PluginBase):
         self._match_mode = config.get("match_mode") or "identity"
         self._bypass_hours = int(config.get("bypass_hours") or 24)
         self._volume_ratio = float(config.get("volume_ratio") or _DEFAULT_VOLUME_RATIO)
+        prefixes = (config.get("disk_prefixes") or "").strip()
+        self._disk_prefixes = [p.strip() for p in prefixes.replace("，", ",").split(",") if p.strip()] \
+            or ["/ptdownload/"]
 
         # 数据库初始化
         self._db_path = self.get_data_path() / "dedup.db"
@@ -297,15 +301,20 @@ class OguraDownloadHelper(_PluginBase):
         return int(m.group(1)) if m else None
 
     @staticmethod
-    def _format_size(size_gb: Optional[float]) -> str:
-        """体积（GB）转显示字符串"""
-        if size_gb is None:
+    def _format_size(size_kb: Optional[float]) -> str:
+        """体积（KB）转人类可读（MP 的 torrent.size 单位为 KB）"""
+        if not size_kb:
             return "未知"
         try:
-            size_gb = float(size_gb)
-            if size_gb >= 1024:
-                return f"{size_gb / 1024:.2f} TB"
-            return f"{size_gb:.2f} GB"
+            size = float(size_kb)
+            units = ["KB", "MB", "GB", "TB", "PB"]
+            idx = 0
+            while size >= 1024 and idx < len(units) - 1:
+                size /= 1024
+                idx += 1
+            if idx == 0:
+                return f"{int(size)} {units[idx]}"
+            return f"{size:.2f} {units[idx]}"
         except Exception:
             return "未知"
 
@@ -571,23 +580,73 @@ class OguraDownloadHelper(_PluginBase):
                           f"本次请求有 {len(overlap)} 集已存在（如 E{sorted(overlap)[:5]} 等）")
         return False, ""
 
+    def _disk_of(self, path: Optional[str]) -> str:
+        """从路径提取盘名（裁剪前缀后第一段）"""
+        p = str(path or "").replace("\\", "/")
+        for prefix in self._disk_prefixes:
+            prefix = prefix.strip()
+            if prefix and p.startswith(prefix):
+                rest = p[len(prefix):].lstrip("/")
+                return rest.split("/")[0] if rest else ""
+        return ""
+
+    def _short_path(self, path: Optional[str], max_parts: int = 3) -> str:
+        """路径精简：裁剪盘前缀，保留前 N 段"""
+        p = str(path or "").replace("\\", "/")
+        for prefix in self._disk_prefixes:
+            prefix = prefix.strip()
+            if prefix and p.startswith(prefix):
+                p = p[len(prefix):].lstrip("/")
+                break
+        parts = [x for x in p.split("/") if x]
+        if not parts:
+            return ""
+        if len(parts) > max_parts:
+            return "/".join(parts[:max_parts]) + "/…"
+        return "/".join(parts)
+
     def _build_old_text(self, records: List[dict]) -> str:
-        """构造已有资源描述文本"""
+        """构造已有资源描述文本（合并统计，避免逐文件刷屏）"""
         lines = []
-        seen = set()
-        for rec in records[:5]:
-            key = (rec.get("source_type"), rec.get("torrent_name"), rec.get("date"))
-            if key in seen:
-                continue
-            seen.add(key)
-            stype = {
-                "download": "下载历史",
-                "transfer": "整理入库",
-                "mediaserver": "媒体库",
-            }.get(rec.get("source_type"), rec.get("source_type") or "记录")
-            name = rec.get("torrent_name") or rec.get("title") or ""
-            date = rec.get("date") or ""
-            lines.append(f"· [{stype}] {date} {name}".rstrip())
+
+        # 下载历史：取最新一条
+        dl = [r for r in records if r.get("source_type") == "download"]
+        if dl:
+            latest = max(dl, key=lambda r: r.get("date") or "")
+            name = latest.get("torrent_name") or latest.get("title") or ""
+            date = (latest.get("date") or "")[:16]
+            lines.append(f"· 下载过 {date}：{name}".rstrip())
+
+        # 整理入库：按目录合并统计
+        tr = [r for r in records if r.get("source_type") == "transfer"]
+        if tr:
+            dirs: Dict[str, int] = {}
+            for r in tr:
+                d = self._short_path(r.get("torrent_name") or r.get("dest") or "")
+                if d:
+                    dirs[d] = dirs.get(d, 0) + 1
+            for d, cnt in list(dirs.items())[:2]:
+                lines.append(f"· 已入库 {cnt} 个文件：{d}")
+            if len(dirs) > 2:
+                lines.append(f"· 等共 {len(dirs)} 个目录")
+
+        # 媒体库
+        ms = [r for r in records if r.get("source_type") == "mediaserver"]
+        if ms:
+            libs = sorted({r.get("torrent_name") or r.get("title") or "" for r in ms})
+            lines.append(f"· 媒体库：{'、'.join(libs[:3])}")
+
+        # 所在盘统计
+        disks = set()
+        for r in records:
+            for f in (r.get("torrent_name"), r.get("dest"), r.get("src")):
+                d = self._disk_of(f)
+                if d:
+                    disks.add(d)
+        if disks:
+            disk_txt = "、".join(sorted(disks))
+            lines.append(f"· 所在盘：{disk_txt}" + (f"（{len(disks)} 个盘）" if len(disks) > 1 else ""))
+
         return "\n".join(lines) or "（无详细信息）"
 
     def _volume_hint(self, records: List[dict], torrent: Any) -> str:
@@ -886,7 +945,6 @@ class OguraDownloadHelper(_PluginBase):
         season_txt = f" 第{season}季" if season else ""
         torrent_title = getattr(torrent, "title", None) or ""
         site_name = getattr(torrent, "site_name", None) or ""
-        size_txt = self._format_size(getattr(torrent, "size", None))
 
         lines = [
             f"媒体：{title} {year}{season_txt}".rstrip(),
@@ -899,8 +957,6 @@ class OguraDownloadHelper(_PluginBase):
             lines.extend(["", dup["volume_hint"]])
         if torrent_title:
             lines.extend(["", f"本次种子：{torrent_title}" + (f"（{site_name}）" if site_name else "")])
-        if size_txt and size_txt != "未知":
-            lines.append(f"新体积：{size_txt}")
         lines.extend(["", "如需洗版/再次下载，请点击「继续下载」后重新发起下载；否则点「取消」。"])
 
         notify_title = f"【{self.plugin_name}】拦截重复下载"
@@ -1402,6 +1458,21 @@ class OguraDownloadHelper(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "disk_prefixes",
+                                            "label": "盘路径前缀",
+                                            "hint": "逗号分隔。通知中的路径精简与盘名提取用（默认 /ptdownload/）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -1436,6 +1507,7 @@ class OguraDownloadHelper(_PluginBase):
             "tg_use_mp_channel": True,
             "bypass_hours": 24,
             "volume_ratio": 0.05,
+            "disk_prefixes": "/ptdownload/",
         }
 
     # ==================== 详情页 ====================
