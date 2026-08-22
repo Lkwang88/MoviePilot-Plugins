@@ -53,7 +53,7 @@ class OguraDownloadHelper(_PluginBase):
     plugin_name = "小仓酱的下载助手"
     plugin_desc = "手动下载去重守护：综合下载/整理/媒体库数据，拦截重复下载并提供洗版对比提示与TG交互放行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradownloadhelper_"
@@ -205,6 +205,9 @@ class OguraDownloadHelper(_PluginBase):
             from sqlalchemy import select
 
             conn = self._get_conn()
+            dl_count = 0
+            tr_count = 0
+            err_count = 0
             try:
                 conn.execute("DELETE FROM media_records")
                 now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -212,41 +215,50 @@ class OguraDownloadHelper(_PluginBase):
                     # 下载历史（未删除的下载记录视为已知，但体积不作数——可能被取消）
                     dhs = db.execute(select(DownloadHistory)).scalars().all()
                     for dh in dhs:
-                        conn.execute(
-                            "INSERT INTO media_records (media_source, media_id, title, year, mtype, "
-                            "seasons, episodes, source_type, torrent_name, size, status, date) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (
-                                dh.media_source, dh.media_id, dh.title or "", dh.year,
-                                dh.type, dh.seasons, dh.episodes, "download",
-                                dh.torrent_name, None,
-                                "downloaded", dh.date or now,
-                            ),
-                        )
+                        try:
+                            conn.execute(
+                                "INSERT INTO media_records (media_source, media_id, title, year, mtype, "
+                                "seasons, episodes, source_type, torrent_name, size, status, date) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (
+                                    dh.media_source, dh.media_id, dh.title or "", dh.year,
+                                    dh.type, dh.seasons, dh.episodes, "download",
+                                    dh.torrent_name, None,
+                                    "downloaded", dh.date or now,
+                                ),
+                            )
+                            dl_count += 1
+                        except Exception as e:
+                            err_count += 1
+                            logger.error(f"【{self.plugin_name}】导入下载记录失败({dh.title}): {e}")
                     # 整理历史（成功入库的，体积 = 文件清单汇总，真正落盘）
                     ths = db.execute(
                         select(TransferHistory).where(TransferHistory.status.is_(True))
                     ).scalars().all()
                     for th in ths:
-                        size = (
-                            self._sum_file_sizes(th.files)
-                            or self._sum_file_sizes(th.dest_fileitem)
-                            or self._sum_file_sizes(th.src_fileitem)
-                        )
-                        conn.execute(
-                            "INSERT INTO media_records (media_source, media_id, title, year, mtype, "
-                            "seasons, episodes, source_type, torrent_name, size, status, date) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (
-                                th.media_source, th.media_id, th.title or "", th.year,
-                                th.type, th.seasons, th.episodes, "transfer",
-                                th.src, size, "transferred", th.date or now,
-                            ),
-                        )
+                        try:
+                            size = self._sum_file_sizes(th.files)
+                            conn.execute(
+                                "INSERT INTO media_records (media_source, media_id, title, year, mtype, "
+                                "seasons, episodes, source_type, torrent_name, size, status, date) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (
+                                    th.media_source, th.media_id, th.title or "", th.year,
+                                    th.type, th.seasons, th.episodes, "transfer",
+                                    th.src, size, "transferred", th.date or now,
+                                ),
+                            )
+                            tr_count += 1
+                        except Exception as e:
+                            err_count += 1
+                            logger.error(f"【{self.plugin_name}】导入整理记录失败({th.title}): {e}")
                 conn.commit()
             finally:
                 conn.close()
-            logger.info(f"【{self.plugin_name}】本地缓存重建完成")
+            logger.info(
+                f"【{self.plugin_name}】本地缓存重建完成：下载 {dl_count} 条，整理 {tr_count} 条"
+                + (f"，失败 {err_count} 条" if err_count else "")
+            )
         except Exception as err:
             logger.error(f"【{self.plugin_name}】本地缓存重建失败：{err}\n{traceback.format_exc()}")
 
@@ -254,9 +266,14 @@ class OguraDownloadHelper(_PluginBase):
 
     @staticmethod
     def _resolve_identity(media: Any) -> Tuple[Optional[str], Optional[str]]:
-        """从 MediaInfo 解析媒体身份 (source, media_id)"""
+        """从 MediaInfo 解析媒体身份 (source, media_id)，优先复用 MP 统一解析"""
         if not media:
             return None, None
+        try:
+            from app.utils.media import resolve_media_identity
+            return resolve_media_identity(media=media)
+        except Exception:
+            pass
         source = getattr(media, "source", None) or None
         media_id = getattr(media, "media_id", None) or None
         # 未显式设置时按各数据源 ID 推断
@@ -341,8 +358,21 @@ class OguraDownloadHelper(_PluginBase):
     def _query_records(self, source: Optional[str], media_id: Optional[str],
                        title: Optional[str], year: Optional[str],
                        mtype: Optional[str], media: Any) -> List[dict]:
-        """查询已知媒体记录（本地缓存优先，系统表兜底）"""
+        """
+        查询已知媒体记录（本地缓存优先，系统表兜底）
+        身份查询与标题查询「合并」执行并去重——避免 media_id 缺失/不一致导致漏记录
+        """
         records: List[dict] = []
+        seen = set()
+
+        def _merge(recs: List[dict]):
+            for r in recs:
+                key = (r.get("source_type"), r.get("torrent_name"),
+                       r.get("date"), r.get("seasons"), r.get("episodes"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(r)
 
         # ---- 1. 本地缓存 ----
         try:
@@ -353,19 +383,19 @@ class OguraDownloadHelper(_PluginBase):
                         "SELECT * FROM media_records WHERE media_source=? AND media_id=?",
                         (source, str(media_id)),
                     ).fetchall()
-                    records.extend([dict(r) for r in rows])
-                if not records and title:
+                    _merge([dict(r) for r in rows])
+                if title:
                     rows = conn.execute(
-                        "SELECT * FROM media_records WHERE title=? AND (? IS NULL OR year=?)",
-                        (title, year, year),
+                        "SELECT * FROM media_records WHERE title=?",
+                        (title,),
                     ).fetchall()
-                    records.extend([dict(r) for r in rows])
-                if not records and title and self._match_mode != "identity":
-                    rows = conn.execute(
-                        "SELECT * FROM media_records WHERE title LIKE ?",
-                        (f"%{title}%",),
-                    ).fetchall()
-                    records.extend([dict(r) for r in rows])
+                    _merge([dict(r) for r in rows])
+                    if not records:
+                        rows = conn.execute(
+                            "SELECT * FROM media_records WHERE title LIKE ?",
+                            (f"%{title}%",),
+                        ).fetchall()
+                        _merge([dict(r) for r in rows])
             finally:
                 conn.close()
         except Exception as err:
@@ -381,24 +411,28 @@ class OguraDownloadHelper(_PluginBase):
             from sqlalchemy import or_, select
 
             with SessionFactory() as db:
-                # 下载历史
+                # 下载历史：身份 + 标题 合并去重
+                dh_rows = []
                 if source and media_id:
-                    dh_rows = db.execute(
+                    dh_rows += list(db.execute(
                         select(DownloadHistory).where(
                             DownloadHistory.media_source == source,
                             DownloadHistory.media_id == str(media_id),
                         )
-                    ).scalars().all()
-                else:
-                    dh_rows = []
-                if not dh_rows and title:
-                    dh_rows = db.execute(
+                    ).scalars().all())
+                if title:
+                    dh_rows += list(db.execute(
                         select(DownloadHistory).where(
                             DownloadHistory.title == title,
                             DownloadHistory.year == year,
                         )
-                    ).scalars().all()
+                    ).scalars().all())
+                seen_dh = set()
                 for dh in dh_rows:
+                    k = id(dh)
+                    if k in seen_dh:
+                        continue
+                    seen_dh.add(k)
                     records.append({
                         "media_source": dh.media_source, "media_id": dh.media_id,
                         "title": dh.title, "year": dh.year, "mtype": dh.type,
@@ -406,29 +440,29 @@ class OguraDownloadHelper(_PluginBase):
                         "source_type": "download", "torrent_name": dh.torrent_name,
                         "size": None, "status": "downloaded", "date": dh.date,
                     })
-                # 整理历史
+                # 整理历史：身份 + 标题 合并去重
+                th_rows = []
                 if source and media_id:
-                    th_rows = db.execute(
+                    th_rows += list(db.execute(
                         select(TransferHistory).where(
                             TransferHistory.media_source == source,
                             TransferHistory.media_id == str(media_id),
                         )
-                    ).scalars().all()
-                else:
-                    th_rows = []
-                if not th_rows and title:
-                    th_rows = db.execute(
+                    ).scalars().all())
+                if title:
+                    th_rows += list(db.execute(
                         select(TransferHistory).where(
                             TransferHistory.title == title,
                             TransferHistory.year == year,
                         )
-                    ).scalars().all()
+                    ).scalars().all())
+                seen_th = set()
                 for th in th_rows:
-                    size = (
-                        self._sum_file_sizes(th.files)
-                        or self._sum_file_sizes(th.dest_fileitem)
-                        or self._sum_file_sizes(th.src_fileitem)
-                    )
+                    k = id(th)
+                    if k in seen_th:
+                        continue
+                    seen_th.add(k)
+                    size = self._sum_file_sizes(th.files)
                     records.append({
                         "media_source": th.media_source, "media_id": th.media_id,
                         "title": th.title, "year": th.year, "mtype": th.type,
@@ -927,15 +961,15 @@ class OguraDownloadHelper(_PluginBase):
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event = None):
-        """整理完成：更新本地缓存状态"""
-        self._update_transfer_status(event, "transferred")
+        """整理完成：写入 transfer 记录（含落盘体积）"""
+        self._handle_transfer_event(event, "transferred")
 
     @eventmanager.register(EventType.TransferFailed)
     def on_transfer_failed(self, event: Event = None):
-        """整理失败：更新本地缓存状态"""
-        self._update_transfer_status(event, "failed")
+        """整理失败：标记状态（不新增落盘记录）"""
+        self._handle_transfer_event(event, "failed")
 
-    def _update_transfer_status(self, event: Event, status: str):
+    def _handle_transfer_event(self, event: Event, status: str):
         if not self._enabled or not event or not event.event_data:
             return
         try:
@@ -946,17 +980,82 @@ class OguraDownloadHelper(_PluginBase):
             title = getattr(mediainfo, "title", None) or ""
             if not title:
                 return
+            source, media_id = self._resolve_identity(mediainfo)
+            year = getattr(mediainfo, "year", None) or None
+            mtype = getattr(mediainfo, "type", None)
+            mtype_str = mtype.value if hasattr(mtype, "value") else (mtype or None)
+            meta = data.get("meta") if isinstance(data, dict) else getattr(data, "meta", None)
+            season = self._parse_season(getattr(meta, "season", None)) if meta else None
+            episode = getattr(meta, "episode", None) if meta else None
+            episodes = self._format_episode_str(episode)
+            # 落盘体积与路径：整理结果中提取
+            transferinfo = data.get("transferinfo") if isinstance(data, dict) else getattr(data, "transferinfo", None)
+            size = None
+            src_path = None
+            if transferinfo:
+                size = getattr(transferinfo, "total_size", None) or None
+                target_item = getattr(transferinfo, "target_item", None)
+                if target_item:
+                    src_path = getattr(target_item, "path", None)
+            fileitem = data.get("fileitem") if isinstance(data, dict) else getattr(data, "fileitem", None)
+            if not src_path and fileitem:
+                src_path = getattr(fileitem, "path", None)
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+
             conn = self._get_conn()
             try:
-                conn.execute(
-                    "UPDATE media_records SET status=? WHERE title=? AND status IN ('downloading','downloaded')",
-                    (status, title),
-                )
+                if status == "transferred":
+                    # 已存在同源 transfer 记录则更新，否则新增
+                    exists = conn.execute(
+                        "SELECT id FROM media_records WHERE source_type='transfer' "
+                        "AND title=? AND (? IS NULL OR seasons=?) AND (? IS NULL OR episodes=?) "
+                        "AND (media_source=? OR media_source IS NULL) AND (media_id=? OR media_id IS NULL) "
+                        "LIMIT 1",
+                        (title, season, f"S{season:02d}" if season is not None else None,
+                         episode, episodes, source, media_id),
+                    ).fetchone()
+                    if exists:
+                        conn.execute(
+                            "UPDATE media_records SET status='transferred', size=?, torrent_name=?, date=? "
+                            "WHERE id=?",
+                            (size, src_path, now, exists["id"]),
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT INTO media_records (media_source, media_id, title, year, mtype, "
+                            "seasons, episodes, source_type, torrent_name, size, status, date) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                source, media_id, title, year, mtype_str,
+                                f"S{season:02d}" if season is not None else None, episodes,
+                                "transfer", src_path, size, "transferred", now,
+                            ),
+                        )
+                else:
+                    # 整理失败：标记同名 download 记录
+                    conn.execute(
+                        "UPDATE media_records SET status='failed' WHERE title=? AND source_type='download'",
+                        (title,),
+                    )
                 conn.commit()
             finally:
                 conn.close()
         except Exception as err:
             logger.debug(f"【{self.plugin_name}】整理事件处理失败：{err}")
+
+    @staticmethod
+    def _format_episode_str(episode) -> Optional[str]:
+        """格式化集数字段（E01、E01-E12 或逗号分隔）"""
+        if not episode:
+            return None
+        if isinstance(episode, str):
+            return episode if episode.strip() else None
+        if isinstance(episode, (list, set, tuple)):
+            eps = sorted(int(e) for e in episode if e)
+            if not eps:
+                return None
+            return ",".join(f"E{e:02d}" for e in eps)
+        return str(episode)
 
     # ==================== 通知 ====================
 
@@ -1221,6 +1320,15 @@ class OguraDownloadHelper(_PluginBase):
                     "SELECT COUNT(*) AS c FROM block_records WHERE status='cancelled'"
                 ).fetchone()["c"]
                 media_count = conn.execute("SELECT COUNT(*) AS c FROM media_records").fetchone()["c"]
+                dl_cache = conn.execute(
+                    "SELECT COUNT(*) AS c FROM media_records WHERE source_type='download'"
+                ).fetchone()["c"]
+                tr_cache = conn.execute(
+                    "SELECT COUNT(*) AS c FROM media_records WHERE source_type='transfer'"
+                ).fetchone()["c"]
+                ms_cache = conn.execute(
+                    "SELECT COUNT(*) AS c FROM media_records WHERE source_type='mediaserver'"
+                ).fetchone()["c"]
                 return {
                     "enabled": self._enabled,
                     "match_mode": self._match_mode,
@@ -1232,6 +1340,11 @@ class OguraDownloadHelper(_PluginBase):
                     "block_bypassed": bypassed,
                     "block_cancelled": cancelled,
                     "media_cache_count": media_count,
+                    "media_cache_detail": {
+                        "download": dl_cache,
+                        "transfer": tr_cache,
+                        "mediaserver": ms_cache,
+                    },
                 }
             finally:
                 conn.close()
