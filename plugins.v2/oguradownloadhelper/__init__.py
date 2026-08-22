@@ -53,7 +53,7 @@ class OguraDownloadHelper(_PluginBase):
     plugin_name = "小仓酱的下载助手"
     plugin_desc = "手动下载去重守护：综合下载/整理/媒体库数据，拦截重复下载并提供洗版对比提示与TG交互放行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradownloadhelper_"
@@ -102,11 +102,15 @@ class OguraDownloadHelper(_PluginBase):
         else:
             self._stop_tg_bot()
 
-        # 首次启动后台全量导入本地缓存
+        # 首次启动后台全量导入本地缓存（空库 或 缓存不健康时）
         if self._enabled and self._db_path:
             try:
                 count = self._count_media_records()
-                if count == 0:
+                if count == 0 or not self._cache_healthy():
+                    if count == 0:
+                        logger.info(f"【{self.plugin_name}】本地缓存为空，触发全量重建")
+                    else:
+                        logger.info(f"【{self.plugin_name}】缓存缺少落盘体积数据，触发全量重建")
                     threading.Thread(target=self._rebuild_cache, daemon=True).start()
             except Exception as err:
                 logger.error(f"【{self.plugin_name}】检查本地缓存失败：{err}")
@@ -196,6 +200,28 @@ class OguraDownloadHelper(_PluginBase):
         except Exception:
             return 0
 
+    def _cache_healthy(self) -> bool:
+        """
+        缓存健康检查：
+        有 transfer 记录 且 全部带落盘体积 → 健康
+        无 transfer 记录 或 存在无体积的 transfer（旧缓存）→ 不健康，需重建
+        """
+        try:
+            conn = self._get_conn()
+            try:
+                tr_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM media_records WHERE source_type='transfer'"
+                ).fetchone()["c"]
+                tr_no_size = conn.execute(
+                    "SELECT COUNT(*) AS c FROM media_records WHERE source_type='transfer' "
+                    "AND (size IS NULL OR size <= 0)"
+                ).fetchone()["c"]
+                return tr_count > 0 and tr_no_size == 0
+            finally:
+                conn.close()
+        except Exception:
+            return False
+
     def _rebuild_cache(self):
         """全量重建本地媒体缓存（从系统表导入，简单可靠）"""
         try:
@@ -237,7 +263,11 @@ class OguraDownloadHelper(_PluginBase):
                     ).scalars().all()
                     for th in ths:
                         try:
-                            size = self._sum_file_sizes(th.files)
+                            size = (
+                                self._sum_file_sizes(th.files)
+                                or self._sum_file_sizes(th.dest_fileitem)
+                                or self._sum_file_sizes(th.src_fileitem)
+                            )
                             conn.execute(
                                 "INSERT INTO media_records (media_source, media_id, title, year, mtype, "
                                 "seasons, episodes, source_type, torrent_name, size, status, date) "
@@ -462,7 +492,11 @@ class OguraDownloadHelper(_PluginBase):
                     if k in seen_th:
                         continue
                     seen_th.add(k)
-                    size = self._sum_file_sizes(th.files)
+                    size = (
+                        self._sum_file_sizes(th.files)
+                        or self._sum_file_sizes(th.dest_fileitem)
+                        or self._sum_file_sizes(th.src_fileitem)
+                    )
                     records.append({
                         "media_source": th.media_source, "media_id": th.media_id,
                         "title": th.title, "year": th.year, "mtype": th.type,
@@ -988,18 +1022,22 @@ class OguraDownloadHelper(_PluginBase):
             season = self._parse_season(getattr(meta, "season", None)) if meta else None
             episode = getattr(meta, "episode", None) if meta else None
             episodes = self._format_episode_str(episode)
-            # 落盘体积与路径：整理结果中提取
+            # 落盘体积与路径：整理结果中提取（多级兜底）
             transferinfo = data.get("transferinfo") if isinstance(data, dict) else getattr(data, "transferinfo", None)
             size = None
             src_path = None
             if transferinfo:
                 size = getattr(transferinfo, "total_size", None) or None
+                if not size:
+                    size = self._sum_file_sizes(getattr(transferinfo, "file_list", None))
                 target_item = getattr(transferinfo, "target_item", None)
                 if target_item:
                     src_path = getattr(target_item, "path", None)
             fileitem = data.get("fileitem") if isinstance(data, dict) else getattr(data, "fileitem", None)
             if not src_path and fileitem:
                 src_path = getattr(fileitem, "path", None)
+            if not size and fileitem:
+                size = getattr(fileitem, "size", None) or None
             now = time.strftime("%Y-%m-%d %H:%M:%S")
 
             conn = self._get_conn()
@@ -1653,6 +1691,7 @@ class OguraDownloadHelper(_PluginBase):
 
     def get_page(self) -> List[dict]:
         records = []
+        cache_info = None
         try:
             conn = self._get_conn()
             try:
@@ -1660,13 +1699,40 @@ class OguraDownloadHelper(_PluginBase):
                     "SELECT * FROM block_records ORDER BY id DESC LIMIT 10"
                 ).fetchall()
                 records = [dict(r) for r in rows]
+                dl_cache = conn.execute(
+                    "SELECT COUNT(*) AS c FROM media_records WHERE source_type='download'"
+                ).fetchone()["c"]
+                tr_cache = conn.execute(
+                    "SELECT COUNT(*) AS c FROM media_records WHERE source_type='transfer'"
+                ).fetchone()["c"]
+                tr_size = conn.execute(
+                    "SELECT COUNT(*) AS c FROM media_records WHERE source_type='transfer' "
+                    "AND size IS NOT NULL AND size > 0"
+                ).fetchone()["c"]
+                cache_info = f"下载 {dl_cache} / 整理 {tr_cache}（带体积 {tr_size}）"
             finally:
                 conn.close()
         except Exception:
             pass
 
+        page = []
+        if cache_info:
+            healthy = self._cache_healthy()
+            page.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "success" if healthy else "warning",
+                        "variant": "tonal",
+                        "text": (
+                            f"本地缓存：{cache_info}｜状态：{'正常' if healthy else '需重建（重启插件自动重建）'}"
+                        ),
+                    },
+                }
+            )
+
         if not records:
-            return [
+            page.append(
                 {
                     "component": "VAlert",
                     "props": {
@@ -1675,7 +1741,8 @@ class OguraDownloadHelper(_PluginBase):
                         "text": "暂无拦截记录。手动下载重复资源时会在此显示。",
                     },
                 }
-            ]
+            )
+            return page
 
         status_map = {
             "blocked": "待处理",
