@@ -53,7 +53,7 @@ class OguraDownloadHelper(_PluginBase):
     plugin_name = "小仓酱的下载助手"
     plugin_desc = "手动下载去重守护：综合下载/整理/媒体库数据，拦截重复下载并提供洗版对比提示与TG交互放行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradownloadhelper_"
@@ -209,7 +209,7 @@ class OguraDownloadHelper(_PluginBase):
                 conn.execute("DELETE FROM media_records")
                 now = time.strftime("%Y-%m-%d %H:%M:%S")
                 with SessionFactory() as db:
-                    # 下载历史（未删除的下载记录视为已知）
+                    # 下载历史（未删除的下载记录视为已知，但体积不作数——可能被取消）
                     dhs = db.execute(select(DownloadHistory)).scalars().all()
                     for dh in dhs:
                         conn.execute(
@@ -219,15 +219,20 @@ class OguraDownloadHelper(_PluginBase):
                             (
                                 dh.media_source, dh.media_id, dh.title or "", dh.year,
                                 dh.type, dh.seasons, dh.episodes, "download",
-                                dh.torrent_name, dh.note.get("size") if isinstance(dh.note, dict) else None,
+                                dh.torrent_name, None,
                                 "downloaded", dh.date or now,
                             ),
                         )
-                    # 整理历史（成功入库的）
+                    # 整理历史（成功入库的，体积 = 文件清单汇总，真正落盘）
                     ths = db.execute(
                         select(TransferHistory).where(TransferHistory.status.is_(True))
                     ).scalars().all()
                     for th in ths:
+                        size = (
+                            self._sum_file_sizes(th.files)
+                            or self._sum_file_sizes(th.dest_fileitem)
+                            or self._sum_file_sizes(th.src_fileitem)
+                        )
                         conn.execute(
                             "INSERT INTO media_records (media_source, media_id, title, year, mtype, "
                             "seasons, episodes, source_type, torrent_name, size, status, date) "
@@ -235,7 +240,7 @@ class OguraDownloadHelper(_PluginBase):
                             (
                                 th.media_source, th.media_id, th.title or "", th.year,
                                 th.type, th.seasons, th.episodes, "transfer",
-                                th.src, None, "transferred", th.date or now,
+                                th.src, size, "transferred", th.date or now,
                             ),
                         )
                 conn.commit()
@@ -301,13 +306,13 @@ class OguraDownloadHelper(_PluginBase):
         return int(m.group(1)) if m else None
 
     @staticmethod
-    def _format_size(size_kb: Optional[float]) -> str:
-        """体积（KB）转人类可读（MP 的 torrent.size 单位为 KB）"""
-        if not size_kb:
+    def _format_size(size_bytes: Optional[float]) -> str:
+        """体积（字节）转人类可读"""
+        if not size_bytes:
             return "未知"
         try:
-            size = float(size_kb)
-            units = ["KB", "MB", "GB", "TB", "PB"]
+            size = float(size_bytes)
+            units = ["B", "KB", "MB", "GB", "TB", "PB"]
             idx = 0
             while size >= 1024 and idx < len(units) - 1:
                 size /= 1024
@@ -317,6 +322,21 @@ class OguraDownloadHelper(_PluginBase):
             return f"{size:.2f} {units[idx]}"
         except Exception:
             return "未知"
+
+    @staticmethod
+    def _sum_file_sizes(item: Any) -> Optional[float]:
+        """递归汇总 FileItem/文件清单中的 size（字节）"""
+        total = 0.0
+        if isinstance(item, dict):
+            size = item.get("size")
+            if isinstance(size, (int, float)) and size > 0:
+                total += float(size)
+            for v in item.values():
+                total += OguraDownloadHelper._sum_file_sizes(v) or 0
+        elif isinstance(item, (list, tuple, set)):
+            for v in item:
+                total += OguraDownloadHelper._sum_file_sizes(v) or 0
+        return total or None
 
     def _query_records(self, source: Optional[str], media_id: Optional[str],
                        title: Optional[str], year: Optional[str],
@@ -384,8 +404,7 @@ class OguraDownloadHelper(_PluginBase):
                         "title": dh.title, "year": dh.year, "mtype": dh.type,
                         "seasons": dh.seasons, "episodes": dh.episodes,
                         "source_type": "download", "torrent_name": dh.torrent_name,
-                        "size": dh.note.get("size") if isinstance(dh.note, dict) else None,
-                        "status": "downloaded", "date": dh.date,
+                        "size": None, "status": "downloaded", "date": dh.date,
                     })
                 # 整理历史
                 if source and media_id:
@@ -405,12 +424,17 @@ class OguraDownloadHelper(_PluginBase):
                         )
                     ).scalars().all()
                 for th in th_rows:
+                    size = (
+                        self._sum_file_sizes(th.files)
+                        or self._sum_file_sizes(th.dest_fileitem)
+                        or self._sum_file_sizes(th.src_fileitem)
+                    )
                     records.append({
                         "media_source": th.media_source, "media_id": th.media_id,
                         "title": th.title, "year": th.year, "mtype": th.type,
                         "seasons": th.seasons, "episodes": th.episodes,
                         "source_type": "transfer", "torrent_name": th.src,
-                        "size": None, "status": "transferred" if th.status else "failed",
+                        "size": size, "status": "transferred" if th.status else "failed",
                         "date": th.date,
                     })
                 # 媒体服务器条目（V2 用 tmdbid/imdbid/tvdbid）
@@ -650,28 +674,31 @@ class OguraDownloadHelper(_PluginBase):
         return "\n".join(lines) or "（无详细信息）"
 
     def _volume_hint(self, records: List[dict], torrent: Any) -> str:
-        """新旧体积对比提示（仅提示，不决策）"""
-        new_size = getattr(torrent, "size", None)
+        """
+        新旧体积对比提示（仅提示，不决策）
+        旧体积只取「整理入库」记录——整理成功才是真正落盘；下载记录可能被取消，不作数。
+        """
+        new_size = getattr(torrent, "size", None)  # KB
+        # 新体积转字节（与整理记录同单位）
+        new_bytes = float(new_size) * 1024 if new_size else None
         old_size = None
         for rec in records:
-            if rec.get("size"):
+            if rec.get("source_type") == "transfer" and rec.get("size"):
                 old_size = rec.get("size")
                 break
-        new_txt = self._format_size(new_size)
+        new_txt = self._format_size(new_bytes)
         old_txt = self._format_size(old_size)
-        if old_size is None and new_size is None:
-            return ""
         if old_size is None:
-            return f"新种子体积：{new_txt}（旧体积未知，无法对比）"
-        if new_size is None:
-            return f"旧体积：{old_txt}（新体积未知，无法对比）"
+            return ""
+        if new_bytes is None:
+            return f"已落盘体积：{old_txt}（新体积未知）"
         try:
-            diff = abs(float(new_size) - float(old_size)) / max(float(old_size), 0.001)
+            diff = abs(new_bytes - float(old_size)) / max(float(old_size), 0.001)
             if diff <= self._volume_ratio:
-                return f"体积相近（旧 {old_txt} / 新 {new_txt}），可能是同一版本"
-            return f"体积不同（旧 {old_txt} / 新 {new_txt}）"
+                return f"体积相近（已落盘 {old_txt} / 新 {new_txt}），可能是同一版本"
+            return f"体积不同（已落盘 {old_txt} / 新 {new_txt}）"
         except Exception:
-            return f"旧 {old_txt} / 新 {new_txt}"
+            return f"已落盘 {old_txt} / 新 {new_txt}"
 
     # ==================== 放行机制 ====================
 
@@ -878,7 +905,6 @@ class OguraDownloadHelper(_PluginBase):
                     episodes = ",".join(f"E{int(e):02d}" for e in sorted(eps))
             torrent = context.torrent_info
             torrent_name = getattr(torrent, "title", None) or ""
-            torrent_size = getattr(torrent, "size", None)
             now = time.strftime("%Y-%m-%d %H:%M:%S")
 
             conn = self._get_conn()
@@ -890,7 +916,7 @@ class OguraDownloadHelper(_PluginBase):
                     (
                         source, media_id, title, year, mtype_str,
                         f"S{season:02d}" if season is not None else None, episodes,
-                        "download", torrent_name, torrent_size, "downloading", now,
+                        "download", torrent_name, None, "downloading", now,
                     ),
                 )
                 conn.commit()
