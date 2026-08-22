@@ -1,4 +1,16 @@
 {
+  "OguraDownloadHelper": {
+    "name": "小仓酱的下载助手",
+    "description": "手动下载去重守护：综合下载历史/整理历史/媒体服务器数据，拦截重复下载，提供洗版对比提示、独立TG Bot一键放行。订阅/RSS自动下载不受影响。",
+    "labels": "下载,工具",
+    "version": "1.0.0",
+    "icon": "DownloaderHelper.png",
+    "author": "lkwang88",
+    "level": 1,
+    "history": {
+      "v1.0.0": "首发：手动下载去重拦截(仅Manual来源) + 三数据源判定(整理/媒体库/下载历史) + 剧集季集粒度 + 体积对比提示 + 独立TG Bot按钮放行 + 本地SQLite缓存 + 拦截记录页"
+    }
+  },
   "GDStrmHelper": {
     "name": "GD网盘Strm助手",
     "description": "为rclone挂载的谷歌网盘生成STRM：异步全量+增量扫描、SQLite状态记忆、实时监控、聚合刷新Emby、删除同步三重保险、数据库自愈维护。面向20-40万文件/盘优化。",
