@@ -53,7 +53,7 @@ class OguraDownloadHelper(_PluginBase):
     plugin_name = "小仓酱的下载助手"
     plugin_desc = "手动下载去重守护：综合下载/整理/媒体库数据，拦截重复下载并提供洗版对比提示与TG交互放行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradownloadhelper_"
@@ -70,6 +70,7 @@ class OguraDownloadHelper(_PluginBase):
     _bypass_hours = 24            # 放行有效期（小时）
     _volume_ratio = _DEFAULT_VOLUME_RATIO
     _disk_prefixes = ["/ptdownload/"]  # 盘路径前缀（用于显示精简与盘名提取）
+    _dl_grace_minutes = 10        # 下载记录宽限期（分钟）：此时间内刚下载的记录不计入拦截
 
     _bot = None
     _bot_thread = None
@@ -91,6 +92,7 @@ class OguraDownloadHelper(_PluginBase):
         prefixes = (config.get("disk_prefixes") or "").strip()
         self._disk_prefixes = [p.strip() for p in prefixes.replace("，", ",").split(",") if p.strip()] \
             or ["/ptdownload/"]
+        self._dl_grace_minutes = max(0, int(config.get("dl_grace_minutes") or 10))
 
         # 数据库初始化
         self._db_path = self.get_data_path() / "dedup.db"
@@ -352,6 +354,33 @@ class OguraDownloadHelper(_PluginBase):
         m = re.match(r"S(\d+)", str(season_str), re.IGNORECASE)
         return int(m.group(1)) if m else None
 
+    def _filter_grace_records(self, records: List[dict]) -> List[dict]:
+        """
+        过滤宽限期内的下载记录：最近 N 分钟内刚下载的记录不参与拦截
+        （防网络抖动重试、下载不满意换种子等误拦）
+        仅影响 download 记录；transfer/mediaserver（真落盘）不受影响
+        """
+        grace = self._dl_grace_minutes
+        if grace <= 0:
+            return records
+        cutoff = time.time() - grace * 60
+        kept = []
+        for rec in records:
+            if rec.get("source_type") == "download" and self._rec_date_ts(rec.get("date")) >= cutoff:
+                continue
+            kept.append(rec)
+        return kept
+
+    @staticmethod
+    def _rec_date_ts(date_str: Optional[str]) -> float:
+        """记录日期字符串 → 时间戳（解析失败返回 0，视为过期）"""
+        if not date_str:
+            return 0.0
+        try:
+            return time.mktime(time.strptime(str(date_str)[:19], "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            return 0.0
+
     @staticmethod
     def _format_size(size_bytes: Optional[float]) -> str:
         """体积（字节）转人类可读"""
@@ -583,6 +612,11 @@ class OguraDownloadHelper(_PluginBase):
         # 硬拦截模式
         source, media_id = self._resolve_identity(media)
         records = self._query_records(source, media_id, title, year, mtype_str, media)
+        if not records:
+            return None
+
+        # 下载记录宽限期：此时间内刚下载的记录不计入拦截（防重试/换种子误拦）
+        records = self._filter_grace_records(records)
         if not records:
             return None
 
@@ -1646,6 +1680,21 @@ class OguraDownloadHelper(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
+                                            "model": "dl_grace_minutes",
+                                            "label": "下载记录宽限期（分钟）",
+                                            "hint": "最近此时间内刚下载的记录不计入拦截（防重试/换种子误拦），0=关闭",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
                                             "model": "volume_ratio",
                                             "label": "体积差异提示阈值",
                                             "hint": "新旧体积差异小于该比例视为相近（默认 0.05=5%）",
@@ -1704,6 +1753,7 @@ class OguraDownloadHelper(_PluginBase):
             "bypass_hours": 24,
             "volume_ratio": 0.05,
             "disk_prefixes": "/ptdownload/",
+            "dl_grace_minutes": 10,
         }
 
     # ==================== 详情页 ====================
