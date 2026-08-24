@@ -21,7 +21,7 @@ class OguraDiskGuard(_PluginBase):
     plugin_name = "小仓酱磁盘卫士"
     plugin_desc = "统计正在下载的种子体积与磁盘剩余空间，定时播报；触及阈值自动暂停下载，防止爆盘。"
     plugin_icon = "diskusage.jpg"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradiskguard_"
@@ -108,32 +108,78 @@ class OguraDiskGuard(_PluginBase):
             return col_config, global_config, page
 
         n, total_size, total_done, _free = self._last_snapshot
-        alert_type = "error" if self._braked else "success"
-        head = ("🚨 已制动 · 空间不足" if self._braked else "✅ 监控中")
-        lines = [
-            "📥 %d 个任务｜待写入 %s（已完成 %.1f%%）" % (
-                n, self._fmt_gb(max(total_size - total_done, 0)),
-                (total_done / total_size * 100) if total_size else 0.0),
-        ]
-        for d in getattr(self, "_page_disks", []) or []:
-            if d["exists"] and d["total"] > 0:
-                lines.append("💾 %s 剩余 %s（%s）" % (
-                    d["dir"], self._fmt_gb(d["free"]),
-                    self._fmt_pct(d["free"], d["total"])))
-            else:
-                lines.append("💾 %s ⚠️ 目录不可用" % d["dir"])
-        if self._braked:
-            lines.append("已自动暂停下载，清理后请手动恢复任务")
-        page = [{
+        disks = getattr(self._page_disks, "copy", lambda: [])() or []
+        color = "error" if self._braked else "success"
+        pending = max(total_size - total_done, 0)
+
+        content = []
+        # 状态行
+        content.append({
             "component": "div",
+            "props": {"class": "text-subtitle-1 font-weight-bold text-%s" % color},
+            "text": "🚨 已制动 · 空间不足" if self._braked else "✅ 监控中",
+        })
+        # 主数字：磁盘剩余（多目录合计），无数据时用待写入
+        free_sum = sum(d["free"] for d in disks if d["exists"])
+        if free_sum > 0:
+            big_num, big_label = self._fmt_gb(free_sum), "磁盘剩余空间"
+        else:
+            big_num, big_label = self._fmt_gb(pending), "待写入体积"
+        content.append({
+            "component": "div",
+            "props": {"class": "text-h5 font-weight-bold mt-1 text-%s" % color},
+            "text": big_num,
+        })
+        content.append({
+            "component": "div",
+            "props": {"class": "text-caption text-medium-emphasis"},
+            "text": big_label,
+        })
+        # 明细表：标签左 / 数值右
+        rows = [
+            ("📥 正在下载", "%d 个任务" % n),
+            ("📦 目标体积", self._fmt_gb(total_size)),
+            ("✅ 已完成", "%s（%s）" % (self._fmt_gb(total_done),
+                                        self._fmt_pct(total_done, total_size))),
+            ("⏳ 待写入", self._fmt_gb(pending)),
+        ]
+        for i, d in enumerate(disks):
+            if d["exists"] and d["total"] > 0:
+                multi = sum(1 for x in disks if x["exists"]) > 1
+                tag = "💾 磁盘剩余" + ("①②③④⑤⑥⑦⑧⑨"[i] if multi else "")
+                rows.append((tag, "剩 %s（%s）" % (
+                    self._fmt_gb(d["free"]),
+                    self._fmt_pct(d["free"], d["total"]))))
+            else:
+                rows.append(("💾 磁盘剩余", "⚠️ 目录不可用"))
+        content.append({
+            "component": "VTable",
+            "props": {"density": "compact", "class": "mt-1"},
             "content": [{
-                "component": "VAlert",
-                "props": {"type": alert_type, "variant": "tonal",
-                          "density": "compact",
-                          "style": "white-space:pre-wrap;"},
-                "text": head + "\n" + "\n".join(lines),
+                "component": "tbody",
+                "content": [
+                    {
+                        "component": "tr",
+                        "content": [
+                            {"component": "td",
+                             "props": {"class": "text-body-2 pl-0 text-medium-emphasis"},
+                             "text": label},
+                            {"component": "td",
+                             "props": {"class": "text-body-2 text-right pr-0 font-weight-medium"},
+                             "text": value},
+                        ],
+                    }
+                    for label, value in rows
+                ],
             }],
-        }]
+        })
+        if self._braked:
+            content.append({
+                "component": "div",
+                "props": {"class": "text-caption text-error mt-1"},
+                "text": "已自动暂停下载，清理空间后请在下载器中手动恢复任务",
+            })
+        page = [{"component": "div", "content": content}]
         return col_config, global_config, page
 
     def stop_service(self):
