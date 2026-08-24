@@ -21,7 +21,7 @@ class OguraDiskGuard(_PluginBase):
     plugin_name = "小仓酱磁盘卫士"
     plugin_desc = "统计正在下载的种子体积与磁盘剩余空间，定时播报；触及阈值自动暂停下载，防止爆盘。"
     plugin_icon = "diskusage.jpg"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradiskguard_"
@@ -64,7 +64,7 @@ class OguraDiskGuard(_PluginBase):
         except (TypeError, ValueError):
             self._notify_interval = 30
         try:
-            self._collect_interval = max(15, int(config.get("collect_interval") or 60))
+            self._collect_interval = max(30, int(config.get("collect_interval") or 60))
         except (TypeError, ValueError):
             self._collect_interval = 60
 
@@ -84,8 +84,8 @@ class OguraDiskGuard(_PluginBase):
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
-        注册定时服务。触发器统一短周期（60s），
-        函数内部按配置的检查/播报间隔自行节流。
+        注册定时服务：60s 心跳触发，内部按检查间隔节流；
+        next_run_time 使服务注册后立即执行一次。
         """
         if not self.get_state():
             return []
@@ -95,7 +95,7 @@ class OguraDiskGuard(_PluginBase):
                 "name": "小仓酱磁盘卫士检查",
                 "trigger": IntervalTrigger(seconds=60),
                 "func": self.check,
-                "kwargs": {},
+                "kwargs": {"next_run_time": datetime.now()},
             },
         ]
 
@@ -259,6 +259,14 @@ class OguraDiskGuard(_PluginBase):
                 self._notify_report(snapshot, stats, disks)
             self._last_snapshot = snapshot
             self._err_notified = False
+            logger.info(
+                "小仓酱磁盘卫士 检查完成：%d 个下载任务，目标 %s / 已完成 %s / 待写入 %s；%s",
+                len(stats),
+                self._fmt_gb(snapshot[1]), self._fmt_gb(snapshot[2]),
+                self._fmt_gb(max(snapshot[1] - snapshot[2], 0)),
+                "；".join("%s 剩余 %s" % (d["dir"], self._fmt_gb(d["free"]))
+                          for d in disks if d["exists"]) or "监控目录不可用",
+            )
         except Exception as err:
             logger.error(f"小仓酱磁盘卫士 检查异常：{str(err)}", exc_info=True)
 
@@ -286,10 +294,11 @@ class OguraDiskGuard(_PluginBase):
                 self._log_action(f"[{dl_name}] 暂停任务出错：{err}")
         return stopped
 
-    def _log_action(self, text: str):
+    def _log_action(self, text: str, level: str = "info"):
         stamp = datetime.now().strftime("%H:%M:%S")
         self._action_log.insert(0, f"[{stamp}] {text}")
         del self._action_log[20:]
+        getattr(logger, level, logger.info)(f"小仓酱磁盘卫士 {text}")
 
     # ============================ 通知输出 ============================
 
@@ -471,12 +480,11 @@ class OguraDiskGuard(_PluginBase):
                                 "props": {"cols": 12, "md": 2},
                                 "content": [{
                                     "component": "VTextField",
-                                    "props": {"model": "collect_interval_unused",
+                                    "props": {"model": "collect_interval",
                                               "label": "检查间隔(秒)",
                                               "type": "number",
-                                              "hint": "当前版本固定 60 秒检查一次",
-                                              "persistent-hint": True,
-                                              "disabled": True},
+                                              "hint": "最小30；60秒开销极小，仅看播报可调大",
+                                              "persistent-hint": True},
                                 }],
                             },
                         ],
@@ -491,76 +499,65 @@ class OguraDiskGuard(_PluginBase):
             "threshold_mode": "percent",
             "threshold_value": 10,
             "notify_interval": 30,
-            "collect_interval_unused": 60,
+            "collect_interval": 60,
         }
 
     # ============================ 详情页 ============================
 
     def get_page(self) -> List[dict]:
+        """
+        详情页。根元素统一 div 包裹、文本放组件层 text——
+        对齐真机验证过的 vuetify 渲染器写法。
+        """
+        content: List[dict] = []
         if not self._enabled:
-            return [{
+            content.append({
                 "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal",
-                          "text": "插件未启用，请在设置中开启。"},
-            }]
+                "props": {"type": "info", "variant": "tonal"},
+                "text": "插件未启用，请在设置中开启。",
+            })
+            return [{"component": "div", "content": content}]
         if not self._last_snapshot:
-            return [{
+            content.append({
                 "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal",
-                          "text": "尚未完成首次检查，启用后一分钟内自动运行。"},
-            }]
+                "props": {"type": "info", "variant": "tonal"},
+                "text": "尚未完成首次检查：服务注册后会立即运行一次，稍候刷新本页查看。",
+            })
+            return [{"component": "div", "content": content}]
 
-        n, total_size, total_done, free_sum = self._last_snapshot
+        n, total_size, total_done, _free = self._last_snapshot
         status = ("🚨 已制动（等待空间回升）" if self._braked else "✅ 监控中")
-        rows = [{
-            "component": "VRow",
-            "content": [
-                self._stat_card("状态", status),
-                self._stat_card("正在下载", "%d 个任务" % n),
-                self._stat_card("待写入", self._fmt_gb(max(total_size - total_done, 0))),
-                self._stat_card("已完成", "%s（%s）" % (
-                    self._fmt_gb(total_done),
-                    self._fmt_pct(total_done, total_size))),
-            ],
-        }]
+        cards = [
+            self._stat_card("状态", status),
+            self._stat_card("正在下载", "%d 个任务" % n),
+            self._stat_card("待写入", self._fmt_gb(max(total_size - total_done, 0))),
+            self._stat_card("已完成", "%s（%s）" % (
+                self._fmt_gb(total_done),
+                self._fmt_pct(total_done, total_size))),
+        ]
         for d in getattr(self, "_page_disks", []) or []:
             if not d["exists"]:
-                rows.append({
-                    "component": "VRow",
-                    "content": [self._stat_card(d["dir"], "⚠️ 目录不存在")],
-                })
+                cards.append(self._stat_card(d["dir"], "⚠️ 目录不存在"))
             else:
-                rows.append({
-                    "component": "VRow",
-                    "content": [
-                        self._stat_card(d["dir"],
-                                        "剩 %s / 共 %s" % (
-                                            self._fmt_gb(d["free"]),
-                                            self._fmt_gb(d["total"]))),
-                        self._stat_card("剩余比例",
-                                        self._fmt_pct(d["free"], d["total"])),
-                    ],
-                })
+                cards.append(self._stat_card(
+                    d["dir"], "剩 %s / 共 %s" % (self._fmt_gb(d["free"]),
+                                                 self._fmt_gb(d["total"]))))
+                cards.append(self._stat_card(
+                    "剩余比例", self._fmt_pct(d["free"], d["total"])))
+        content.append({"component": "VRow", "content": cards})
+
         log_lines = "\n".join(self._action_log[:8]) or "暂无"
-        rows.append({
-            "component": "VRow",
+        content.append({
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mt-3"},
             "content": [{
-                "component": "VCol",
-                "props": {"cols": 12},
-                "content": [{
-                    "component": "VCard",
-                    "props": {"variant": "tonal", "class": "pa-3"},
-                    "content": [{
-                        "component": "VCardText",
-                        "props": {
-                            "class": "text-caption",
-                            "style": "white-space:pre-wrap;",
-                            "text": "最近动作：\n" + log_lines},
-                    }],
-                }],
+                "component": "VCardText",
+                "props": {"class": "text-caption",
+                          "style": "white-space:pre-wrap;"},
+                "text": "最近动作：\n" + log_lines,
             }],
         })
-        return rows
+        return [{"component": "div", "content": content}]
 
     def _stat_card(self, label: str, value: str) -> dict:
         return {
@@ -571,9 +568,9 @@ class OguraDiskGuard(_PluginBase):
                 "props": {"variant": "tonal", "class": "pa-2"},
                 "content": [{
                     "component": "VCardText",
-                    "props": {
-                        "class": "text-center",
-                        "text": "%s\n%s" % (value, label)},
+                    "props": {"class": "text-center",
+                              "style": "white-space:pre-wrap;"},
+                    "text": "%s\n%s" % (value, label),
                 }],
             }],
         }
