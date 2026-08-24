@@ -21,7 +21,7 @@ class OguraDiskGuard(_PluginBase):
     plugin_name = "小仓酱磁盘卫士"
     plugin_desc = "统计正在下载的种子体积与磁盘剩余空间，定时播报；触及阈值自动暂停下载，防止爆盘。"
     plugin_icon = "diskusage.jpg"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradiskguard_"
@@ -77,6 +77,64 @@ class OguraDiskGuard(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return []
+
+    # ============================ 仪表板 ============================
+
+    def get_dashboard(self, key: str = None, **kwargs):
+        """
+        首页仪表板卡片：磁盘卫士实时状态直达。
+        返回 (列配置, 全局配置, 页面JSON)；未启用返回 None 不占位。
+        """
+        if not self.get_state():
+            return None
+
+        col_config = {"cols": 12, "md": 4}
+        global_config = {
+            "title": "小仓酱磁盘卫士",
+            "refresh": 30,
+            "border": True,
+        }
+
+        if not self._last_snapshot:
+            page = [{
+                "component": "div",
+                "content": [{
+                    "component": "VAlert",
+                    "props": {"type": "info", "variant": "tonal",
+                              "density": "compact"},
+                    "text": "等待首次检查…",
+                }],
+            }]
+            return col_config, global_config, page
+
+        n, total_size, total_done, _free = self._last_snapshot
+        alert_type = "error" if self._braked else "success"
+        head = ("🚨 已制动 · 空间不足" if self._braked else "✅ 监控中")
+        lines = [
+            "📥 %d 个任务｜待写入 %s（已完成 %.1f%%）" % (
+                n, self._fmt_gb(max(total_size - total_done, 0)),
+                (total_done / total_size * 100) if total_size else 0.0),
+        ]
+        for d in getattr(self, "_page_disks", []) or []:
+            if d["exists"] and d["total"] > 0:
+                lines.append("💾 %s 剩余 %s（%s）" % (
+                    d["dir"], self._fmt_gb(d["free"]),
+                    self._fmt_pct(d["free"], d["total"])))
+            else:
+                lines.append("💾 %s ⚠️ 目录不可用" % d["dir"])
+        if self._braked:
+            lines.append("已自动暂停下载，清理后请手动恢复任务")
+        page = [{
+            "component": "div",
+            "content": [{
+                "component": "VAlert",
+                "props": {"type": alert_type, "variant": "tonal",
+                          "density": "compact",
+                          "style": "white-space:pre-wrap;"},
+                "text": head + "\n" + "\n".join(lines),
+            }],
+        }]
+        return col_config, global_config, page
 
     def stop_service(self):
         self._braked = False
