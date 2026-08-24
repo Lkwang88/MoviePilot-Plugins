@@ -103,5 +103,18 @@
     "history": {
       "v1.9.5": "首发版本：重构核心逻辑，支持异步监控启动与延迟聚合刷新"
     }
+  },
+  "OguraDiskGuard": {
+    "name": "小仓酱磁盘卫士",
+    "description": "实时统计正在下载的种子体积与磁盘剩余空间，定时播报（数据无变化自动静默）；剩余空间触及阈值可自动暂停下载任务防止爆盘，支持百分比/GB双模式阈值。支持 qBittorrent 与 Transmission。",
+    "labels": "磁盘,监控,工具",
+    "version": "1.0.0",
+    "icon": "diskusage.jpg",
+    "author": "lkwang88",
+    "level": 1,
+    "system_version": ">=2.5.0",
+    "history": {
+      "v1.0.0": "首发：下载中任务体积统计(目标/已完成/待写入) + 磁盘剩余监控(多目录独立判定) + 定时播报(数据无变化静默、间隔可设) + 阈值告警(percent/absolute) + 触线自动暂停下载防爆盘(不动做种、滞回防抖、仅告警模式可选) + qBittorrent/Transmission 双支持"
+    }
   }
 }
