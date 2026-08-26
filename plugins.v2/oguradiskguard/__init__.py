@@ -21,7 +21,7 @@ class OguraDiskGuard(_PluginBase):
     plugin_name = "小仓酱磁盘卫士"
     plugin_desc = "统计正在下载的种子体积与磁盘剩余空间，定时播报；触及阈值自动暂停下载，防止爆盘。"
     plugin_icon = "diskusage.jpg"
-    plugin_version = "1.0.3"
+    plugin_version = "1.1.0"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradiskguard_"
@@ -34,15 +34,17 @@ class OguraDiskGuard(_PluginBase):
     _downloader_names: List[str] = []
     _threshold_mode = "percent"
     _threshold_value = 10.0
-    _auto_stop = False
+    _brake_mode = "pause"          # none/pause/limit/alt
+    _limit_speed = 256             # limit 模式限速值 KB/s
     _notify_interval = 30          # 分钟
     _collect_interval = 60         # 秒
 
-    # 内存状态（重启即复位）
+    # 内存状态（brake_scene 持久化，其余重启复位）
     _services: Dict[str, Any] = {}       # name -> ServiceInfo
     _last_snapshot: Optional[tuple] = None
     _last_notify_ts: float = 0.0
     _braked = False                      # 制动状态机
+    _brake_scene: Optional[Dict] = None  # 制动现场存档（模式/原限速/被停清单）
     _err_notified = False                # 异常告警节流标志
     _action_log: List[str] = []          # 最近动作记录（详情页展示）
 
@@ -58,7 +60,17 @@ class OguraDiskGuard(_PluginBase):
             self._threshold_value = float(config.get("threshold_value") or 10)
         except (TypeError, ValueError):
             self._threshold_value = 10.0
-        self._auto_stop = bool(config.get("auto_stop"))
+        # 制动模式：none仅告警/pause暂停/limit限速/alt备用速度
+        mode = str(config.get("brake_mode") or "").strip()
+        if mode not in ("none", "pause", "limit", "alt"):
+            # 旧版配置迁移：auto_stop=true→pause，false→none；全新安装默认 pause
+            mode = "pause" if config.get("auto_stop") else (
+                "none" if "auto_stop" in config else "pause")
+        self._brake_mode = mode
+        try:
+            self._limit_speed = max(1, int(config.get("limit_speed") or 256))
+        except (TypeError, ValueError):
+            self._limit_speed = 256
         try:
             self._notify_interval = max(1, int(config.get("notify_interval") or 30))
         except (TypeError, ValueError):
@@ -67,9 +79,22 @@ class OguraDiskGuard(_PluginBase):
             self._collect_interval = max(30, int(config.get("collect_interval") or 60))
         except (TypeError, ValueError):
             self._collect_interval = 60
+        # 恢复持久化的制动现场（MP 重启后继续未完成的制动周期）
+        try:
+            scene = self.get_data("brake_scene")
+            if scene and isinstance(scene, dict):
+                self._brake_scene = scene
+                self._braked = True
+        except Exception as err:
+            logger.error(f"小仓酱磁盘卫士 读取制动现场失败：{err}")
 
     def get_state(self) -> bool:
         return self._enabled
+
+    @staticmethod
+    def _mode_label(mode: str) -> str:
+        return {"none": "仅告警", "pause": "暂停下载",
+                "limit": "限速", "alt": "备用速度"}.get(mode, mode)
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -114,10 +139,15 @@ class OguraDiskGuard(_PluginBase):
 
         content = []
         # 状态行
+        if self._braked:
+            applied = (self._brake_scene or {}).get("applied") or self._brake_mode
+            head = "🚨 已制动·%s · 空间不足" % self._mode_label(applied)
+        else:
+            head = "✅ 监控中"
         content.append({
             "component": "div",
             "props": {"class": "text-subtitle-1 font-weight-bold text-%s" % color},
-            "text": "🚨 已制动 · 空间不足" if self._braked else "✅ 监控中",
+            "text": head,
         })
         # 主数字：磁盘剩余（多目录合计），无数据时用待写入
         free_sum = sum(d["free"] for d in disks if d["exists"])
@@ -174,16 +204,21 @@ class OguraDiskGuard(_PluginBase):
             }],
         })
         if self._braked:
+            applied = (self._brake_scene or {}).get("applied") or self._brake_mode
+            foot = {"pause": "已自动暂停下载，空间回升后将自动恢复任务",
+                    "limit": "已自动限速，空间回升后将自动恢复原速",
+                    "alt": "已切换备用速度，空间回升后将自动切回"}.get(
+                        applied, "请及时清理空间或手动暂停下载任务")
             content.append({
                 "component": "div",
                 "props": {"class": "text-caption text-error mt-1"},
-                "text": "已自动暂停下载，清理空间后请在下载器中手动恢复任务",
+                "text": foot,
             })
         page = [{"component": "div", "content": content}]
         return col_config, global_config, page
 
     def stop_service(self):
-        self._braked = False
+        # 制动现场已持久化，停用/重配不丢状态；仅清异常节流标志
         self._err_notified = False
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -342,17 +377,28 @@ class OguraDiskGuard(_PluginBase):
                 return
             disks = self._collect_disk()
 
-            # --- 阈值判定与制动 ---
+            # --- 阈值判定与制动/恢复 ---
             triggered = [d for d in disks if self._is_triggered(d)]
             if triggered and not self._braked:
+                scene = self._do_brake(stats)
+                self._brake_scene = scene
                 self._braked = True
-                stopped = self._do_brake(stats) if self._auto_stop else []
-                self._notify_brake(triggered, stopped, stats)
+                try:
+                    self.save_data("brake_scene", scene)
+                except Exception as err:
+                    logger.error(f"小仓酱磁盘卫士 保存制动现场失败：{err}")
+                self._notify_brake(triggered, scene, stats)
                 self._last_notify_ts = time.time()   # 制动后顺延常规播报，防轰炸
             elif self._braked and not triggered:
                 if all(self._is_recovered(d) for d in disks):
+                    self._do_recover()
+                    self._notify_recover()
                     self._braked = False
-                    self._notify_recover(triggered=None)
+                    self._brake_scene = None
+                    try:
+                        self.del_data("brake_scene")
+                    except Exception as err:
+                        logger.error(f"小仓酱磁盘卫士 清理制动现场失败：{err}")
 
             # --- 常规播报（节流）---
             snapshot = self._make_snapshot(stats, disks)
@@ -374,8 +420,63 @@ class OguraDiskGuard(_PluginBase):
         except Exception as err:
             logger.error(f"小仓酱磁盘卫士 检查异常：{str(err)}", exc_info=True)
 
-    def _do_brake(self, stats: List[Dict]) -> List[Dict]:
-        """全停正在下载任务（不动做种），返回停成功的列表"""
+    def _do_brake(self, stats: List[Dict]) -> Dict:
+        """
+        按制动模式执行动作，返回现场存档 dict（持久化供恢复用）。
+        none=仅告警；pause=停下载任务；limit=全局限速；alt=qb备用速度(TR回退pause)。
+        """
+        scene: Dict = {"mode": self._brake_mode, "applied": self._brake_mode,
+                       "stopped": {}, "orig_speed": None,
+                       "orig_alt": None, "switched": False, "ts": time.time()}
+        if self._brake_mode == "none":
+            return scene
+
+        if self._brake_mode == "alt":
+            # 备用速度仅 qBittorrent 支持，TR 实例回退为暂停模式
+            qb_services = {k: v for k, v in self._services.items()
+                           if v.type == "qbittorrent"}
+            if qb_services:
+                switched_all = True
+                for dl_name, service in qb_services.items():
+                    qbc = getattr(service.instance, "qbc", None)
+                    try:
+                        cur = getattr(qbc.transfer, "speed_limits_mode", "normal")
+                        if cur != "alternative":
+                            qbc.toggle_speed_limits_mode()
+                            scene["orig_alt"] = False
+                            scene["switched"] = True
+                            self._log_action(f"[{dl_name}] 已切换至备用速度")
+                        else:
+                            scene["orig_alt"] = True
+                            self._log_action(f"[{dl_name}] 已处于备用速度，无需切换")
+                    except Exception as err:
+                        switched_all = False
+                        logger.error(f"小仓酱磁盘卫士 [{dl_name}] 切换备用速度失败：{err}")
+                        self._log_action(f"[{dl_name}] 切换备用速度出错", "error")
+                if switched_all:
+                    return scene
+            scene["applied"] = "pause"   # 回退
+
+        if scene["applied"] == "limit":
+            orig_all, ok_all = [], True
+            for dl_name, service in self._services.items():
+                try:
+                    orig = service.instance.get_speed_limit() or (0, 0)
+                    orig_all.append((dl_name, orig))
+                    # 仅压低下载速度，上传保持原值（None 会被转成 0=不限）
+                    service.instance.set_speed_limit(self._limit_speed, orig[1])
+                    self._log_action(
+                        f"[{dl_name}] 下载限速 {self._limit_speed} KB/s（原 {orig[0]}）")
+                except Exception as err:
+                    ok_all = False
+                    logger.error(f"小仓酱磁盘卫士 [{dl_name}] 限速失败：{err}")
+                    self._log_action(f"[{dl_name}] 限速出错", "error")
+            if ok_all:
+                scene["orig_speed"] = orig_all
+                return scene
+            scene["applied"] = "pause"   # 限速失败回退为暂停
+
+        # pause（含回退）：停全部下载任务，记录清单供恢复
         by_dl: Dict[str, List[Dict]] = {}
         for s in stats:
             by_dl.setdefault(s["downloader"], []).append(s)
@@ -389,14 +490,51 @@ class OguraDiskGuard(_PluginBase):
                 continue
             try:
                 if service.instance.stop_torrents(ids):
+                    scene["stopped"][dl_name] = ids
                     stopped.extend(items)
                     self._log_action(f"[{dl_name}] 已暂停 {len(items)} 个下载任务")
                 else:
                     self._log_action(f"[{dl_name}] 暂停操作返回失败")
             except Exception as err:
                 logger.error(f"小仓酱磁盘卫士 [{dl_name}] 暂停任务失败：{err}")
-                self._log_action(f"[{dl_name}] 暂停任务出错：{err}")
-        return stopped
+                self._log_action(f"[{dl_name}] 暂停任务出错", "error")
+        return scene
+
+    def _do_recover(self):
+        """按现场存档恢复：只动自己制动时的操作，不碰用户手动变更"""
+        scene = self._brake_scene or {}
+        applied = scene.get("applied") or scene.get("mode") or "none"
+        if applied == "pause" and scene.get("stopped"):
+            for dl_name, ids in scene["stopped"].items():
+                service = self._services.get(dl_name)
+                if not service:
+                    continue
+                try:
+                    # 重复 start 对运行中的任务无副作用；已删除的 id 会被忽略
+                    service.instance.start_torrents(ids)
+                    self._log_action(f"[{dl_name}] 已恢复 {len(ids)} 个下载任务")
+                except Exception as err:
+                    logger.error(f"小仓酱磁盘卫士 [{dl_name}] 恢复任务失败：{err}")
+                    self._log_action(f"[{dl_name}] 恢复任务出错", "error")
+        elif applied == "limit" and scene.get("orig_speed"):
+            for dl_name, orig in scene["orig_speed"]:
+                service = self._services.get(dl_name)
+                if not service:
+                    continue
+                try:
+                    service.instance.set_speed_limit(orig[0], orig[1])
+                    self._log_action(f"[{dl_name}] 已恢复原限速 {orig[0]} KB/s")
+                except Exception as err:
+                    logger.error(f"小仓酱磁盘卫士 [{dl_name}] 恢复限速失败：{err}")
+        elif applied == "alt" and scene.get("switched"):
+            for dl_name, service in self._services.items():
+                if service.type != "qbittorrent":
+                    continue
+                try:
+                    service.instance.qbc.toggle_speed_limits_mode()
+                    self._log_action(f"[{dl_name}] 已切回正常速度")
+                except Exception as err:
+                    logger.error(f"小仓酱磁盘卫士 [{dl_name}] 切回正常速度失败：{err}")
 
     def _log_action(self, text: str, level: str = "info"):
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -435,13 +573,16 @@ class OguraDiskGuard(_PluginBase):
         self._last_notify_ts = time.time()
         self._log_action("已发送常规播报")
 
-    def _notify_brake(self, triggered: List[Dict], stopped: List[Dict],
+    def _notify_brake(self, triggered: List[Dict], scene: Dict,
                       stats: List[Dict]):
-        """制动告警：触线目录 + 被停任务清单"""
-        if self._auto_stop and stopped:
+        """制动告警：触线目录 + 按模式说明已执行的动作"""
+        mode = scene.get("applied") or self._brake_mode
+        if mode == "pause":
             head = "已自动暂停下载"
-        elif self._auto_stop:
-            head = "自动暂停未成功"
+        elif mode == "limit":
+            head = "已自动限速"
+        elif mode == "alt":
+            head = "已切换备用速度"
         else:
             head = "请及时处理"
         lines = []
@@ -452,7 +593,10 @@ class OguraDiskGuard(_PluginBase):
                 d["dir"], free, pct,
                 ("%g%%" % self._threshold_value) if self._threshold_mode == "percent"
                 else "%g GB" % self._threshold_value))
-        if self._auto_stop:
+        if mode == "pause":
+            stopped = [s for s in stats
+                       if s["id"] in (scene.get("stopped", {})
+                                       .get(s["downloader"], []))]
             if stopped:
                 lines.append("\n⏸️ 暂停了 %d 个下载任务：" % len(stopped))
                 for i, s in enumerate(sorted(stopped, key=lambda x: -x["size"])[:10], 1):
@@ -462,20 +606,39 @@ class OguraDiskGuard(_PluginBase):
                     lines.append("   ...等共 %d 个" % len(stopped))
             elif stats:
                 lines.append("\n⚠️ 暂停操作未成功，请尽快手动处理！")
-            lines.append("\n💡 清理空间后请在下载器中手动恢复任务")
+            lines.append("\n💡 空间回升后将自动恢复这些任务")
+        elif mode == "limit":
+            lines.append("\n🐢 全局下载速度已限制为 %d KB/s" % self._limit_speed)
+            lines.append("💡 空间回升后将自动恢复原限速")
+        elif mode == "alt":
+            lines.append("\n🐢 已切换至 qBittorrent 备用速度")
+            lines.append("💡 空间回升后将自动切回正常速度")
+        else:
+            lines.append("\n💡 请及时清理空间或手动暂停下载任务")
         self.post_message(mtype=NotificationType.Plugin,
                           title="🚨 磁盘空间告警 · %s" % head,
                           text="\n".join(lines))
         self._log_action("触发告警：" + "；".join(d["dir"] for d in triggered))
 
-    def _notify_recover(self, triggered: Optional[List[Dict]]):
-        """空间回升提示（轻量）"""
+    def _notify_recover(self):
+        """空间回升通知：按制动模式说明已恢复的动作"""
+        scene = self._brake_scene or {}
+        applied = scene.get("applied") or scene.get("mode") or "none"
+        lines = ["剩余空间已回到安全范围，小仓酱解除告警状态。"]
+        if applied == "pause" and scene.get("stopped"):
+            total = sum(len(v) for v in scene["stopped"].values())
+            lines.append(f"▶️ 已自动恢复 {total} 个下载任务")
+        elif applied == "limit" and scene.get("orig_speed"):
+            lines.append("▶️ 已恢复原下载限速设置")
+        elif applied == "alt" and scene.get("switched"):
+            lines.append("▶️ 已切回正常下载速度")
+        else:
+            lines.append("如需继续下载，请在下载器中恢复任务。")
         try:
             self.post_message(mtype=NotificationType.Plugin,
                               title="✅ 磁盘空间已回升",
-                              text="剩余空间回到安全范围，小仓酱解除告警状态。"
-                                   "如需继续下载，请在下载器中恢复任务。")
-            self._log_action("空间回升，解除告警状态")
+                              text="\n".join(lines))
+            self._log_action("空间回升，已解除告警并恢复")
         except Exception as err:
             logger.error(f"小仓酱磁盘卫士 发送恢复通知失败：{err}")
 
@@ -515,9 +678,22 @@ class OguraDiskGuard(_PluginBase):
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 6},
                                 "content": [{
-                                    "component": "VSwitch",
-                                    "props": {"model": "auto_stop",
-                                              "label": "触阈值自动暂停下载任务"},
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "brake_mode",
+                                        "label": "触阈值动作",
+                                        "items": [
+                                            {"title": "暂停全部下载任务",
+                                             "value": "pause"},
+                                            {"title": "全局限速",
+                                             "value": "limit"},
+                                            {"title": "备用速度(仅qB)",
+                                             "value": "alt"},
+                                            {"title": "仅告警不动作",
+                                             "value": "none"},
+                                        ],
+                                        "hint": "空间回升超阈值1.1倍时自动恢复",
+                                        "persistent-hint": True},
                                 }],
                             },
                             {
@@ -571,6 +747,18 @@ class OguraDiskGuard(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {"model": "limit_speed",
+                                              "label": "限速值(KB/s)",
+                                              "type": "number",
+                                              "hint": "限速模式生效，空间回升自动恢复原速",
+                                              "persistent-hint": True},
+                                }],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 2},
                                 "content": [{
                                     "component": "VTextField",
@@ -597,11 +785,12 @@ class OguraDiskGuard(_PluginBase):
             }
         ], {
             "enabled": False,
-            "auto_stop": False,
             "monitor_dirs": "/ptdownload",
             "downloader_names": "",
             "threshold_mode": "percent",
             "threshold_value": 10,
+            "brake_mode": "pause",
+            "limit_speed": 256,
             "notify_interval": 30,
             "collect_interval": 60,
         }
@@ -630,7 +819,9 @@ class OguraDiskGuard(_PluginBase):
             return [{"component": "div", "content": content}]
 
         n, total_size, total_done, _free = self._last_snapshot
-        status = ("🚨 已制动（等待空间回升）" if self._braked else "✅ 监控中")
+        status = ("🚨 已制动·%s（等待空间回升）" % self._mode_label(
+                      (self._brake_scene or {}).get("applied") or self._brake_mode)
+                  if self._braked else "✅ 监控中")
         cards = [
             self._stat_card("状态", status),
             self._stat_card("正在下载", "%d 个任务" % n),
