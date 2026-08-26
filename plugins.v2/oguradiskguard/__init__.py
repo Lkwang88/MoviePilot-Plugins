@@ -21,7 +21,7 @@ class OguraDiskGuard(_PluginBase):
     plugin_name = "小仓酱磁盘卫士"
     plugin_desc = "统计正在下载的种子体积与磁盘剩余空间，定时播报；触及阈值自动暂停下载，防止爆盘。"
     plugin_icon = "diskusage.jpg"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradiskguard_"
@@ -36,6 +36,7 @@ class OguraDiskGuard(_PluginBase):
     _threshold_value = 10.0
     _brake_mode = "pause"          # none/pause/limit/alt
     _limit_speed = 256             # limit 模式限速值 KB/s
+    _recover_factor = 1.1          # 恢复线 = 阈值 × 系数
     _notify_interval = 30          # 分钟
     _collect_interval = 60         # 秒
 
@@ -71,6 +72,12 @@ class OguraDiskGuard(_PluginBase):
             self._limit_speed = max(1, int(config.get("limit_speed") or 256))
         except (TypeError, ValueError):
             self._limit_speed = 256
+        # 恢复系数：恢复线=阈值×系数，调大可避免空间缓慢回升时反复触发
+        try:
+            self._recover_factor = min(5.0, max(1.05,
+                                         float(config.get("recover_factor") or 1.1)))
+        except (TypeError, ValueError):
+            self._recover_factor = 1.1
         try:
             self._notify_interval = max(1, int(config.get("notify_interval") or 30))
         except (TypeError, ValueError):
@@ -347,13 +354,15 @@ class OguraDiskGuard(_PluginBase):
         return disk["free"] / disk["total"] * 100 <= self._threshold_value
 
     def _is_recovered(self, disk: Dict) -> bool:
-        """滞回复位判定：回升超过阈值×1.1 才算解除"""
+        """恢复判定：回升超过 阈值×恢复系数 才解除（系数可调，防缓慢回升反复触发）"""
         if not disk["exists"] or disk["total"] <= 0:
             return True
         if self._threshold_mode == "absolute":
-            limit = self._to_bytes(self._threshold_value * 1.1 * 1024 ** 3)
+            limit = self._to_bytes(self._threshold_value
+                                   * self._recover_factor * 1024 ** 3)
             return disk["free"] > limit
-        return disk["free"] / disk["total"] * 100 > self._threshold_value * 1.1
+        return disk["free"] / disk["total"] * 100 > (self._threshold_value
+                                                     * self._recover_factor)
 
     # ============================ 主流程 ============================
 
@@ -692,7 +701,7 @@ class OguraDiskGuard(_PluginBase):
                                             {"title": "仅告警不动作",
                                              "value": "none"},
                                         ],
-                                        "hint": "空间回升超阈值1.1倍时自动恢复",
+                                        "hint": "空间回升超过恢复线(阈值×恢复系数)时自动恢复",
                                         "persistent-hint": True},
                                 }],
                             },
@@ -759,6 +768,18 @@ class OguraDiskGuard(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {"model": "recover_factor",
+                                              "label": "恢复系数",
+                                              "type": "number",
+                                              "hint": "恢复线=阈值×系数，如阈值50GB系数2.0即回升到100GB才恢复；调大防反复触发",
+                                              "persistent-hint": True},
+                                }],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 2},
                                 "content": [{
                                     "component": "VTextField",
@@ -791,6 +812,7 @@ class OguraDiskGuard(_PluginBase):
             "threshold_value": 10,
             "brake_mode": "pause",
             "limit_speed": 256,
+            "recover_factor": 1.1,
             "notify_interval": 30,
             "collect_interval": 60,
         }
