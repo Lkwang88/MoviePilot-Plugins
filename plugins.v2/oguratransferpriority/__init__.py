@@ -241,10 +241,10 @@ class OguraTransferPriority(_PluginBase):
     """
 
     # 插件元信息
-    plugin_name = "订阅优先整理"
+    plugin_name = "小仓酱的订阅优先整理"
     plugin_desc = "订阅下载的媒体优先整理：订阅任务插队到整理队列队首，手动及其他任务保持原有顺序，适合 HDD 等慢速存储环境。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/SpeedLimiter.jpg"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguratransferpriority."
