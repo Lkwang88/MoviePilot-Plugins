@@ -23,6 +23,7 @@ import importlib
 import threading
 import time
 import traceback
+import weakref
 from typing import Any, Optional
 
 from app.log import logger
@@ -31,6 +32,15 @@ from app.schemas import NotificationType
 
 # 原生 queue.Queue 类型引用（用于类型判断与还原）
 import queue as _native_queue
+
+
+# ---------------------------------------------------------------------------
+# 类级协调注册表（插件分身场景）：记录当前处于「已生效」状态的实例。
+# 只有关联到队列的实例才有权降级队列；其他分身停用不影响队列。
+# 用 WeakSet 存实例引用，实例被回收后自动移除，不泄漏。
+# ---------------------------------------------------------------------------
+_active_plugin_refs: "weakref.WeakSet" = weakref.WeakSet()
+_registry_lock = threading.Lock()
 
 
 class SubscribePriorityQueue:
@@ -53,6 +63,10 @@ class SubscribePriorityQueue:
         self._logger = logger_
         self._source_tag = source_tag
         self._jump_notify_fn = jump_notify_fn
+        # 降级开关：True 时按纯 FIFO 工作（停用插件用，杜绝引用交换丢任务）
+        self._disabled = False
+        # 队列所有权：当前绑定到该队列的插件实例（弱引用，防循环引用泄漏）
+        self._owner_ref = None
         self.mutex = threading.Lock()
         self.not_empty = threading.Condition(self.mutex)
         self.not_full = threading.Condition(self.mutex)  # 无界队列，仅占位保接口
@@ -60,7 +74,6 @@ class SubscribePriorityQueue:
         self._heap = []           # [(priority, seq, item), ...]
         self._seq = 0
         self.unfinished_tasks = 0
-        self._pending_jump_notify = []  # absorb 锁内暂存，锁外统一发送
 
     # ------------------------------------------------------------------ 内部
     def _log(self, level: str, msg: str):
@@ -83,6 +96,9 @@ class SubscribePriorityQueue:
     def put(self, item, block=True, timeout=None):
         priority = self._priority_of(item)
         with self.mutex:
+            # 降级模式（插件停用）：一律按 P1 追加，纯 FIFO，不丢引用不换对象
+            if self._disabled:
+                priority = 1
             heapq.heappush(self._heap, (priority, self._seq, item))
             self._seq += 1
             self.unfinished_tasks += 1
@@ -213,18 +229,7 @@ class SubscribePriorityQueue:
                 self._seq += 1
                 self.unfinished_tasks += 1
                 self.not_empty.notify()
-                # 吸收路径同样触发插队判定（存量订阅任务重新置顶）
-                if priority == 0 and self._jump_notify_fn is not None:
-                    normal_cnt = sum(1 for p, _, _ in self._heap if p == 1)
-                    if normal_cnt > 0:
-                        self._pending_jump_notify.append(
-                            (normal_cnt, self._extract_hash(item), self._extract_title(item))
-                        )
             absorbed += 1
-        # 锁外发通知（通知内部自带去重与异常兜底）
-        for ahead, key, title in self._pending_jump_notify:
-            self._notify_jump(ahead, key, title)
-        self._pending_jump_notify = []
         if absorbed:
             self._log("info", f"已吸收原队列 {absorbed} 个存量任务")
         return absorbed
@@ -239,7 +244,7 @@ class OguraTransferPriority(_PluginBase):
     plugin_name = "订阅优先整理"
     plugin_desc = "订阅下载的媒体优先整理：订阅任务插队到整理队列队首，手动及其他任务保持原有顺序，适合 HDD 等慢速存储环境。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/SpeedLimiter.jpg"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguratransferpriority."
@@ -317,10 +322,16 @@ class OguraTransferPriority(_PluginBase):
             raise RuntimeError("TransferChain 没有 _queue 属性（版本不兼容）")
 
         if isinstance(old_queue, SubscribePriorityQueue):
-            # 已改造过（重复保存配置）：只更新回调引用
+            # 已改造过（重复保存配置 / 重新启用 / 其他分身改造过）：
+            # 更新回调引用、解除降级，并转移所有权给当前实例
             old_queue._priority_fn = self._detect_subscribe
             old_queue._logger = logger
             old_queue._jump_notify_fn = self._queue_jump_notify
+            with old_queue.mutex:
+                old_queue._disabled = False
+                old_queue._owner_ref = weakref.ref(self)
+            with _registry_lock:
+                _active_plugin_refs.add(self)
             self._pqueue = old_queue
             self._patched = True
             logger.info("【订阅优先整理】队列已是优先级队列，跳过重复改造")
@@ -341,6 +352,10 @@ class OguraTransferPriority(_PluginBase):
         )
         # 先替换引用：此后新任务一律写入优先队列
         chain._queue = pqueue
+        # 认领队列所有权 + 注册生效实例（分身协调）
+        pqueue._owner_ref = weakref.ref(self)
+        with _registry_lock:
+            _active_plugin_refs.add(self)
         # 再吸收存量：旧队列中等待的任务全部迁入（订阅置顶，同级保序）
         absorbed = pqueue.absorb(old_queue)
         self._pqueue = pqueue
@@ -355,26 +370,29 @@ class OguraTransferPriority(_PluginBase):
 
     def _restore_queue(self):
         """
-        把队列还原为原生 queue.Queue（按当前优先级顺序回填，不丢任务）。
+        停用插件：把优先队列切到降级模式（纯 FIFO），不交换对象引用。
+        分身协调：只有「队列所有者」才有权降级——其他分身停用不影响队列；
+        所有权在 _patch_queue 时转移给最后启用的实例。
         """
-        if not self._patched or self._chain is None or self._pqueue is None:
-            self._patched = False
-            return
-        try:
-            native = _native_queue.Queue()
-            # 排空优先队列（保持弹出顺序 = 最终执行顺序），回填原生队列
-            while True:
-                try:
-                    native.put(self._pqueue.get_nowait())
-                except Exception:
-                    break
-            self._chain._queue = native
-            self._pqueue = None
-            logger.info("【订阅优先整理】队列已还原为原生 FIFO")
-        except Exception as e:
-            logger.warning(f"【订阅优先整理】还原队列失败（不影响整理主流程）：{e}")
-        finally:
-            self._patched = False
+        with _registry_lock:
+            _active_plugin_refs.discard(self)
+        if self._pqueue is not None:
+            try:
+                with self._pqueue.mutex:
+                    owner_ref = self._pqueue._owner_ref
+                    owner = owner_ref() if owner_ref else None
+                    # 仅当自己是所有者（或所有者已消失）时才降级
+                    if owner is None or owner is self:
+                        self._pqueue._disabled = True
+                        self._pqueue._owner_ref = None
+                        logger.info("【订阅优先整理】队列已切换为降级模式（纯FIFO），后续任务按原顺序整理")
+                    else:
+                        logger.info("【订阅优先整理】另一分身仍在生效，队列保持优先级模式")
+            except Exception as e:
+                logger.warning(f"【订阅优先整理】切换降级模式失败：{e}")
+        self._patched = False
+        self._pqueue = None
+        self._chain = None
 
     # ------------------------------------------------------------------ 判定
     def _detect_subscribe(self, item) -> bool:
