@@ -244,7 +244,7 @@ class OguraTransferPriority(_PluginBase):
     plugin_name = "小仓酱的订阅优先整理"
     plugin_desc = "订阅下载的媒体优先整理：订阅任务插队到整理队列队首，手动及其他任务保持原有顺序，适合 HDD 等慢速存储环境。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/SpeedLimiter.jpg"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguratransferpriority."
@@ -293,6 +293,10 @@ class OguraTransferPriority(_PluginBase):
                         f"队列改造遇到异常，已自动停用以保护正常整理流程。\n{e}",
                     )
                 return
+            if not self._patched:
+                # 放弃改造（如完全未知的队列类型）：不算生效，别误报
+                logger.warning("【订阅优先整理】队列未改造，插件保持观察模式（不影响整理）")
+                return
             logger.info("【订阅优先整理】插件已生效")
             if self._notify:
                 self._post(
@@ -321,29 +325,73 @@ class OguraTransferPriority(_PluginBase):
         if old_queue is None:
             raise RuntimeError("TransferChain 没有 _queue 属性（版本不兼容）")
 
+        # ① 同代优先队列（重复保存配置 / 重新启用 / 分身改造过）：直接接管
         if isinstance(old_queue, SubscribePriorityQueue):
-            # 已改造过（重复保存配置 / 重新启用 / 其他分身改造过）：
-            # 更新回调引用、解除降级，并转移所有权给当前实例
-            old_queue._priority_fn = self._detect_subscribe
-            old_queue._logger = logger
-            old_queue._jump_notify_fn = self._queue_jump_notify
-            with old_queue.mutex:
-                old_queue._disabled = False
-                old_queue._owner_ref = weakref.ref(self)
-            with _registry_lock:
-                _active_plugin_refs.add(self)
-            self._pqueue = old_queue
-            self._patched = True
-            logger.info("【订阅优先整理】队列已是优先级队列，跳过重复改造")
+            self._adopt_queue(old_queue, "队列已是优先级队列，跳过重复改造")
             return
 
-        if not isinstance(old_queue, _native_queue.Queue):
-            logger.warning(
-                f"【订阅优先整理】未知队列类型 {type(old_queue).__name__}，放弃改造"
-            )
-            self._patched = False
+        # ② 跨代优先队列：插件更新会重载模块，旧实例的类身份与新代码不匹配
+        #    （isinstance 必然 False）。按结构签名识别旧版队列并直接接管——
+        #    不换对象、不动存量，解除降级即恢复插队，无需重启 MP
+        if self._looks_like_priority_queue(old_queue):
+            logger.info("【订阅优先整理】检测到插件更新前的旧版优先队列，接管中...")
+            try:
+                self._adopt_queue(old_queue, "已接管旧版优先级队列（插件更新场景）")
+                return
+            except Exception as e:
+                logger.warning(f"【订阅优先整理】接管旧队列失败：{e}，改为重建迁移")
+
+        # ③ 可排空队列（原生 queue.Queue / 更早版本优先队列）：全新改造+吸收存量
+        if isinstance(old_queue, _native_queue.Queue) or callable(
+                getattr(old_queue, "get_nowait", None)):
+            self._install_fresh_queue(chain, old_queue)
             return
 
+        # ④ 彻底未知的队列类型：放弃（不动现有队列，不影响整理）
+        logger.warning(
+            f"【订阅优先整理】未知队列类型 {type(old_queue).__name__}，放弃改造"
+        )
+        self._patched = False
+
+    @staticmethod
+    def _looks_like_priority_queue(queue) -> bool:
+        """
+        结构签名识别跨代旧版优先队列（插件更新后模块重载导致类身份失配）。
+        """
+        return (
+                type(queue).__name__ == "SubscribePriorityQueue"
+                and hasattr(queue, "_heap")
+                and hasattr(queue, "_disabled")
+                and callable(getattr(queue, "get_nowait", None))
+                and callable(getattr(queue, "absorb", None))
+                and callable(getattr(queue, "task_done", None))
+        )
+
+    def _adopt_queue(self, queue, note: str = ""):
+        """
+        接管现有优先队列（同代或跨代）：刷新回调、解除降级、转移所有权。
+        不换对象引用、不动队列存量，正在整理/排队的任务零影响。
+        """
+        queue._priority_fn = self._detect_subscribe
+        queue._logger = logger
+        queue._jump_notify_fn = self._queue_jump_notify
+        with queue.mutex:
+            was_disabled = bool(getattr(queue, "_disabled", False))
+            queue._disabled = False
+            queue._owner_ref = weakref.ref(self)
+        with _registry_lock:
+            _active_plugin_refs.add(self)
+        self._pqueue = queue
+        self._patched = True
+        msg = note or "队列已是优先级队列，跳过重复改造"
+        if was_disabled:
+            msg += "（已解除降级模式，插队恢复）"
+        logger.info(f"【订阅优先整理】{msg}")
+
+    def _install_fresh_queue(self, chain, old_queue) -> None:
+        """
+        全新安装优先队列并吸收旧队列存量（引用先换、数据后迁，零丢失）。
+        """
         pqueue = SubscribePriorityQueue(
             priority_fn=self._detect_subscribe,
             logger_=logger,
