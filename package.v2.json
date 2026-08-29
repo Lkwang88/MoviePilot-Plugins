@@ -156,5 +156,20 @@
    "v0.1.7": "新增调试日志开关：开启后扫描日志显示各站点种子数、新增签名/超窗口/非影视/命中/被跳过的种子详情（实用过程发现 120 分钟发布窗口太小，需要看出被卡再哪一步）",
    "v0.1.8": "修复空识别信息触发 MP 自定义识别词刷屏和 media_exists 的 NoneType.value 报错；查库失败改为保守跳过，避免误报；DEBUG 改为短心跳+汇总诊断；混合分类在总上限内合并为一条通知；修复 37.5GB~37.5GB 假范围。"
   }
+ },
+ "SubscribePlus": {
+  "name": "小仓酱的订阅补全助手",
+  "description": "电视剧订阅缺集诊断与补全助手：优先复用 MoviePilot 原生订阅搜索，支持手动扫描、定时扫描、PT 资源分析、Telegram 交互和识别词修正。",
+  "labels": "订阅,补全,工具",
+  "version": "1.0.0",
+  "icon": "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/subscribeplus.png",
+  "author": "Lkwang88",
+  "level": 1,
+  "v2": true,
+  "v3": false,
+  "release": true,
+  "history": {
+   "v1.0.0": "小仓酱系列首发：修复定时扫描注册参数错位（func_kwargs）；修复配置页保存 Cron/启用状态后定时任务不即时刷新；补充 V2 调度回归测试；保留插件 ID SubscribePlus 兼容已有安装。"
+  }
  }
 }
