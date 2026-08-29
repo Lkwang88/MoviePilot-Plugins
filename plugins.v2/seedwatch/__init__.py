@@ -14,6 +14,7 @@
 设计原则：轻量、低负担、补漏。允许漏报，不允许打扰。
 兼容：MoviePilot V2（app/chain/torrents.py 的 TorrentsChain、app/schemas/context.py 的 Context/TorrentInfo/MediaInfo）
 """
+import copy
 import re
 import threading
 import uuid
@@ -26,7 +27,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.1.7"
+PLUGIN_VERSION = "0.1.8"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
@@ -517,24 +518,27 @@ class SeedWatch(_PluginBase):
             logger.warning(f"【种子监控】读取数据 {key} 失败：{e}")
             return default
 
-    def _save_data(self, key: str, value: Any) -> None:
+    def _save_data(self, key: str, value: Any) -> bool:
+        """保存插件数据；成功返回 True，失败返回 False。"""
         try:
             self.save_data(key, value)
+            return True
         except Exception as e:
             logger.warning(f"【种子监控】保存数据 {key} 失败：{e}")
+            return False
 
     def _clear_seen(self):
-        """清空已见记录、通知历史与待处理队列（一次性开关触发）"""
+        """清空已见记录、通知历史，并清理旧版遗留队列数据。"""
         try:
             self.save_data(self._SEEN_KEY, [])
             self.save_data(self._NOTIFY_LOG_KEY, [])
             self.save_data(self._QUEUE_KEY, [])
-            logger.info("【种子监控】已清空已见记录/通知历史/待处理队列")
+            logger.info("【种子监控】已清空已见记录/通知历史")
             try:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="🧹 种子监控已清空记录",
-                    text="已见种子标记、通知历史、待处理队列已全部清空。\n下次扫描将把所有缓存种子视为新种子重新对比。",
+                    text="已见种子标记和通知历史已清空。\n下次扫描将把所有缓存种子视为新种子重新对比。",
                 )
             except Exception:
                 pass
@@ -555,8 +559,9 @@ class SeedWatch(_PluginBase):
         report = self._new_run_report()
         try:
             self._do_scan(report)
-            report["success"] = True
+            report["success"] = not bool(report.get("error"))
         except Exception as e:
+            report["success"] = False
             report["error"] = str(e)
             logger.error(f"【种子监控】扫描异常：{e}")
         finally:
@@ -576,11 +581,13 @@ class SeedWatch(_PluginBase):
             return
         if not torrents_map:
             report["result"] = "empty_cache"
+            if self._debug:
+                logger.info("【种子监控-DEBUG】扫描完成：种子缓存为空（扫描任务正常运行）")
             return
 
         # 站点过滤
         allow_domains = {d.strip() for d in self._site_filter.split(",") if d.strip()}
-        all_contexts: List[Any] = []
+        all_contexts: List[Tuple[str, Any]] = []
         site_stats: Dict[str, Dict[str, int]] = {}
         for domain, contexts in torrents_map.items():
             if allow_domains and domain not in allow_domains:
@@ -592,54 +599,73 @@ class SeedWatch(_PluginBase):
             })
             if not contexts:
                 continue
-            all_contexts.extend(contexts)
+            all_contexts.extend((domain, context) for context in contexts)
         report["source_count"] = len(all_contexts)
         if not all_contexts:
             report["result"] = "no_candidates"
+            if self._debug:
+                logger.info(
+                    "【种子监控-DEBUG】扫描完成：缓存有数据，但站点白名单筛选后为 0"
+                )
             return
 
-        # 2. 已见签名（有序列表保存插入顺序，集合用于 O(1) 查重）
-        seen_list: List[str] = self._get_data(self._SEEN_KEY, []) or []
+        # 2. 已见签名：读取失败必须中止，不能把失败误当空列表导致全量重复通知。
+        try:
+            seen_value = self.get_data(self._SEEN_KEY)
+        except Exception as e:
+            report["error"] = f"读取已见记录失败；为避免重复通知，本轮停止：{e}"
+            report["result"] = "seen_read_failed"
+            logger.warning(f"【种子监控】读取已见记录失败，本轮停止以避免重复通知：{e}")
+            return
+        seen_list: List[str] = seen_value or []
+        if not isinstance(seen_list, list):
+            report["error"] = "已见记录格式异常；为避免重复通知，本轮停止"
+            report["result"] = "seen_data_invalid"
+            logger.warning("【种子监控】已见记录格式异常，本轮停止以避免重复通知")
+            return
         seen_set: Set[str] = set(seen_list)
         seen_added = 0
         # 3. 命中收集
         hits: List[dict] = []
+        # 跨辅助函数累计诊断数据，最终统一汇总，禁止逐候选刷屏。
+        self._scan_diag = {
+            "empty_media": 0,
+            "empty_title": 0,
+            "type_repaired": 0,
+            "type_conflict": 0,
+            "lookup_error": 0,
+            "download_error": 0,
+        }
 
-        for context in all_contexts:
+        debug_skips: List[str] = []
+        for domain, context in all_contexts:
             torrent = getattr(context, "torrent_info", None)
             if not torrent or not torrent.title:
                 continue
             signature = self._signature(torrent)
-            domain_hint = torrent.site_name or ""
+            site_name = torrent.site_name or domain
             if signature in seen_set:
-                if domain_hint in site_stats:
-                    site_stats[domain_hint]["seen"] += 1
+                site_stats[domain]["seen"] += 1
                 continue
             # 首次看到 → 加入已见
             seen_set.add(signature)
             seen_list.append(signature)
             seen_added += 1
-            if domain_hint in site_stats:
-                site_stats[domain_hint]["new_sign"] += 1
+            site_stats[domain]["new_sign"] += 1
             # 发布窗口判定（首次看到时）
             pub_minutes = _pub_minutes_of(torrent.pubdate)
             if pub_minutes is None:
-                if domain_hint in site_stats:
-                    site_stats[domain_hint]["no_date"] += 1
+                site_stats[domain]["no_date"] += 1
                 continue
             if pub_minutes > self._pub_window:
-                if domain_hint in site_stats:
-                    site_stats[domain_hint]["over_window"] += 1
+                site_stats[domain]["over_window"] += 1
                 continue
             report["window_passed"] += 1
             # 分类
             category = self._category_of(torrent, context)
             if category not in (MediaType.MOVIE.value, MediaType.TV.value):
-                if domain_hint in site_stats:
-                    site_stats[domain_hint]["wrong_cat"] += 1
+                site_stats[domain]["wrong_cat"] += 1
                 continue
-            # 站点名（供文案）
-            site_name = torrent.site_name or ""
             # 命中判定
             hit = self._evaluate(context, torrent, category)
             if hit:
@@ -647,32 +673,52 @@ class SeedWatch(_PluginBase):
                 hit["pub_minutes"] = int(pub_minutes)
                 hits.append(hit)
                 report["hits"] += 1
-                if domain_hint in site_stats:
-                    site_stats[domain_hint]["hit"] += 1
-            else:
-                # 被过滤的种子也在 DEBUG 里列出（只列前3条省空间）
-                if self._debug and len(hits) < 3:
-                    logger.info(
-                        f"【种子监控-DEBUG】跳过: 《{self._cn_title(context)}》"
-                        f"|{domain_hint}|发布{pub_minutes}分"
-                    )
+                site_stats[domain]["hit"] += 1
+            elif self._debug and len(debug_skips) < 3:
+                # 仅留前 3 个样本；逐轮可控，避免 DEBUG 反而刷屏。
+                debug_skips.append(
+                    f"《{self._cn_title(context)}》|{site_name}|发布{int(pub_minutes)}分"
+                )
 
-        # 扫描汇总 DEBUG 日志
+        # DEBUG 默认只打一条短心跳；有新签名时才补变化站点/过滤样本。
         if self._debug:
-            total_stats = "、".join(
-                f"{d}/{s['count']} (新{s['new_sign']}|已s['seen']|无日期s['no_date']|超窗口s['over_window']|非影视s['wrong_cat']|命中s['hit'])"
-                for d, s in site_stats.items() if s["count"]
-            )
+            totals = {
+                key: sum(stats[key] for stats in site_stats.values())
+                for key in ("count", "new_sign", "seen", "no_date", "over_window", "wrong_cat", "hit")
+            }
             logger.info(
-                f"【种子监控-DEBUG】扫描完成：{len(torrents_map)}站点 "
-                f"{total_stats}"
+                f"【种子监控-DEBUG】扫描完成：缓存{totals['count']} | 新{totals['new_sign']}"
+                f" | 已见{totals['seen']} | 无日期{totals['no_date']}"
+                f" | 超窗口{totals['over_window']} | 非影视{totals['wrong_cat']}"
+                f" | 命中{totals['hit']}"
             )
+            changed_sites = [
+                f"{domain}+{stats['new_sign']}"
+                f"(超窗{stats['over_window']}/非影视{stats['wrong_cat']}/命中{stats['hit']})"
+                for domain, stats in site_stats.items()
+                if stats["new_sign"]
+            ]
+            if changed_sites:
+                logger.info(f"【种子监控-DEBUG】变化站点：{'、'.join(changed_sites)}")
+            if debug_skips:
+                logger.info(f"【种子监控-DEBUG】过滤样本（最多3条）：{'；'.join(debug_skips)}")
+            diag = getattr(self, "_scan_diag", {})
+            if any(diag.values()):
+                logger.info(
+                    f"【种子监控-DEBUG】识别诊断：无媒体{diag['empty_media']}"
+                    f" | 空标题{diag['empty_title']} | 类型修复{diag['type_repaired']}"
+                    f" | 类型冲突{diag['type_conflict']} | 查库失败{diag['lookup_error']}"
+                    f" | 历史失败{diag['download_error']}"
+                )
 
         # 保存已见（有界；保留插入顺序，超限时丢最旧的）
         if seen_added:
             if len(seen_list) > self._MAX_SEEN:
                 seen_list = seen_list[-self._MAX_SEEN:]
-            self._save_data(self._SEEN_KEY, seen_list)
+            if not self._save_data(self._SEEN_KEY, seen_list):
+                report["error"] = "保存已见记录失败；为避免下轮重复通知，本轮不发送"
+                report["result"] = "seen_save_failed"
+                return
         report["seen_added"] = seen_added
 
         # 4. 通知（聚合）
@@ -688,14 +734,16 @@ class SeedWatch(_PluginBase):
 
     @staticmethod
     def _category_of(torrent, context) -> Optional[str]:
-        """种子分类：优先 torrent.category，其次 context.media_info.type（v2 都是中文字符串）"""
+        """种子分类：优先 torrent.category，其次 context.media_info.type；兼容字符串与枚举。"""
         cat = getattr(torrent, "category", None)
-        if cat in (MediaType.MOVIE.value, MediaType.TV.value):
-            return cat
+        cat_value = getattr(cat, "value", cat)
+        if cat_value in (MediaType.MOVIE.value, MediaType.TV.value):
+            return cat_value
         media = getattr(context, "media_info", None)
         mtype = getattr(media, "type", None)
-        if mtype in (MediaType.MOVIE.value, MediaType.TV.value):
-            return mtype
+        mtype_value = getattr(mtype, "value", mtype)
+        if mtype_value in (MediaType.MOVIE.value, MediaType.TV.value):
+            return mtype_value
         return None
 
     # ------------------------------------------------------------------ 判定
@@ -707,6 +755,9 @@ class SeedWatch(_PluginBase):
         media_ids = self._media_ids(context)
         # 媒体库查重
         exists, exists_info = self._library_exists(context, category, media_ids)
+        # 查库条件不足或 MP 查询异常时不能推断“库里没有”；保守跳过，避免误报。
+        if exists is None:
+            return None
         if exists:
             # 库内已有 → 只有电影洗版才可能命中
             if category != MediaType.MOVIE.value or not self._notify_upgrade:
@@ -758,7 +809,10 @@ class SeedWatch(_PluginBase):
             reason = "新电影（未订阅或漏订）"
         # 下载历史排除（任一媒体 ID 存在即查）
         if self._exclude_downloaded and any(media_ids.values()):
-            if self._downloaded(media_ids):
+            downloaded = self._downloaded(media_ids)
+            if downloaded is None:
+                return None
+            if downloaded:
                 return None
         return {
             "kind": kind,
@@ -826,8 +880,16 @@ class SeedWatch(_PluginBase):
             "anilist_id": getattr(media, "anilist_id", None),
         }
 
-    def _library_exists(self, context, category, media_ids: dict) -> Tuple[bool, dict]:
-        """媒体库查重。返回 (是否存在, 存在信息dict)
+    def _diag_inc(self, key: str) -> int:
+        """增加本轮诊断计数；辅助函数被独立测试调用时也安全。"""
+        diag = getattr(self, "_scan_diag", None)
+        if not isinstance(diag, dict):
+            return 0
+        diag[key] = diag.get(key, 0) + 1
+        return diag[key]
+
+    def _library_exists(self, context, category, media_ids: dict) -> Tuple[Optional[bool], dict]:
+        """媒体库查重。返回 (True=存在 / False=不存在 / None=无法判断, 信息dict)
 
         存在信息里尽量带上库内版本的画质/分辨率（从 iteminfo 的 path 提取），
         供电影洗版对比使用。拿不到就按未知处理（保守判定：不通知洗版）。
@@ -835,10 +897,40 @@ class SeedWatch(_PluginBase):
         try:
             media = getattr(context, "media_info", None)
             if not media:
-                return False, {}
+                self._diag_inc("empty_media")
+                return None, {}
+            # 标题为空会触发 MP 自定义识别词对 None 做正则替换，无法安全查库。
+            if not getattr(media, "title", None):
+                self._diag_inc("empty_title")
+                return None, {}
+            # 缓存里偶有 media.type=None；MP media_exists 内部会访问 type.value。
+            # 对副本按已确认的种子分类补齐枚举，绝不修改 MP 缓存原对象。
+            query_media = copy.copy(media)
+            raw_type = getattr(query_media, "type", None)
+            raw_value = getattr(raw_type, "value", raw_type)
+            # 媒体识别与种子分类冲突时无法安全判定，宁可漏报也不误查/误报。
+            if (
+                raw_value in (MediaType.MOVIE.value, MediaType.TV.value)
+                and raw_value != category
+            ):
+                self._diag_inc("type_conflict")
+                return None, {}
+            # 类型缺失/旧格式字符串时，用已经确认的种子分类规范成 MP 所需枚举。
+            expected_type = (
+                MediaType.MOVIE if category == MediaType.MOVIE.value
+                else MediaType.TV if category == MediaType.TV.value
+                else None
+            )
+            if not expected_type:
+                return None, {}
+            # MP v2 的 media_exists 要求 MediaType 枚举（内部直接访问 type.value）。
+            # 在副本上规范化，既兼容 None/中文字符串，也不篡改缓存原对象。
+            if raw_type != expected_type:
+                query_media.type = expected_type
+                self._diag_inc("type_repaired")
             # 用 media_exists 判断库里是否有该作品（返回 ExistMediaInfo 或 None）
             # v2：_PluginBase 不继承 ChainBase，媒体库操作走 self.chain
-            exist_info = self.chain.media_exists(mediainfo=media)
+            exist_info = self.chain.media_exists(mediainfo=query_media)
             if not exist_info:
                 return False, {}
             # 库里有 → 取画质信息（iteminfo 的 path 含分辨率/编码等）
@@ -866,11 +958,14 @@ class SeedWatch(_PluginBase):
                 info["desc"] = f"已有{len(info['seasons'])}季"
             return True, info
         except Exception as e:
-            logger.warning(f"【种子监控】媒体库查重失败：{e}")
-            return False, {}
+            count = self._diag_inc("lookup_error")
+            # 同轮只报第 1 次，后续由 DEBUG 汇总计数，避免同一异常刷屏。
+            if count <= 1:
+                logger.warning(f"【种子监控】媒体库查重失败，本轮同类错误将合并：{e}")
+            return None, {}
 
-    def _downloaded(self, media_ids: dict) -> bool:
-        """下载历史是否有记录（v2 DownloadHistoryOper.get_by_mediaid）"""
+    def _downloaded(self, media_ids: dict) -> Optional[bool]:
+        """下载历史三态：True=有记录，False=确认没有，None=查询失败。"""
         try:
             from app.db.downloadhistory_oper import DownloadHistoryOper
             records = DownloadHistoryOper().get_by_mediaid(
@@ -881,8 +976,10 @@ class SeedWatch(_PluginBase):
             )
             return bool(records)
         except Exception as e:
-            logger.warning(f"【种子监控】下载历史查询失败：{e}")
-            return False
+            count = self._diag_inc("download_error")
+            if count <= 1:
+                logger.warning(f"【种子监控】下载历史查询失败，本轮同类错误将合并：{e}")
+            return None
 
     # ------------------------------------------------------------------ 通知
     # 单条消息字符数保护线：超过则把该组再对半拆成多条消息
@@ -895,39 +992,87 @@ class SeedWatch(_PluginBase):
     )
 
     def _notify_hits(self, hits: List[dict], report: dict):
-        """聚合通知：同作品多种子合并为一行，按类别分组，超上限分多条消息发，一条不漏"""
+        """聚合通知：保留分类块；按单条总作品上限/字符保护线装箱，避免每类强拆一条。"""
         merged = self._merge_hits(hits)
         report["merged_count"] = len(merged)
-        # 按类别分组
+        title = f"🎬 种子监控：{len(merged)} 部作品 / {len(hits)} 个种子"
+        chunks = self._pack_notification_chunks(merged)
+        total = len(chunks)
+        sent_items: List[dict] = []
+        failed_messages = 0
+        for idx, items in enumerate(chunks, start=1):
+            message_title = title
+            if total > 1:
+                message_title += f"（{idx}/{total}）"
+            try:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title=message_title,
+                    text=self._format_mixed_groups(items),
+                )
+                sent_items.extend(items)
+            except Exception as e:
+                failed_messages += 1
+                logger.warning(f"【种子监控】通知发送失败：{e}")
+        if sent_items:
+            self._log_notify(sent_items)
+        report["messages"] = total - failed_messages
+        report["message_failures"] = failed_messages
+        report["notified"] = len(sent_items)
+        if not failed_messages:
+            report["result"] = "notified"
+        elif sent_items:
+            report["result"] = "notify_partial_failed"
+            report["error"] = f"{failed_messages}/{total} 条通知发送失败"
+        else:
+            report["result"] = "notify_failed"
+            report["error"] = f"全部 {total} 条通知发送失败"
+
+    def _pack_notification_chunks(self, merged: List[dict]) -> List[List[dict]]:
+        """按类别顺序装箱；每箱不超过配置条数，也尽量不超过字符保护线。"""
         groups: Dict[str, List[dict]] = {kind: [] for kind, _ in self._KIND_LABELS}
         for item in merged:
             groups.setdefault(item["kind"], []).append(item)
-        # 按条目上限分块
+        ordered = [
+            item
+            for kind, _ in self._KIND_LABELS
+            for item in (groups.get(kind) or [])
+        ]
+        # 兼容未来新增类别，避免静默漏通知。
+        known_kinds = {kind for kind, _ in self._KIND_LABELS}
+        ordered.extend(item for item in merged if item.get("kind") not in known_kinds)
+
         limit = max(1, min(50, self._aggregate_max))
-        chunks: List[Tuple[str, str, List[dict]]] = []
-        for kind, label in self._KIND_LABELS:
-            items = groups.get(kind) or []
-            for i in range(0, len(items), limit):
-                chunks.append((kind, label, items[i:i + limit]))
-        # 超长再拆
-        final_chunks: List[Tuple[str, str, List[dict]]] = []
-        for kind, label, items in chunks:
-            final_chunks.extend(self._split_by_chars(kind, label, items))
-        # 逐条发送（务求发完）
-        total = len(final_chunks)
-        for idx, (_, label, items) in enumerate(final_chunks, start=1):
-            title = f"🎬 种子监控：{len(merged)} 部作品 / {len(hits)} 个种子"
-            if total > 1:
-                title += f"（{idx}/{total}）"
-            body = self._format_group(label, items)
-            try:
-                self.post_message(mtype=NotificationType.Plugin, title=title, text=body)
-            except Exception as e:
-                logger.warning(f"【种子监控】通知发送失败：{e}")
-        self._log_notify(merged)
-        report["messages"] = total
-        report["notified"] = len(merged)
-        report["result"] = "notified"
+        chunks: List[List[dict]] = []
+        current: List[dict] = []
+        for item in ordered:
+            candidate = current + [item]
+            too_many = len(candidate) > limit
+            too_long = len(self._format_mixed_groups(candidate)) > self._MAX_MSG_CHARS
+            if current and (too_many or too_long):
+                chunks.append(current)
+                current = [item]
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _format_mixed_groups(self, items: List[dict]) -> str:
+        """把一箱作品渲染成多个分类块，同一条通知内保留清晰分区。"""
+        groups: Dict[str, List[dict]] = {kind: [] for kind, _ in self._KIND_LABELS}
+        for item in items:
+            groups.setdefault(item["kind"], []).append(item)
+        blocks = [
+            self._format_group(label, groups[kind])
+            for kind, label in self._KIND_LABELS
+            if groups.get(kind)
+        ]
+        known_kinds = {kind for kind, _ in self._KIND_LABELS}
+        for item in items:
+            if item.get("kind") not in known_kinds:
+                blocks.append(self._format_group(str(item.get("kind") or "其他"), [item]))
+        return "\n\n".join(blocks)
 
     @staticmethod
     def _media_key(hit: dict) -> str:
@@ -975,15 +1120,6 @@ class SeedWatch(_PluginBase):
             item["raw_titles"].append(hit.get("raw_title", ""))
         return [merged_map[k] for k in order_keys]
 
-    def _split_by_chars(self, kind: str, label: str, items: List[dict]):
-        """渲染后超长的分组对半拆分，直到不超长或只剩一条"""
-        text = self._format_group(label, items)
-        if len(text) <= self._MAX_MSG_CHARS or len(items) <= 1:
-            return [(kind, label, items)]
-        half = max(1, len(items) // 2)
-        return (self._split_by_chars(kind, label, items[:half])
-                + self._split_by_chars(kind, label, items[half:]))
-
     def _format_group(self, label: str, items: List[dict]) -> str:
         """渲染一个类别块"""
         lines = [f"{label}（{len(items)}）"]
@@ -994,15 +1130,15 @@ class SeedWatch(_PluginBase):
             sizes = item["sizes"]
             if not sizes:
                 size_desc = "?"
-            elif max(sizes) == min(sizes):
-                size_desc = self._fmt_size(sizes[0])
             else:
-                size_desc = f"{self._fmt_size(min(sizes))}~{self._fmt_size(max(sizes))}"
+                min_size = self._fmt_size(min(sizes))
+                max_size = self._fmt_size(max(sizes))
+                size_desc = min_size if min_size == max_size else f"{min_size}~{max_size}"
             pub = item.get("pub_min")
             if pub is None:
                 pub_desc = ""
             elif count > 1:
-                pub_desc = f" | 最早发布{pub}分钟前"
+                pub_desc = f" | 最近发布{pub}分钟前"
             else:
                 pub_desc = f" | 发布{pub}分钟前"
             lines.append(
@@ -1056,6 +1192,7 @@ class SeedWatch(_PluginBase):
             "hits": 0,
             "merged_count": 0,
             "messages": 0,
+            "message_failures": 0,
             "notified": 0,
         }
 
