@@ -16,19 +16,17 @@
 """
 import re
 import threading
-import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.chain.torrents import TorrentsChain
-from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import EventType, MediaType, NotificationType
+from app.schemas.types import MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.1.3"
+PLUGIN_VERSION = "0.1.4"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
@@ -491,8 +489,9 @@ class SeedWatch(_PluginBase):
             report["result"] = "no_candidates"
             return
 
-        # 2. 已见签名
-        seen: Set[str] = set(self._get_data(self._SEEN_KEY, []) or [])
+        # 2. 已见签名（有序列表保存插入顺序，集合用于 O(1) 查重）
+        seen_list: List[str] = self._get_data(self._SEEN_KEY, []) or []
+        seen_set: Set[str] = set(seen_list)
         seen_added = 0
         # 3. 命中收集
         hits: List[dict] = []
@@ -502,10 +501,11 @@ class SeedWatch(_PluginBase):
             if not torrent or not torrent.title:
                 continue
             signature = self._signature(torrent)
-            if signature in seen:
+            if signature in seen_set:
                 continue
             # 首次看到 → 加入已见
-            seen.add(signature)
+            seen_set.add(signature)
+            seen_list.append(signature)
             seen_added += 1
             # 发布窗口判定（首次看到时）
             pub_minutes = _pub_minutes_of(torrent.pubdate)
