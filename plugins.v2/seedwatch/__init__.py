@@ -28,7 +28,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import EventType, MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.3"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
