@@ -25,7 +25,7 @@ from app.chain.torrents import TorrentsChain
 from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import EventType, MediaType, NotificationType
+from app.schemas.types import EventType, MediaType, NotificationType
 
 # 版本
 PLUGIN_VERSION = "0.1.0"
