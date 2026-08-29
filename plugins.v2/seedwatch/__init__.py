@@ -26,7 +26,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.1.5"
+PLUGIN_VERSION = "0.1.6"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
@@ -55,6 +55,85 @@ def _quality_level(title: str, description: str = "") -> int:
     if has_hdr:
         return 1
     return 0
+
+
+# 分辨率等级：4K/UHD/2160p=3，1080p=2，720p=1，其他=0
+_RES_4K_RE = re.compile(r"(?i)\b(2160p|4k|uhd)\b")
+_RES_1080_RE = re.compile(r"(?i)\b1080p\b")
+_RES_720_RE = re.compile(r"(?i)\b720p\b")
+
+_QUALITY_TAGS = {0: "SDR", 1: "HDR", 2: "HDR10+", 3: "DV", 4: "DV+HDR"}
+
+
+def _resolution_level(text: str) -> int:
+    """从文本解析分辨率等级 4K=3 / 1080p=2 / 720p=1 / 未知=0"""
+    text = text or ""
+    if _RES_4K_RE.search(text):
+        return 3
+    if _RES_1080_RE.search(text):
+        return 2
+    if _RES_720_RE.search(text):
+        return 1
+    return 0
+
+
+def _res_label(level: int) -> str:
+    return {3: "4K", 2: "1080p", 1: "720p"}.get(level, "?")
+
+
+def _quality_label(spec: Tuple[int, int]) -> str:
+    """画质标签：(画质等级, 分辨率等级) → 'DV+HDR 4K'"""
+    q, r = spec
+    return f"{_QUALITY_TAGS.get(q, 'SDR')} {_res_label(r)}"
+
+
+# --------------------------------------------------------------------- 洗版维度
+# 白名单版本（三档，P8 > DV > HDR 在每档内排序）：
+#   L3: 4K REMUX → L2: 1080p REMUX → L1: 4K WEB-DL
+# 排除项（直接滚）：ISO 原盘、种子名带 DIY 的（自改原盘）
+_ISO_RE = re.compile(r"(?i)\biso\b")
+_DIY_RE = re.compile(r"(?i)\bdiy\b")
+
+# 版本档位：300=4K REMUX, 200=1080p REMUX, 100=4K WEB-DL, 0=不在白名单
+_TIER_REMUX = re.compile(r"(?i)remux")
+_TIER_WEBDL = re.compile(r"(?i)web[ -]?dl")
+
+
+def _version_tier(text: str) -> Tuple[int, str]:
+    """从文本（新种标题或库内路径）识别白名单档位"""
+    text = text or ""
+    res = _resolution_level(text)
+    if _TIER_REMUX.search(text):
+        if res == 3:
+            return 300, "4K REMUX"
+        if res == 2:
+            return 200, "1080p REMUX"
+        return 0, ""
+    if _TIER_WEBDL.search(text):
+        if res >= 3:    # 4K/UHD
+            return 100, "4K WEB-DL"
+        return 0, ""    # 1080p WEB-DL 不在白名单
+    return 0, ""
+
+
+def _upgrade_score(text: str) -> Tuple[int, str]:
+    """检查是否是洗版白名单版本（4K REMUX / 1080p REMUX / 4K WEB-DL，P8/DV/HDR）
+    返回 (分数, 版本标签)；不在白名单（0）或其他垃圾（-1）
+    大小写不敏感
+    """
+    text = text or ""
+    # 排除项：ISO / DIY
+    if _ISO_RE.search(text) or _DIY_RE.search(text):
+        return -1, ""
+    tier, tier_label = _version_tier(text)
+    if tier <= 0:
+        return 0, ""    # 不在白名单
+    q = _quality_level(text, "")
+    if q == 0:       # SDR 不在白名单
+        return 0, ""
+    score = tier + (4 if q == 4 else 3 if q == 3 else 1 if q in (1, 2) else 0)
+    label = f"{tier_label} {_QUALITY_TAGS.get(q, '?')}"
+    return score, label
 
 
 def _pub_minutes_of(pubdate: Optional[str]) -> Optional[int]:
@@ -571,8 +650,29 @@ class SeedWatch(_PluginBase):
             # 库内已有 → 只有电影洗版才可能命中
             if category != MediaType.MOVIE.value or not self._notify_upgrade:
                 return None
-            # 洗版对比（保守：新种带 DV/HDR/4K 就提醒）
-            if not _UPGRADE_SIGNAL_RE.search(f"{torrent.title} {torrent.description or ''}"):
+            # 新种必须在白名单内（4K REMUX / 1080p REMUX / 4K WEB-DL，P8/DV/HDR，ISO/DIY 不要）
+            new_score, new_label = _upgrade_score(f"{torrent.title} {torrent.description or ''}")
+            if new_score <= 0:
+                return None
+            # 库内版本打分对比（拿不到 / 打错 → 人工核对）
+            old_path = exists_info.get("path") or ""
+            if not old_path:
+                # 拿不到库内信息 → 人工核对
+                return {
+                    "kind": "manual",
+                    "title": title_cn,
+                    "raw_title": torrent.title,
+                    "size": torrent.size,
+                    "category": category,
+                    "reason": "库内有旧版但拿不到详情，请人工核对画质",
+                    "media_ids": media_ids,
+                }
+            old_score, old_label = _upgrade_score(old_path)
+            if old_score < 0:
+                # 库里是 DIY/ISO → 当无用，不通知
+                return None
+            # 新种分数严格更高 → 明确升级；同级或低 → 通知不需要
+            if new_score <= old_score:
                 return None
             return {
                 "kind": "upgrade",
@@ -581,7 +681,7 @@ class SeedWatch(_PluginBase):
                 "size": torrent.size,
                 "category": category,
                 "quality": _quality_level(torrent.title, torrent.description),
-                "reason": f"库内有旧版（{exists_info.get('desc', '')}），新种更好",
+                "reason": f"库内 {old_label} → 新种 {new_label}",
                 "media_ids": media_ids,
             }
         # 库内没有 → 新剧/新电影
@@ -666,7 +766,11 @@ class SeedWatch(_PluginBase):
         }
 
     def _library_exists(self, context, category, media_ids: dict) -> Tuple[bool, dict]:
-        """媒体库查重。返回 (是否存在, 存在信息dict)"""
+        """媒体库查重。返回 (是否存在, 存在信息dict)
+
+        存在信息里尽量带上库内版本的画质/分辨率（从 iteminfo 的 path 提取），
+        供电影洗版对比使用。拿不到就按未知处理（保守判定：不通知洗版）。
+        """
         try:
             media = getattr(context, "media_info", None)
             if not media:
@@ -676,15 +780,30 @@ class SeedWatch(_PluginBase):
             exist_info = self.chain.media_exists(mediainfo=media)
             if not exist_info:
                 return False, {}
-            # 库里有 → 构造存在信息
-            seasons = (exist_info.seasons or {}) if hasattr(exist_info, "seasons") else {}
-            desc = "已存在"
-            if category == MediaType.TV.value and seasons:
-                desc = f"已有{len(seasons)}季"
-            return True, {
-                "desc": desc,
-                "seasons": seasons,
+            # 库里有 → 取画质信息（iteminfo 的 path 含分辨率/编码等）
+            info: Dict[str, Any] = {
+                "desc": "已存在",
+                "seasons": (exist_info.seasons or {}) if hasattr(exist_info, "seasons") else {},
+                "quality": 0,
+                "resolution": 0,
+                "path": None,
             }
+            try:
+                server = getattr(exist_info, "server", None)
+                itemid = getattr(exist_info, "itemid", None)
+                if server and itemid:
+                    detail = self.chain.iteminfo(server=server, item_id=itemid)
+                    path = getattr(detail, "path", None) if detail else None
+                    if path:
+                        info["path"] = path
+                        info["quality"] = _quality_level(path, "")
+                        info["resolution"] = _resolution_level(path)
+            except Exception as e:
+                # 拿不到画质不影响存在判定，仅降级为未知
+                logger.debug(f"【种子监控】获取库内条目画质失败：{e}")
+            if category == MediaType.TV.value and info["seasons"]:
+                info["desc"] = f"已有{len(info['seasons'])}季"
+            return True, info
         except Exception as e:
             logger.warning(f"【种子监控】媒体库查重失败：{e}")
             return False, {}
@@ -711,6 +830,7 @@ class SeedWatch(_PluginBase):
         ("episode", "📺 新剧集"),
         ("movie", "🎞️ 新电影"),
         ("upgrade", "🔄 洗版候选"),
+        ("manual", "🤔 人工核对"),
     )
 
     def _notify_hits(self, hits: List[dict], report: dict):
