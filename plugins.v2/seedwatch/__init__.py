@@ -26,7 +26,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.1.4"
+PLUGIN_VERSION = "0.1.5"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
@@ -582,6 +582,7 @@ class SeedWatch(_PluginBase):
                 "category": category,
                 "quality": _quality_level(torrent.title, torrent.description),
                 "reason": f"库内有旧版（{exists_info.get('desc', '')}），新种更好",
+                "media_ids": media_ids,
             }
         # 库内没有 → 新剧/新电影
         if category == MediaType.TV.value:
@@ -606,10 +607,11 @@ class SeedWatch(_PluginBase):
             "category": category,
             "quality": _quality_level(torrent.title, torrent.description),
             "reason": reason,
+            "media_ids": media_ids,
         }
 
     def _cn_title(self, context) -> str:
-        """中文名：优先 media_info.title（中文），降级原标题"""
+        """中文名：优先 media_info.title（中文）→ names → 副标题提取 → 原标题"""
         media = getattr(context, "media_info", None)
         if media:
             title = getattr(media, "title", None)
@@ -619,7 +621,35 @@ class SeedWatch(_PluginBase):
             if names:
                 return names[0]
         torrent = getattr(context, "torrent_info", None)
+        # 识别失败兜底：从副标题提取中文名（如「开火开伙 開火開伙 ... 第01季 第01集 | 类型: 真人秀」）
+        desc = getattr(torrent, "description", None) or ""
+        cn = self._cn_from_description(desc)
+        if cn:
+            return cn
         return getattr(torrent, "title", "") or "未知"
+
+    # 副标题按空格切词后，取第一个含汉字的词作为候选中文名
+    _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+    _CN_TAIL_RE = re.compile(r"(?:第[\d零一二三四五六七八九十百]+[季部集]?)+$")
+
+    @classmethod
+    def _cn_from_description(cls, description: str) -> Optional[str]:
+        """从副标题提取中文名：按空格切词，在含汉字且不含冒号的词里取最长的，去掉季集尾巴。"""
+        if not description:
+            return None
+        candidates = []
+        for token in description.split():
+            if ":" in token or "：" in token:
+                continue
+            if not cls._CJK_RE.search(token):
+                continue
+            candidates.append(token)
+        # 取最长候选，逐条尝试去季集尾巴直到有效
+        for token in sorted(candidates, key=len, reverse=True):
+            name = cls._CN_TAIL_RE.sub("", token).strip()
+            if name and cls._CJK_RE.search(name):
+                return name
+        return None
 
     @staticmethod
     def _media_ids(context) -> Dict[str, Any]:
@@ -675,37 +705,129 @@ class SeedWatch(_PluginBase):
             return False
 
     # ------------------------------------------------------------------ 通知
+    # 单条消息字符数保护线：超过则把该组再对半拆成多条消息
+    _MAX_MSG_CHARS = 1800
+    _KIND_LABELS = (
+        ("episode", "📺 新剧集"),
+        ("movie", "🎞️ 新电影"),
+        ("upgrade", "🔄 洗版候选"),
+    )
+
     def _notify_hits(self, hits: List[dict], report: dict):
-        """聚合通知"""
+        """聚合通知：同作品多种子合并为一行，按类别分组，超上限分多条消息发，一条不漏"""
+        merged = self._merge_hits(hits)
+        report["merged_count"] = len(merged)
+        # 按类别分组
+        groups: Dict[str, List[dict]] = {kind: [] for kind, _ in self._KIND_LABELS}
+        for item in merged:
+            groups.setdefault(item["kind"], []).append(item)
+        # 按条目上限分块
         limit = max(1, min(50, self._aggregate_max))
-        batch = hits[:limit]
-        overflow = hits[limit:]
-        if overflow:
-            self._append_pending(overflow)
-            report["queued"] = len(overflow)
-        if batch:
-            self._post_batch(batch)
-            report["notified"] = len(batch)
-            self._log_notify(batch)
+        chunks: List[Tuple[str, str, List[dict]]] = []
+        for kind, label in self._KIND_LABELS:
+            items = groups.get(kind) or []
+            for i in range(0, len(items), limit):
+                chunks.append((kind, label, items[i:i + limit]))
+        # 超长再拆
+        final_chunks: List[Tuple[str, str, List[dict]]] = []
+        for kind, label, items in chunks:
+            final_chunks.extend(self._split_by_chars(kind, label, items))
+        # 逐条发送（务求发完）
+        total = len(final_chunks)
+        for idx, (_, label, items) in enumerate(final_chunks, start=1):
+            title = f"🎬 种子监控：{len(merged)} 部作品 / {len(hits)} 个种子"
+            if total > 1:
+                title += f"（{idx}/{total}）"
+            body = self._format_group(label, items)
+            try:
+                self.post_message(mtype=NotificationType.Plugin, title=title, text=body)
+            except Exception as e:
+                logger.warning(f"【种子监控】通知发送失败：{e}")
+        self._log_notify(merged)
+        report["messages"] = total
+        report["notified"] = len(merged)
         report["result"] = "notified"
 
-    def _post_batch(self, hits: List[dict]):
-        """发送聚合通知"""
-        lines = []
+    @staticmethod
+    def _media_key(hit: dict) -> str:
+        """媒体合并键：优先媒体 ID，无 ID 用标题"""
+        ids = hit.get("media_ids") or {}
+        for k in ("tmdb_id", "douban_id", "bangumi_id", "anilist_id", "imdb_id"):
+            v = ids.get(k)
+            if v:
+                return f"{k}:{v}"
+        return f"title:{hit.get('title') or hit.get('raw_title')}"
+
+    def _merge_hits(self, hits: List[dict]) -> List[dict]:
+        """同一作品的多个种子合并为一条（保留首次出现顺序）"""
+        merged_map: Dict[str, dict] = {}
+        order_keys: List[str] = []
         for hit in hits:
-            size = self._fmt_size(hit.get("size"))
+            key = f"{hit.get('kind')}|{self._media_key(hit)}"
+            item = merged_map.get(key)
+            if item is None:
+                item = {
+                    "kind": hit["kind"],
+                    "title": hit["title"],
+                    "category": hit.get("category"),
+                    "reason": hit.get("reason", ""),
+                    "torrent_count": 0,
+                    "sites": [],
+                    "sizes": [],
+                    "pub_min": None,
+                    "raw_titles": [],
+                }
+                merged_map[key] = item
+                order_keys.append(key)
+            item["torrent_count"] += 1
             site = hit.get("site_name") or ""
-            pub = hit.get("pub_minutes", 0)
+            if site and site not in item["sites"]:
+                item["sites"].append(site)
+            if hit.get("size"):
+                try:
+                    item["sizes"].append(float(hit["size"]))
+                except Exception:
+                    pass
+            pub = hit.get("pub_minutes")
+            if pub is not None and (item["pub_min"] is None or pub < item["pub_min"]):
+                item["pub_min"] = pub
+            item["raw_titles"].append(hit.get("raw_title", ""))
+        return [merged_map[k] for k in order_keys]
+
+    def _split_by_chars(self, kind: str, label: str, items: List[dict]):
+        """渲染后超长的分组对半拆分，直到不超长或只剩一条"""
+        text = self._format_group(label, items)
+        if len(text) <= self._MAX_MSG_CHARS or len(items) <= 1:
+            return [(kind, label, items)]
+        half = max(1, len(items) // 2)
+        return (self._split_by_chars(kind, label, items[:half])
+                + self._split_by_chars(kind, label, items[half:]))
+
+    def _format_group(self, label: str, items: List[dict]) -> str:
+        """渲染一个类别块"""
+        lines = [f"{label}（{len(items)}）"]
+        for item in items:
+            sites = "/".join(item["sites"]) or "未知站"
+            count = item["torrent_count"]
+            torrent_desc = f"{count}个种子" if count > 1 else "1个种子"
+            sizes = item["sizes"]
+            if not sizes:
+                size_desc = "?"
+            elif max(sizes) == min(sizes):
+                size_desc = self._fmt_size(sizes[0])
+            else:
+                size_desc = f"{self._fmt_size(min(sizes))}~{self._fmt_size(max(sizes))}"
+            pub = item.get("pub_min")
+            if pub is None:
+                pub_desc = ""
+            elif count > 1:
+                pub_desc = f" | 最早发布{pub}分钟前"
+            else:
+                pub_desc = f" | 发布{pub}分钟前"
             lines.append(
-                f"• 《{hit['title']}》 {size}\n"
-                f"  {site} | 发布{pub}分钟前 | {hit.get('reason', '')}"
+                f"• 《{item['title']}》{torrent_desc} · {sites} | {size_desc}{pub_desc}"
             )
-        title = f"🎬 种子监控：{len(hits)} 条新资源"
-        text = "\n".join(lines)
-        try:
-            self.post_message(mtype=NotificationType.Plugin, title=title, text=text)
-        except Exception as e:
-            logger.warning(f"【种子监控】通知发送失败：{e}")
+        return "\n".join(lines)
 
     @staticmethod
     def _fmt_size(size) -> str:
@@ -722,28 +844,21 @@ class SeedWatch(_PluginBase):
         except Exception:
             return "?"
 
-    def _log_notify(self, hits: List[dict]):
-        """记录通知历史"""
+    def _log_notify(self, merged: List[dict]):
+        """记录通知历史（合并后的条目）"""
         log = self._get_data(self._NOTIFY_LOG_KEY, []) or []
         now = self._now_iso()
-        for hit in hits:
+        for item in merged:
             log.append({
                 "time": now,
-                "title": hit.get("title"),
-                "raw_title": hit.get("raw_title"),
-                "kind": hit.get("kind"),
-                "site": hit.get("site_name", ""),
-                "reason": hit.get("reason", ""),
+                "title": item.get("title"),
+                "kind": item.get("kind"),
+                "site": "/".join(item.get("sites") or []),
+                "reason": item.get("reason", ""),
+                "torrent_count": item.get("torrent_count", 1),
             })
         log = log[-self._MAX_NOTIFY_LOG:]
         self._save_data(self._NOTIFY_LOG_KEY, log)
-
-    def _append_pending(self, hits: List[dict]):
-        """超出上限的进待处理队列"""
-        queue = self._get_data(self._QUEUE_KEY, []) or []
-        queue.extend(hits)
-        queue = queue[-self._MAX_PENDING:]
-        self._save_data(self._QUEUE_KEY, queue)
 
     # ------------------------------------------------------------------ 报告
     def _new_run_report(self) -> dict:
@@ -758,8 +873,9 @@ class SeedWatch(_PluginBase):
             "seen_added": 0,
             "window_passed": 0,
             "hits": 0,
+            "merged_count": 0,
+            "messages": 0,
             "notified": 0,
-            "queued": 0,
         }
 
     @staticmethod
