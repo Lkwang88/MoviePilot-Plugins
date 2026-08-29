@@ -528,11 +528,11 @@ class SeedWatch(_PluginBase):
                 hits.append(hit)
                 report["hits"] += 1
 
-        # 保存已见（有界）
+        # 保存已见（有界；保留插入顺序，超限时丢最旧的）
         if seen_added:
-            if len(seen) > self._MAX_SEEN:
-                seen = set(list(seen)[-self._MAX_SEEN:])
-            self._save_data(self._SEEN_KEY, list(seen))
+            if len(seen_list) > self._MAX_SEEN:
+                seen_list = seen_list[-self._MAX_SEEN:]
+            self._save_data(self._SEEN_KEY, seen_list)
         report["seen_added"] = seen_added
 
         # 4. 通知（聚合）
