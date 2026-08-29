@@ -22,9 +22,10 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.chain.torrents import TorrentsChain
+from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import MediaType, NotificationType
+from app.schemas import EventType, MediaType, NotificationType
 
 # 版本
 PLUGIN_VERSION = "0.1.0"
@@ -104,12 +105,14 @@ class SeedWatch(_PluginBase):
     _notify_upgrade = True
     _aggregate_max = 10
     _exclude_downloaded = True
+    _was_enabled = False
 
     _lock = None
     _running = False
 
     def init_plugin(self, config: dict = None):
         """生效配置"""
+        was_enabled = bool(getattr(self, "_was_enabled", False))
         self._lock = threading.Lock()
         self._enabled = False
         self._scan_interval = 20
@@ -120,6 +123,8 @@ class SeedWatch(_PluginBase):
         self._notify_upgrade = True
         self._aggregate_max = 10
         self._exclude_downloaded = True
+        run_once = False
+        clear_seen = False
         if config:
             self._enabled = bool(config.get("enabled"))
             self._scan_interval = int(config.get("scan_interval") or 20)
@@ -130,7 +135,28 @@ class SeedWatch(_PluginBase):
             self._notify_upgrade = bool(config.get("notify_upgrade", True))
             self._aggregate_max = int(config.get("aggregate_max") or 10)
             self._exclude_downloaded = bool(config.get("exclude_downloaded", True))
+            # 一次性开关（保存后执行并自动复位）
+            run_once = bool(config.get("run_once"))
+            clear_seen = bool(config.get("clear_seen"))
+        self._was_enabled = self._enabled
         logger.info(f"【种子监控】插件{'已启用' if self._enabled else '未启用'}")
+
+        # 处理一次性开关：清空已见记录
+        if clear_seen:
+            self._clear_seen()
+        # 需要扫描：勾了"立即扫描"或刚从停用变为启用（含 MP 重启后自动补扫）
+        should_scan = run_once or (self._enabled and not was_enabled)
+        if should_scan and self._enabled:
+            self.scan()
+        # 复位一次性开关
+        if run_once or clear_seen:
+            try:
+                cfg = dict(config or {})
+                cfg["run_once"] = False
+                cfg["clear_seen"] = False
+                self.update_config(cfg)
+            except Exception as e:
+                logger.warning(f"【种子监控】复位一次性开关失败：{e}")
 
     # ------------------------------------------------------------------ 状态
     def get_state(self) -> bool:
@@ -330,6 +356,37 @@ class SeedWatch(_PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "run_once",
+                                            "label": "立即扫描一次（保存后执行并自动复位）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "clear_seen",
+                                            "label": "清空已见记录（保存后执行并自动复位）",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
                 ],
             }
         ], {
@@ -342,6 +399,8 @@ class SeedWatch(_PluginBase):
             "notify_upgrade": True,
             "aggregate_max": 10,
             "exclude_downloaded": True,
+            "run_once": False,
+            "clear_seen": False,
         }
 
     def get_page(self) -> Optional[list]:
@@ -363,10 +422,29 @@ class SeedWatch(_PluginBase):
         except Exception as e:
             logger.warning(f"【种子监控】保存数据 {key} 失败：{e}")
 
+    def _clear_seen(self):
+        """清空已见记录、通知历史与待处理队列（一次性开关触发）"""
+        try:
+            self.save_data(self._SEEN_KEY, [])
+            self.save_data(self._NOTIFY_LOG_KEY, [])
+            self.save_data(self._QUEUE_KEY, [])
+            logger.info("【种子监控】已清空已见记录/通知历史/待处理队列")
+            try:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title="🧹 种子监控已清空记录",
+                    text="已见种子标记、通知历史、待处理队列已全部清空。\n下次扫描将把所有缓存种子视为新种子重新对比。",
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"【种子监控】清空记录失败：{e}")
+
     # ------------------------------------------------------------------ 扫描
     def scan(self):
-        """主扫描入口（定时服务调用）"""
+        """主扫描入口（定时服务/一次性开关调用）"""
         if not self._enabled:
+            logger.debug("【种子监控】插件未启用，跳过扫描")
             return
         with self._lock:
             if self._running:
