@@ -26,7 +26,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.1.6"
+PLUGIN_VERSION = "0.1.7"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
@@ -183,6 +183,7 @@ class SeedWatch(_PluginBase):
     _aggregate_max = 10
     _exclude_downloaded = True
     _was_enabled = False
+    _debug = False
 
     _lock = None
     _running = False
@@ -200,6 +201,7 @@ class SeedWatch(_PluginBase):
         self._notify_upgrade = True
         self._aggregate_max = 10
         self._exclude_downloaded = True
+        self._debug = False
         run_once = False
         clear_seen = False
         if config:
@@ -212,11 +214,13 @@ class SeedWatch(_PluginBase):
             self._notify_upgrade = bool(config.get("notify_upgrade", True))
             self._aggregate_max = int(config.get("aggregate_max") or 10)
             self._exclude_downloaded = bool(config.get("exclude_downloaded", True))
-            # 一次性开关（保存后执行并自动复位）
+            self._debug = bool(config.get("debug"))
             run_once = bool(config.get("run_once"))
             clear_seen = bool(config.get("clear_seen"))
         self._was_enabled = self._enabled
         logger.info(f"【种子监控】插件{'已启用' if self._enabled else '未启用'}")
+        if self._debug:
+            logger.info(f"【种子监控-DEBUG】进入调试模式（debug=True）")
 
         # 处理一次性开关：清空已见记录
         if clear_seen:
@@ -443,6 +447,25 @@ class SeedWatch(_PluginBase):
                                     {
                                         "component": "VSwitch",
                                         "props": {
+                                            "model": "debug",
+                                            "label": "调试日志（观察扫描过程）",
+                                            "hint": "开启后日志显示每轮扫描的站点数据、新增签名、过滤原因和命中数"
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
                                             "model": "run_once",
                                             "label": "立即扫描一次（保存后执行并自动复位）",
                                         },
@@ -476,6 +499,7 @@ class SeedWatch(_PluginBase):
             "notify_upgrade": True,
             "aggregate_max": 10,
             "exclude_downloaded": True,
+            "debug": False,
             "run_once": False,
             "clear_seen": False,
         }
@@ -557,9 +581,15 @@ class SeedWatch(_PluginBase):
         # 站点过滤
         allow_domains = {d.strip() for d in self._site_filter.split(",") if d.strip()}
         all_contexts: List[Any] = []
+        site_stats: Dict[str, Dict[str, int]] = {}
         for domain, contexts in torrents_map.items():
             if allow_domains and domain not in allow_domains:
                 continue
+            site_stats.setdefault(domain, {
+                "count": len(contexts or []),
+                "new_sign": 0, "seen": 0, "no_date": 0,
+                "over_window": 0, "wrong_cat": 0, "hit": 0,
+            })
             if not contexts:
                 continue
             all_contexts.extend(contexts)
@@ -580,22 +610,33 @@ class SeedWatch(_PluginBase):
             if not torrent or not torrent.title:
                 continue
             signature = self._signature(torrent)
+            domain_hint = torrent.site_name or ""
             if signature in seen_set:
+                if domain_hint in site_stats:
+                    site_stats[domain_hint]["seen"] += 1
                 continue
             # 首次看到 → 加入已见
             seen_set.add(signature)
             seen_list.append(signature)
             seen_added += 1
+            if domain_hint in site_stats:
+                site_stats[domain_hint]["new_sign"] += 1
             # 发布窗口判定（首次看到时）
             pub_minutes = _pub_minutes_of(torrent.pubdate)
             if pub_minutes is None:
+                if domain_hint in site_stats:
+                    site_stats[domain_hint]["no_date"] += 1
                 continue
             if pub_minutes > self._pub_window:
+                if domain_hint in site_stats:
+                    site_stats[domain_hint]["over_window"] += 1
                 continue
             report["window_passed"] += 1
             # 分类
             category = self._category_of(torrent, context)
             if category not in (MediaType.MOVIE.value, MediaType.TV.value):
+                if domain_hint in site_stats:
+                    site_stats[domain_hint]["wrong_cat"] += 1
                 continue
             # 站点名（供文案）
             site_name = torrent.site_name or ""
@@ -606,6 +647,26 @@ class SeedWatch(_PluginBase):
                 hit["pub_minutes"] = int(pub_minutes)
                 hits.append(hit)
                 report["hits"] += 1
+                if domain_hint in site_stats:
+                    site_stats[domain_hint]["hit"] += 1
+            else:
+                # 被过滤的种子也在 DEBUG 里列出（只列前3条省空间）
+                if self._debug and len(hits) < 3:
+                    logger.info(
+                        f"【种子监控-DEBUG】跳过: 《{self._cn_title(context)}》"
+                        f"|{domain_hint}|发布{pub_minutes}分"
+                    )
+
+        # 扫描汇总 DEBUG 日志
+        if self._debug:
+            total_stats = "、".join(
+                f"{d}/{s['count']} (新{s['new_sign']}|已s['seen']|无日期s['no_date']|超窗口s['over_window']|非影视s['wrong_cat']|命中s['hit'])"
+                for d, s in site_stats.items() if s["count"]
+            )
+            logger.info(
+                f"【种子监控-DEBUG】扫描完成：{len(torrents_map)}站点 "
+                f"{total_stats}"
+            )
 
         # 保存已见（有界；保留插入顺序，超限时丢最旧的）
         if seen_added:
