@@ -51,10 +51,6 @@ class ConfigSaveSchedulerTest(unittest.TestCase):
         self.assertEqual(plugin._plugin_config.cron, "*/6 * * * *")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class NotificationTest(unittest.TestCase):
     def make_plugin(self, **config):
         plugin = OguraSubscribePlus()
@@ -107,3 +103,40 @@ class NotificationTest(unittest.TestCase):
         self.assertIn("发现候选订阅：12 部", calls[0]["text"])
         self.assertIn("本轮处理：5 部", calls[0]["text"])
         self.assertIn("生成诊断：3 部", calls[0]["text"])
+
+
+class StartupNotificationTest(unittest.TestCase):
+    def test_enabled_init_posts_startup_notification_once(self):
+        plugin = OguraSubscribePlus()
+        calls = []
+        plugin._post_plugin_notification = lambda **kwargs: calls.append(kwargs)
+
+        plugin.init_plugin({"enabled": True, "notifications_enabled": True})
+        plugin.init_plugin({"enabled": True, "notifications_enabled": True, "cron": "0 12 * * *"})
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("已启动", calls[0]["title"])
+
+    def test_reenable_posts_startup_notification_again(self):
+        plugin = OguraSubscribePlus()
+        calls = []
+        plugin._post_plugin_notification = lambda **kwargs: calls.append(kwargs)
+
+        plugin.init_plugin({"enabled": True, "notifications_enabled": True})
+        plugin.init_plugin({"enabled": False, "notifications_enabled": True})
+        plugin.init_plugin({"enabled": True, "notifications_enabled": True})
+
+        self.assertEqual(len(calls), 2)
+
+    def test_disabled_notifications_suppress_startup_notification(self):
+        plugin = OguraSubscribePlus()
+        calls = []
+        plugin._post_plugin_notification = lambda **kwargs: calls.append(kwargs)
+
+        plugin.init_plugin({"enabled": True, "notifications_enabled": False})
+
+        self.assertEqual(calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

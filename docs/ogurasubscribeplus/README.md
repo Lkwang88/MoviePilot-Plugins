@@ -84,6 +84,12 @@ Telegram 保留 `/ci 媒体文件名` 作为自定义识别词交互入口。
 - `候选缓存天数`：候选下载信息的本地缓存有效期，默认 3 天；设为 0 关闭缓存。
 - `通知方式`：每部剧单独发送 Telegram 通知。
 
+## v1.0.4（通知可见性与启动通知修复）
+
+- 前端切换到版本化资源目录和新的 Config 内容哈希，避免浏览器继续命中 1.0.3 旧缓存。
+- 新增真正的插件启动通知：首次启用或停用后重新启用时发送，普通保存配置不重复发送。
+- 恢复 1.0.3 误替换掉的手动扫描 API，并修复测试通知按钮的编译缓存槽冲突。
+
 ## v1.0.3（通知修复增强）
 
 - 新增「开启通知」总开关、可选「扫描结束通知」和「测试通知」按钮。
@@ -273,9 +279,9 @@ Telegram 保留 `/ci 媒体文件名` 作为自定义识别词交互入口。
 
 - 插件 ID：`OguraSubscribePlus`
 - 插件目录：`ogurasubscribeplus`
-- 当前版本：`1.0.3`
-- Release tag：`OguraSubscribePlus_v1.0.3`
-- Release 资产：`ogurasubscribeplus_v1.0.3.zip`
+- 当前版本：`1.0.4`
+- Release tag：`OguraSubscribePlus_v1.0.4`
+- Release 资产：`ogurasubscribeplus_v1.0.4.zip`
 
 ## 致谢
 

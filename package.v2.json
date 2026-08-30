@@ -161,7 +161,7 @@
   "name": "小仓酱的订阅补全助手",
   "description": "电视剧订阅缺集诊断与补全助手：优先复用 MoviePilot 原生订阅搜索，支持手动扫描、定时扫描、PT 资源分析、Telegram 交互和识别词修正。",
   "labels": "订阅,补全,工具",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "icon": "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/ogurasubscribeplus.png",
   "author": "Lkwang88",
   "level": 1,
@@ -169,6 +169,7 @@
   "v3": false,
   "release": true,
   "history": {
+   "v1.0.4": "修复 1.0.3 前端缓存导致新按钮不可见，并补真正的插件启动通知；恢复误删的手动扫描 API；前端切换版本化资源目录和新 Config 哈希，避免复用旧缓存。",
    "v1.0.3": "通知修复：新增开启通知总开关、扫描结束通知和测试通知；主动通知明确走 Telegram + 插件通道；关闭通知不影响扫描、下载和 Telegram 交互回执。",
    "v1.0.2": "通知增强：新增开启通知、扫描结束通知和测试通知；主动通知明确走 Telegram + 插件通道；不影响扫描、下载和 Telegram 交互回执。",
    "v1.0.1": "独立插件 ID 发布：使用 OguraSubscribePlus，隔离配置、数据目录、API、Telegram 回调和调度服务，避免与原作者版本竞争。",

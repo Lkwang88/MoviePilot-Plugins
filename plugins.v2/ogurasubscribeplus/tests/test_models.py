@@ -12,7 +12,7 @@ class PluginConfigTest(unittest.TestCase):
 
         self.assertEqual(plugin.plugin_name, "小仓酱的订阅补全助手")
         self.assertEqual(plugin.plugin_config_prefix, "ogurasubscribeplus_")
-        self.assertEqual(plugin.get_render_mode(), ("vue", "dist/assets"))
+        self.assertEqual(plugin.get_render_mode(), ("vue", "dist/assets-v104"))
 
     def test_config_defaults_select_all_categories_and_mp_sites(self):
         config = PluginConfig.from_dict({})
@@ -44,6 +44,9 @@ class PluginConfigTest(unittest.TestCase):
     def test_post_api_endpoints_do_not_require_var_kwargs(self):
         plugin = OguraSubscribePlus()
         post_apis = [api for api in plugin.get_api() if "POST" in api.get("methods", [])]
+
+        self.assertIn("/scan", {api["path"] for api in plugin.get_api()})
+        self.assertIn("/test_notify", {api["path"] for api in plugin.get_api()})
 
         self.assertTrue(post_apis)
         for api in post_apis:

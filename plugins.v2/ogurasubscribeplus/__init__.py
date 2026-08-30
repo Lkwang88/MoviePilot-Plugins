@@ -137,7 +137,7 @@ class OguraSubscribePlus(_PluginBase):
     plugin_name = "小仓酱的订阅补全助手"
     plugin_desc = "检测已播出但未入库的电视剧订阅，并分析 PT 资源、识别和订阅规则原因。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/ogurasubscribeplus.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "ogurasubscribeplus_"
@@ -157,6 +157,7 @@ class OguraSubscribePlus(_PluginBase):
         self._download_contexts = {}
         self._category_cache = {}
         self._custom_release_groups_cache = []
+        self._notification_active = False
 
     # 说明：这些成员在 init_plugin 中初始化实例属性；此处仅做类型注解，
     # 避免使用类级可变默认值（dict/list）导致多实例间状态共享的隐患。
@@ -169,6 +170,7 @@ class OguraSubscribePlus(_PluginBase):
     _download_contexts: Dict[str, Any]
     _category_cache: Dict[str, str]
     _custom_release_groups_cache: List[str]
+    _notification_active: bool
 
     def init_plugin(self, config: dict = None):
         self._config = config or {}
@@ -187,13 +189,14 @@ class OguraSubscribePlus(_PluginBase):
         self._download_contexts = {}
         self._category_cache = {}
         self._custom_release_groups_cache = []
+        self._sync_startup_notification()
 
     def get_state(self) -> bool:
         return bool(self._plugin_config.enabled)
 
     @staticmethod
     def get_render_mode() -> Tuple[str, Optional[str]]:
-        return "vue", "dist/assets"
+        return "vue", "dist/assets-v104"
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -241,6 +244,7 @@ class OguraSubscribePlus(_PluginBase):
             {"path": "/config", "endpoint": self.save_config_api, "methods": ["POST"], "auth": "bear", "summary": "保存插件配置"},
             {"path": "/categories", "endpoint": self.get_categories_api, "methods": ["GET"], "auth": "bear", "summary": "获取订阅二级分类"},
             {"path": "/sites", "endpoint": self.get_site_options_api, "methods": ["GET"], "auth": "bear", "summary": "获取可搜索 PT 站点"},
+            {"path": "/scan", "endpoint": self.run_scan_api, "methods": ["POST"], "auth": "bear", "summary": "手动扫描订阅"},
             {"path": "/test_notify", "endpoint": self.test_notify_api, "methods": ["POST"], "auth": "bear", "summary": "发送测试通知"},
             {"path": "/results", "endpoint": self.get_results_api, "methods": ["GET"], "auth": "bear", "summary": "获取最近诊断结果"},
             {"path": "/results/clear", "endpoint": self.clear_results_api, "methods": ["POST"], "auth": "bear", "summary": "清除最近诊断结果"},
@@ -354,6 +358,29 @@ class OguraSubscribePlus(_PluginBase):
             text=text,
             **kwargs,
         )
+
+    def _sync_startup_notification(self) -> None:
+        """在主动通知从未激活变为激活时发送一次启动通知。"""
+        active = bool(self._plugin_config.enabled and self._notifications_enabled())
+        if not active:
+            self._notification_active = False
+            return
+        if self._notification_active:
+            return
+        self._notification_active = True
+        try:
+            self._post_plugin_notification(
+                title="小仓酱的订阅补全助手已启动",
+                text=(
+                    "插件已启用，通知通道正常。\n"
+                    f"扫描计划：{self._plugin_config.cron}\n"
+                    "可在插件页面点击「测试通知」再次验证。"
+                ),
+                save_history=False,
+            )
+        except Exception as exc:
+            self._notification_active = False
+            logger.warning(f"小仓酱的订阅补全助手启动通知发送失败：{exc}")
 
     def get_status_api(self) -> Dict[str, Any]:
         store = self._ensure_store()
