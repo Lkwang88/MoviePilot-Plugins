@@ -65,6 +65,11 @@ const fields = [
     hint: '关闭后不发送诊断、扫描完成和整季包处理通知；不影响扫描与下载逻辑',
   },
   {
+    key: 'tg_user_ids', group: 'notify', section: '通知渠道', type: 'text',
+    label: 'Telegram 白名单用户 ID', cols: { md: 12 },
+    hint: '可选：逗号/空格分隔的 Telegram 用户数字 ID。配置后通知只发给这些用户（绕过 MP 全局通知开关）；留空则按 MP 全局通知设置广播',
+  },
+  {
     key: 'notify_scan_complete', group: 'notify', section: '通知渠道', type: 'switch',
     label: '扫描结束通知', color: 'info', cols: { md: 6 },
     hint: '每次手动或定时扫描结束后发送一条汇总通知',
@@ -115,6 +120,7 @@ const defaults = {
   season_pack_cleanup: 'off',
   season_pack_full_download: false,
   candidate_cache_days: 3,
+  tg_user_ids: '',
 };
 
 /**

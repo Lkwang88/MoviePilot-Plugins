@@ -33,6 +33,8 @@ class PluginConfig:
     season_pack_cleanup: str = "off"
     season_pack_full_download: bool = False
     candidate_cache_days: int = 3
+    # 新增：Telegram 白名单用户 ID（逗号分隔的数字列表）
+    tg_user_ids: Optional[str] = None
 
     @classmethod
     def from_dict(cls, raw: Optional[Dict[str, Any]]) -> "PluginConfig":
@@ -58,6 +60,8 @@ class PluginConfig:
 
         config.season_pack_cleanup = normalize_cleanup_mode(config.season_pack_cleanup)
         config.cron = str(config.cron or "0 9 * * *")
+        # 解析白名单用户 ID
+        config.tg_user_ids = raw.get("tg_user_ids", None) or None
         return config
 
     def to_dict(self) -> Dict[str, Any]:

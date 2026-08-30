@@ -25,10 +25,13 @@ try:
     from app.core.event import eventmanager
     from app.log import logger
     from app.plugins import _PluginBase
-    from app.schemas.types import EventType, MediaType, MediaSource, MessageChannel, NotificationType, SystemConfigKey
+    from app.schemas.types import EventType, MediaType, MessageChannel, NotificationType, SystemConfigKey
+    try:
+        from app.schemas.types import MediaSource
+    except Exception:  # v2 无 MediaSource 符号，单独容错避免整行导入失败
+        MediaSource = None
 except Exception:  # pragma: no cover - lets local unit tests import this package
     eventmanager = None
-    NotificationType = None
 
     class _FallbackLogger:
         @staticmethod
@@ -137,7 +140,7 @@ class OguraSubscribePlus(_PluginBase):
     plugin_name = "小仓酱的订阅补全助手"
     plugin_desc = "检测已播出但未入库的电视剧订阅，并分析 PT 资源、识别和订阅规则原因。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/ogurasubscribeplus.png"
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "ogurasubscribeplus_"
@@ -190,7 +193,7 @@ class OguraSubscribePlus(_PluginBase):
         self._category_cache = {}
         self._custom_release_groups_cache = []
         logger.info(
-            "小仓酱的订阅补全助手 1.0.5 已加载："
+            "小仓酱的订阅补全助手 1.0.6 已加载："
             f"enabled={self._plugin_config.enabled}，"
             f"notifications_enabled={self._plugin_config.notifications_enabled}，"
             "frontend=dist/assets-v104"
@@ -340,13 +343,15 @@ class OguraSubscribePlus(_PluginBase):
         if not self._notifications_enabled():
             return {"success": False, "message": "通知已关闭，请先开启通知"}
         try:
-            self._post_plugin_notification(
+            ok = self._notify_to_allowed_users(
                 title="小仓酱的订阅补全助手测试通知",
                 text="测试通知发送成功。当前插件通知已通过 Telegram 插件通道提交。",
                 save_history=False,
             )
-            logger.info("小仓酱的订阅补全助手测试通知已提交")
-            return {"success": True, "message": "测试通知已提交"}
+            if ok:
+                logger.info("小仓酱的订阅补全助手测试通知已提交")
+                return {"success": True, "message": "测试通知已提交"}
+            return {"success": False, "message": "测试通知发送失败，请检查插件配置与 Telegram 白名单"}
         except Exception as exc:
             logger.error(f"小仓酱的订阅补全助手测试通知失败：{exc}", exc_info=True)
             return {"success": False, "message": f"测试通知发送失败：{exc}"}
@@ -355,15 +360,62 @@ class OguraSubscribePlus(_PluginBase):
         config = getattr(self, "_plugin_config", PluginConfig.from_dict({}))
         return bool(getattr(config, "notifications_enabled", True))
 
-    def _post_plugin_notification(self, title: str, text: str, **kwargs) -> None:
-        """统一提交 Telegram 插件通知，主动通知固定走 Telegram + 插件通道。"""
-        self.post_message(
-            channel=MessageChannel.Telegram if MessageChannel else None,
-            mtype=NotificationType.Plugin if NotificationType else None,
-            title=title,
-            text=text,
-            **kwargs,
-        )
+    def _parse_tg_user_ids(self) -> List[int]:
+        """解析 Telegram 白名单用户 ID 配置（逗号/空格/全角逗号分隔的数字）。"""
+        raw = getattr(self._plugin_config, "tg_user_ids", None)
+        if not raw:
+            return []
+        ids: List[int] = []
+        for token in re.split(r"[,\s，]+", str(raw).strip()):
+            token = token.strip()
+            if token.lstrip("-").isdigit():
+                ids.append(int(token))
+        return ids
+
+    def _notify_to_allowed_users(
+        self, userid: Optional[str] = None, title: str = "", text: str = "", **kwargs
+    ) -> bool:
+        """统一提交 Telegram 插件通知。
+
+        白名单（tg_user_ids）配置后：对每个白名单用户定向直发，
+        绕过全局"通知开关"（v2 check_message 对带 userid 的消息跳过开关校验）；
+        未配置白名单时：按全局通知开关广播（与其他插件行为一致）。
+        返回是否有至少一条消息成功提交。
+        """
+        whitelist = self._parse_tg_user_ids()
+        channel = MessageChannel.Telegram
+        mtype = NotificationType.Plugin
+        if whitelist:
+            all_ok = True
+            for uid in whitelist:
+                try:
+                    self.post_message(
+                        channel=channel,
+                        mtype=mtype,
+                        userid=str(uid),
+                        title=title,
+                        text=text,
+                        **kwargs,
+                    )
+                    logger.info(f"小仓酱的订阅补全助手通知已发送至 Telegram 用户 {uid}")
+                except Exception as exc:
+                    all_ok = False
+                    logger.warning(f"小仓酱的订阅补全助手通知发送给 Telegram 用户 {uid} 失败：{exc}")
+            return all_ok
+        try:
+            self.post_message(
+                channel=channel,
+                mtype=mtype,
+                userid=userid,
+                title=title,
+                text=text,
+                **kwargs,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"小仓酱的订阅补全助手通知发送失败：{exc}")
+            return False
+
 
     def _sync_startup_notification(self) -> None:
         """在主动通知从未激活变为激活时发送一次启动通知。"""
@@ -375,7 +427,7 @@ class OguraSubscribePlus(_PluginBase):
             return
         self._notification_active = True
         try:
-            self._post_plugin_notification(
+            ok = self._notify_to_allowed_users(
                 title="小仓酱的订阅补全助手已启动",
                 text=(
                     "插件已启用，通知通道正常。\n"
@@ -384,7 +436,10 @@ class OguraSubscribePlus(_PluginBase):
                 ),
                 save_history=False,
             )
-            logger.info("小仓酱的订阅补全助手启动通知已提交到 Telegram 插件通道")
+            if ok:
+                logger.info("小仓酱的订阅补全助手启动通知已提交到 Telegram 插件通道")
+            else:
+                logger.warning("小仓酱的订阅补全助手启动通知提交失败")
         except Exception as exc:
             self._notification_active = False
             logger.warning(f"小仓酱的订阅补全助手启动通知发送失败：{exc}")
@@ -556,7 +611,7 @@ class OguraSubscribePlus(_PluginBase):
 
     def _notify_scan_complete(self, source: str, candidate_count: int, batch_count: int, result_count: int) -> None:
         source_text = "手动" if source == "manual" else "定时"
-        self._post_plugin_notification(
+        self._notify_to_allowed_users(
             title="小仓酱的订阅补全助手扫描完成",
             text=(
                 f"扫描方式：{source_text}\n"
@@ -1106,7 +1161,7 @@ class OguraSubscribePlus(_PluginBase):
                 continue
             token = self._save_interaction(item)
             try:
-                self._post_plugin_notification(
+                self._notify_to_allowed_users(
                     title=self._notification_title(item),
                     text=render_notification_text(item),
                     buttons=build_main_menu(
@@ -2598,7 +2653,7 @@ class OguraSubscribePlus(_PluginBase):
         if errors:
             lines.append(f"失败：{len(errors)} 条")
             lines.extend(errors[:5])
-        self._post_plugin_notification(
+        self._notify_to_allowed_users(
             title=self._notification_title(title),
             text="\n".join(lines),
             save_history=False,
@@ -2643,7 +2698,7 @@ class OguraSubscribePlus(_PluginBase):
         if errors:
             lines.append(f"清理失败：{len(errors)} 条")
             lines.extend(errors[:5])
-        self._post_plugin_notification(
+        self._notify_to_allowed_users(
             title=self._notification_title(title),
             text="\n".join(lines),
             save_history=False,

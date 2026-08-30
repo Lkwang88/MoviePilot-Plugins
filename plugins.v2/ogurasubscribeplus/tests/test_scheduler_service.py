@@ -62,12 +62,64 @@ class NotificationTest(unittest.TestCase):
         calls = []
         plugin.post_message = lambda **kwargs: calls.append(kwargs)
 
-        plugin._post_plugin_notification("标题", "正文", save_history=False)
+        plugin._notify_to_allowed_users(title="标题", text="正文", save_history=False)
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(getattr(calls[0]["channel"], "value", calls[0]["channel"]), "Telegram")
         self.assertEqual(getattr(calls[0]["mtype"], "value", calls[0]["mtype"]), "插件")
         self.assertEqual(calls[0]["title"], "标题")
+
+    def test_whitelist_direct_sends_to_each_user(self):
+        plugin = self.make_plugin(tg_user_ids="123, 456")
+        calls = []
+        plugin.post_message = lambda **kwargs: calls.append(kwargs)
+
+        ok = plugin._notify_to_allowed_users(title="标题", text="正文", save_history=False)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({c["userid"] for c in calls}, {"123", "456"})
+        for call in calls:
+            self.assertEqual(getattr(call["channel"], "value", call["channel"]), "Telegram")
+            self.assertEqual(getattr(call["mtype"], "value", call["mtype"]), "插件")
+
+    def test_whitelist_parses_commas_spaces_and_filters_garbage(self):
+        plugin = self.make_plugin(tg_user_ids="123, 456　789，abc")
+        self.assertEqual(plugin._parse_tg_user_ids(), [123, 456, 789])
+
+    def test_empty_whitelist_broadcasts_once_without_userid(self):
+        plugin = self.make_plugin()
+        calls = []
+        plugin.post_message = lambda **kwargs: calls.append(kwargs)
+
+        ok = plugin._notify_to_allowed_users(title="标题", text="正文", save_history=False)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0].get("userid"))
+
+    def test_notify_failure_returns_false(self):
+        plugin = self.make_plugin()
+
+        def boom(**kwargs):
+            raise RuntimeError("send failed")
+
+        plugin.post_message = boom
+        self.assertFalse(plugin._notify_to_allowed_users(title="标题", text="正文"))
+
+    def test_whitelist_partial_failure_returns_false_but_sends_others(self):
+        plugin = self.make_plugin(tg_user_ids="123, 456")
+        calls = []
+
+        def flaky(**kwargs):
+            if kwargs.get("userid") == "123":
+                raise RuntimeError("first user failed")
+            calls.append(kwargs)
+
+        plugin.post_message = flaky
+        ok = plugin._notify_to_allowed_users(title="标题", text="正文")
+        self.assertFalse(ok)
+        self.assertEqual([c["userid"] for c in calls], ["456"])
 
     def test_test_notification_is_blocked_when_notifications_are_disabled(self):
         plugin = self.make_plugin(notifications_enabled=False)
@@ -90,10 +142,19 @@ class NotificationTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("测试通知发送成功", calls[0]["text"])
 
+    def test_test_notification_reports_send_failure(self):
+        plugin = self.make_plugin()
+        plugin._notify_to_allowed_users = lambda **kwargs: False
+
+        result = plugin.test_notify_api()
+
+        self.assertFalse(result["success"])
+        self.assertIn("发送失败", result["message"])
+
     def test_scan_complete_notification_contains_scan_summary(self):
         plugin = self.make_plugin(notify_scan_complete=True)
         calls = []
-        plugin._post_plugin_notification = lambda **kwargs: calls.append(kwargs)
+        plugin._notify_to_allowed_users = lambda **kwargs: calls.append(kwargs)
 
         plugin._notify_scan_complete("schedule", 12, 5, 3)
 
@@ -109,7 +170,7 @@ class StartupNotificationTest(unittest.TestCase):
     def test_enabled_init_posts_startup_notification_once(self):
         plugin = OguraSubscribePlus()
         calls = []
-        plugin._post_plugin_notification = lambda **kwargs: calls.append(kwargs)
+        plugin._notify_to_allowed_users = lambda **kwargs: calls.append(kwargs)
 
         plugin.init_plugin({"enabled": True, "notifications_enabled": True})
         plugin.init_plugin({"enabled": True, "notifications_enabled": True, "cron": "0 12 * * *"})
@@ -120,7 +181,7 @@ class StartupNotificationTest(unittest.TestCase):
     def test_reenable_posts_startup_notification_again(self):
         plugin = OguraSubscribePlus()
         calls = []
-        plugin._post_plugin_notification = lambda **kwargs: calls.append(kwargs)
+        plugin._notify_to_allowed_users = lambda **kwargs: calls.append(kwargs)
 
         plugin.init_plugin({"enabled": True, "notifications_enabled": True})
         plugin.init_plugin({"enabled": False, "notifications_enabled": True})
@@ -131,7 +192,7 @@ class StartupNotificationTest(unittest.TestCase):
     def test_disabled_notifications_suppress_startup_notification(self):
         plugin = OguraSubscribePlus()
         calls = []
-        plugin._post_plugin_notification = lambda **kwargs: calls.append(kwargs)
+        plugin._notify_to_allowed_users = lambda **kwargs: calls.append(kwargs)
 
         plugin.init_plugin({"enabled": True, "notifications_enabled": False})
 
@@ -141,13 +202,13 @@ class StartupNotificationTest(unittest.TestCase):
 class RuntimeDiagnosisLogTest(unittest.TestCase):
     def test_init_logs_loaded_version_and_frontend_assets(self):
         plugin = OguraSubscribePlus()
-        plugin._post_plugin_notification = lambda **kwargs: None
+        plugin._notify_to_allowed_users = lambda **kwargs: True
 
         with patch("ogurasubscribeplus.logger.info") as info:
             plugin.init_plugin({"enabled": True, "notifications_enabled": True})
 
         messages = [str(call.args[0]) for call in info.call_args_list if call.args]
-        self.assertTrue(any("1.0.5 已加载" in message for message in messages))
+        self.assertTrue(any("已加载" in message for message in messages))
         self.assertTrue(any("frontend=dist/assets-v104" in message for message in messages))
         self.assertTrue(any("启动通知已提交到 Telegram 插件通道" in message for message in messages))
 

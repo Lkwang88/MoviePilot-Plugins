@@ -38,6 +38,9 @@ class FrontendCacheBustTest(unittest.TestCase):
         self.assertIn("plugin/OguraSubscribePlus/test_notify", config_text)
         self.assertIn("key: 'notifications_enabled'", config_text)
         self.assertIn("key: 'notify_scan_complete'", config_text)
+        self.assertIn("key: 'tg_user_ids'", config_text)
+        self.assertIn("Telegram 白名单用户 ID", config_text)
+        self.assertIn("tg_user_ids: ''", config_text)
         self.assertIn('测试通知', config_text)
 
 
