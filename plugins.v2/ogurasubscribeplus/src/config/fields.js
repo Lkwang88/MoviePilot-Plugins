@@ -56,9 +56,14 @@ export const fields = [
 
   // ---- 通知权限 ----
   {
-    key: 'notify_tg', group: 'notify', section: '通知渠道', type: 'switch',
-    label: 'Telegram 独立通知', color: 'primary', cols: { md: 6 },
-    hint: '每部剧单独发送 Telegram 诊断通知',
+    key: 'notifications_enabled', group: 'notify', section: '通知渠道', type: 'switch',
+    label: '开启通知', color: 'success', cols: { md: 6 },
+    hint: '关闭后不发送诊断、扫描完成和整季包处理通知；不影响扫描与下载逻辑',
+  },
+  {
+    key: 'notify_scan_complete', group: 'notify', section: '通知渠道', type: 'switch',
+    label: '扫描结束通知', color: 'info', cols: { md: 6 },
+    hint: '每次手动或定时扫描结束后发送一条汇总通知',
   },
   {
     key: 'allow_tg_rule_update', group: 'notify', section: '授权', type: 'switch',
@@ -100,6 +105,8 @@ export const defaults = {
   search_sites: [],
   max_scan_subscribes: 20,
   notify_tg: true,
+  notifications_enabled: true,
+  notify_scan_complete: false,
   allow_tg_rule_update: false,
   season_pack_cleanup: 'off',
   season_pack_full_download: false,

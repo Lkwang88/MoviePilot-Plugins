@@ -24,10 +24,22 @@ class PluginConfigTest(unittest.TestCase):
         self.assertFalse(config.allow_tg_rule_update)
 
     def test_config_normalizes_numeric_bounds(self):
-        config = PluginConfig.from_dict({"delay_days": "-1", "max_scan_subscribes": "0"})
+        config = PluginConfig.from_dict({"delay_days": "-1", "max_scan_subscribes": "0", "notify_tg": False})
 
         self.assertEqual(config.delay_days, 0)
         self.assertEqual(config.max_scan_subscribes, 1)
+        self.assertEqual(config.notifications_enabled, False)
+
+    def test_new_notification_switch_overrides_legacy_notify_tg(self):
+        config = PluginConfig.from_dict({"notify_tg": False, "notifications_enabled": True})
+
+        self.assertEqual(config.notifications_enabled, True)
+
+    def test_default_notification_switches_are_enabled_and_scan_summary_disabled(self):
+        config = PluginConfig.from_dict({})
+
+        self.assertTrue(config.notifications_enabled)
+        self.assertFalse(config.notify_scan_complete)
 
     def test_post_api_endpoints_do_not_require_var_kwargs(self):
         plugin = OguraSubscribePlus()

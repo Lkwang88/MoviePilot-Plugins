@@ -25,7 +25,7 @@ try:
     from app.core.event import eventmanager
     from app.log import logger
     from app.plugins import _PluginBase
-    from app.schemas.types import EventType, MediaType, MediaSource, NotificationType, SystemConfigKey
+    from app.schemas.types import EventType, MediaType, MediaSource, MessageChannel, NotificationType, SystemConfigKey
 except Exception:  # pragma: no cover - lets local unit tests import this package
     eventmanager = None
     NotificationType = None
@@ -64,6 +64,12 @@ except Exception:  # pragma: no cover - lets local unit tests import this packag
 
     class MediaType:
         TV = type("TV", (), {"value": "电视剧"})()
+
+    class NotificationType:
+        Plugin = type("Plugin", (), {"value": "插件"})()
+
+    class MessageChannel:
+        Telegram = "Telegram"
 
     class SystemConfigKey:
         IndexerSites = "IndexerSites"
@@ -131,7 +137,7 @@ class OguraSubscribePlus(_PluginBase):
     plugin_name = "小仓酱的订阅补全助手"
     plugin_desc = "检测已播出但未入库的电视剧订阅，并分析 PT 资源、识别和订阅规则原因。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/ogurasubscribeplus.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.3"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "ogurasubscribeplus_"
@@ -235,7 +241,7 @@ class OguraSubscribePlus(_PluginBase):
             {"path": "/config", "endpoint": self.save_config_api, "methods": ["POST"], "auth": "bear", "summary": "保存插件配置"},
             {"path": "/categories", "endpoint": self.get_categories_api, "methods": ["GET"], "auth": "bear", "summary": "获取订阅二级分类"},
             {"path": "/sites", "endpoint": self.get_site_options_api, "methods": ["GET"], "auth": "bear", "summary": "获取可搜索 PT 站点"},
-            {"path": "/scan", "endpoint": self.run_scan_api, "methods": ["POST"], "auth": "bear", "summary": "手动扫描订阅"},
+            {"path": "/test_notify", "endpoint": self.test_notify_api, "methods": ["POST"], "auth": "bear", "summary": "发送测试通知"},
             {"path": "/results", "endpoint": self.get_results_api, "methods": ["GET"], "auth": "bear", "summary": "获取最近诊断结果"},
             {"path": "/results/clear", "endpoint": self.clear_results_api, "methods": ["POST"], "auth": "bear", "summary": "清除最近诊断结果"},
             {"path": "/results/delete", "endpoint": self.delete_result_api, "methods": ["POST"], "auth": "bear", "summary": "删除单条诊断结果"},
@@ -318,6 +324,36 @@ class OguraSubscribePlus(_PluginBase):
         except Exception as exc:
             logger.error(f"小仓酱的订阅补全助手保存配置失败：{exc}", exc_info=True)
             return {"success": False, "message": str(exc)}
+
+    def test_notify_api(self, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+        """发送一条不修改业务数据的 Telegram 插件通道测试消息。"""
+        if not self._notifications_enabled():
+            return {"success": False, "message": "通知已关闭，请先开启通知"}
+        try:
+            self._post_plugin_notification(
+                title="小仓酱的订阅补全助手测试通知",
+                text="测试通知发送成功。当前插件通知已通过 Telegram 插件通道提交。",
+                save_history=False,
+            )
+            logger.info("小仓酱的订阅补全助手测试通知已提交")
+            return {"success": True, "message": "测试通知已提交"}
+        except Exception as exc:
+            logger.error(f"小仓酱的订阅补全助手测试通知失败：{exc}", exc_info=True)
+            return {"success": False, "message": f"测试通知发送失败：{exc}"}
+
+    def _notifications_enabled(self) -> bool:
+        config = getattr(self, "_plugin_config", PluginConfig.from_dict({}))
+        return bool(getattr(config, "notifications_enabled", True))
+
+    def _post_plugin_notification(self, title: str, text: str, **kwargs) -> None:
+        """统一提交 Telegram 插件通知，主动通知固定走 Telegram + 插件通道。"""
+        self.post_message(
+            channel=MessageChannel.Telegram if MessageChannel else None,
+            mtype=NotificationType.Plugin if NotificationType else None,
+            title=title,
+            text=text,
+            **kwargs,
+        )
 
     def get_status_api(self) -> Dict[str, Any]:
         store = self._ensure_store()
@@ -403,7 +439,7 @@ class OguraSubscribePlus(_PluginBase):
         diagnosis = self._diagnose_item(item)
         results = [diagnosis.to_dict()] if diagnosis else []
         self._ensure_store().save_scan_results(results)
-        if notify and self._plugin_config.notify_tg and results:
+        if notify and self._notifications_enabled() and results:
             self._notify_each_show(results)
         return {
             "success": True,
@@ -478,9 +514,24 @@ class OguraSubscribePlus(_PluginBase):
             results.append(diagnosis.to_dict())
 
         store.save_scan_results(results)
-        if config.notify_tg:
+        if self._notifications_enabled():
             self._notify_each_show(results)
+        if config.notify_scan_complete and self._notifications_enabled():
+            self._notify_scan_complete(source, len(inputs), len(batch), len(results))
         return {"success": True, "count": len(results), "source": source}
+
+    def _notify_scan_complete(self, source: str, candidate_count: int, batch_count: int, result_count: int) -> None:
+        source_text = "手动" if source == "manual" else "定时"
+        self._post_plugin_notification(
+            title="小仓酱的订阅补全助手扫描完成",
+            text=(
+                f"扫描方式：{source_text}\n"
+                f"发现候选订阅：{candidate_count} 部\n"
+                f"本轮处理：{batch_count} 部\n"
+                f"生成诊断：{result_count} 部"
+            ),
+            save_history=False,
+        )
 
     def _build_single_diagnosis_input(self, payload: Dict[str, Any]) -> Tuple[Optional[DiagnosisInput], str]:
         subscribe_id = safe_int(payload.get("subscribe_id") or payload.get("sid") or payload.get("id"), 0)
@@ -1009,6 +1060,8 @@ class OguraSubscribePlus(_PluginBase):
         return f"小仓酱的订阅补全助手：{title}" if title else "小仓酱的订阅补全助手"
 
     def _notify_next_queued_show(self):
+        if not self._notifications_enabled():
+            return
         store = self._ensure_store()
         while True:
             item = store.pop_notification_queue()
@@ -1019,8 +1072,7 @@ class OguraSubscribePlus(_PluginBase):
                 continue
             token = self._save_interaction(item)
             try:
-                self.post_message(
-                    mtype=NotificationType.Plugin if NotificationType else None,
+                self._post_plugin_notification(
                     title=self._notification_title(item),
                     text=render_notification_text(item),
                     buttons=build_main_menu(
@@ -2497,7 +2549,7 @@ class OguraSubscribePlus(_PluginBase):
 
     def _notify_season_cleanup_legacy(self, current, plan, deleted: List[Any], errors: List[str]):
         config = getattr(self, "_plugin_config", PluginConfig.from_dict({}))
-        if not getattr(config, "notify_tg", True):
+        if not self._notifications_enabled():
             return
         if not deleted and not errors:
             return
@@ -2512,8 +2564,7 @@ class OguraSubscribePlus(_PluginBase):
         if errors:
             lines.append(f"失败：{len(errors)} 条")
             lines.extend(errors[:5])
-        self.post_message(
-            mtype=NotificationType.Plugin if NotificationType else None,
+        self._post_plugin_notification(
             title=self._notification_title(title),
             text="\n".join(lines),
             save_history=False,
@@ -2528,7 +2579,7 @@ class OguraSubscribePlus(_PluginBase):
         download_result: Optional[Dict[str, Any]] = None,
     ):
         config = getattr(self, "_plugin_config", PluginConfig.from_dict({}))
-        if not getattr(config, "notify_tg", True):
+        if not self._notifications_enabled():
             return
         if not deleted and not errors and not download_result:
             return
@@ -2558,8 +2609,7 @@ class OguraSubscribePlus(_PluginBase):
         if errors:
             lines.append(f"清理失败：{len(errors)} 条")
             lines.extend(errors[:5])
-        self.post_message(
-            mtype=NotificationType.Plugin if NotificationType else None,
+        self._post_plugin_notification(
             title=self._notification_title(title),
             text="\n".join(lines),
             save_history=False,

@@ -25,7 +25,10 @@ class PluginConfig:
     selected_categories: List[str] = field(default_factory=list)
     search_sites: List[str] = field(default_factory=list)
     max_scan_subscribes: int = 20
+    # 保留 notify_tg 兼容旧配置；notifications_enabled 控制插件所有通知。
     notify_tg: bool = True
+    notifications_enabled: bool = True
+    notify_scan_complete: bool = False
     allow_tg_rule_update: bool = False
     season_pack_cleanup: str = "off"
     season_pack_full_download: bool = False
@@ -44,7 +47,10 @@ class PluginConfig:
         config.selected_categories = [str(item) for item in _as_list(config.selected_categories)]
         config.search_sites = [str(item) for item in _as_list(config.search_sites)]
         config.max_scan_subscribes = max(1, int(config.max_scan_subscribes or 1))
-        config.notify_tg = bool(config.notify_tg)
+        if "notifications_enabled" not in raw:
+            config.notifications_enabled = config.notify_tg
+        config.notifications_enabled = bool(config.notifications_enabled)
+        config.notify_scan_complete = bool(config.notify_scan_complete)
         config.allow_tg_rule_update = bool(config.allow_tg_rule_update)
         config.season_pack_full_download = bool(config.season_pack_full_download)
         config.candidate_cache_days = max(0, int(config.candidate_cache_days or 0))

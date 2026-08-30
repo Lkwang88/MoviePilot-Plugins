@@ -84,6 +84,16 @@ Telegram 保留 `/ci 媒体文件名` 作为自定义识别词交互入口。
 - `候选缓存天数`：候选下载信息的本地缓存有效期，默认 3 天；设为 0 关闭缓存。
 - `通知方式`：每部剧单独发送 Telegram 通知。
 
+## v1.0.3（通知修复增强）
+
+- 新增「开启通知」总开关、可选「扫描结束通知」和「测试通知」按钮。
+- 主动通知明确指定 Telegram 渠道与 MoviePilot 插件消息类型；关闭通知不影响扫描、下载和 Telegram 交互回执。
+
+## v1.0.2（通知增强）
+
+- 新增「开启通知」总开关、可选「扫描结束通知」和「测试通知」按钮。
+- 主动通知明确指定 Telegram 渠道与 MoviePilot 插件消息类型；关闭通知不影响扫描、下载和 Telegram 交互回执。
+
 ## v1.0.1（独立插件 ID 发布）
 
 - 修复定时扫描服务注册失败：将扫描来源参数放入 `func_kwargs`，避免被 MoviePilot v2 当作 APScheduler 参数。
@@ -263,9 +273,9 @@ Telegram 保留 `/ci 媒体文件名` 作为自定义识别词交互入口。
 
 - 插件 ID：`OguraSubscribePlus`
 - 插件目录：`ogurasubscribeplus`
-- 当前版本：`1.0.1`
-- Release tag：`OguraSubscribePlus_v1.0.1`
-- Release 资产：`ogurasubscribeplus_v1.0.1.zip`
+- 当前版本：`1.0.3`
+- Release tag：`OguraSubscribePlus_v1.0.3`
+- Release 资产：`ogurasubscribeplus_v1.0.3.zip`
 
 ## 致谢
 

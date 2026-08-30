@@ -64,6 +64,7 @@
                 <div class="sp-section-title mb-0">运行概览</div>
                 <VSpacer />
                 <VBtn color="primary" prepend-icon="mdi-radar" variant="tonal" size="small" :loading="scanning" @click="runScan">手动扫描</VBtn>
+                <VBtn color="info" prepend-icon="mdi-message-check-outline" variant="text" size="small" :loading="testingNotify" @click="testNotify">测试通知</VBtn>
                 <VBtn color="warning" prepend-icon="mdi-delete-sweep-outline" variant="text" size="small" :loading="clearing" @click="clearResults">清除诊断</VBtn>
                 <VBtn icon="mdi-refresh" variant="text" size="small" :loading="loading" @click="loadData" />
               </div>
@@ -250,7 +251,7 @@
                 <div class="sp-dashboard-row"><VIcon icon="mdi-history" /><span>最近扫描</span><strong>{{ lastScanText }}</strong></div>
                 <div class="sp-dashboard-row"><VIcon icon="mdi-timer-sand" /><span>待处理</span><strong>{{ items.length }}</strong></div>
                 <div class="sp-dashboard-row"><VIcon icon="mdi-download-box-outline" /><span>候选资源</span><strong>{{ candidateTotal }}</strong></div>
-                <div class="sp-dashboard-row"><VIcon icon="mdi-toggle-switch-outline" /><span>已启用功能</span><strong>{{ enabledFeatureCount }}/6</strong></div>
+                <div class="sp-dashboard-row"><VIcon icon="mdi-toggle-switch-outline" /><span>已启用功能</span><strong>{{ enabledFeatureCount }}/7</strong></div>
               </section>
             </aside>
           </div>
@@ -382,6 +383,7 @@ const items = ref([])
 const ruleRecords = ref([])
 const identifierRecords = ref([])
 const scanning = ref(false)
+const testingNotify = ref(false)
 const clearing = ref(false)
 const clearingRules = ref(false)
 const clearingIdentifiers = ref(false)
@@ -427,7 +429,8 @@ const candidateTotal = computed(() => items.value.reduce(
 
 const enabledFeatureCount = computed(() => [
   Boolean(config.enabled),
-  Boolean(config.notify_tg),
+  Boolean(config.notifications_enabled),
+  Boolean(config.notify_scan_complete),
   Boolean(config.allow_tg_rule_update),
   config.season_pack_cleanup !== 'off',
   Boolean(config.season_pack_full_download),
@@ -612,7 +615,26 @@ async function runScan() {
   }
 }
 
-async function clearResults() {
+async function testNotify() {
+  testingNotify.value = true
+  error.value = ''
+  try {
+    const response = await props.api.post('plugin/OguraSubscribePlus/test_notify', {})
+    const body = response?.data ?? response ?? {}
+    const data = body?.data ?? body
+    if (body.success === false || data.success === false) {
+      throw new Error(body.message || data.message || '测试通知失败')
+    }
+    saveMessage.value = body.message || data.message || '测试通知已提交'
+    saveSnackbar.value = true
+  } catch (err) {
+    error.value = err?.message || '测试通知失败'
+  } finally {
+    testingNotify.value = false
+  }
+}
+
+
   clearing.value = true
   error.value = ''
   try {

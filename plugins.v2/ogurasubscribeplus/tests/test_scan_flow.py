@@ -59,7 +59,12 @@ def make_input():
 class ScanFlowTest(unittest.TestCase):
     def make_plugin(self, item):
         plugin = OguraSubscribePlus()
-        plugin._plugin_config = PluginConfig(enabled=True, notify_tg=False, max_scan_subscribes=20)
+        plugin._plugin_config = PluginConfig(
+            enabled=True,
+            notify_tg=False,
+            notifications_enabled=False,
+            max_scan_subscribes=20,
+        )
         plugin._store = FakeStore()
         plugin._scanner = FakeScanner([item])
         plugin._site_resolver = object()

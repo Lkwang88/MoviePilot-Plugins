@@ -60,9 +60,14 @@ const fields = [
 
   // ---- 通知权限 ----
   {
-    key: 'notify_tg', group: 'notify', section: '通知渠道', type: 'switch',
-    label: 'Telegram 独立通知', color: 'primary', cols: { md: 6 },
-    hint: '每部剧单独发送 Telegram 诊断通知',
+    key: 'notifications_enabled', group: 'notify', section: '通知渠道', type: 'switch',
+    label: '开启通知', color: 'success', cols: { md: 6 },
+    hint: '关闭后不发送诊断、扫描完成和整季包处理通知；不影响扫描与下载逻辑',
+  },
+  {
+    key: 'notify_scan_complete', group: 'notify', section: '通知渠道', type: 'switch',
+    label: '扫描结束通知', color: 'info', cols: { md: 6 },
+    hint: '每次手动或定时扫描结束后发送一条汇总通知',
   },
   {
     key: 'allow_tg_rule_update', group: 'notify', section: '授权', type: 'switch',
@@ -104,6 +109,8 @@ const defaults = {
   search_sites: [],
   max_scan_subscribes: 20,
   notify_tg: true,
+  notifications_enabled: true,
+  notify_scan_complete: false,
   allow_tg_rule_update: false,
   season_pack_cleanup: 'off',
   season_pack_full_download: false,
@@ -298,6 +305,7 @@ const items = ref([]);
 const ruleRecords = ref([]);
 const identifierRecords = ref([]);
 const scanning = ref(false);
+const testingNotify = ref(false);
 const clearing = ref(false);
 const clearingRules = ref(false);
 const clearingIdentifiers = ref(false);
@@ -343,7 +351,8 @@ const candidateTotal = computed(() => items.value.reduce(
 
 const enabledFeatureCount = computed(() => [
   Boolean(config.enabled),
-  Boolean(config.notify_tg),
+  Boolean(config.notifications_enabled),
+  Boolean(config.notify_scan_complete),
   Boolean(config.allow_tg_rule_update),
   config.season_pack_cleanup !== 'off',
   Boolean(config.season_pack_full_download),
@@ -541,6 +550,25 @@ async function runScan() {
     error.value = err?.message || '手动扫描失败';
   } finally {
     scanning.value = false;
+  }
+}
+
+async function testNotify() {
+  testingNotify.value = true;
+  error.value = '';
+  try {
+    const response = await props.api.post('plugin/OguraSubscribePlus/test_notify', {});
+    const body = response?.data ?? response ?? {};
+    const data = body?.data ?? body;
+    if (body.success === false || data.success === false) {
+      throw new Error(body.message || data.message || '测试通知失败')
+    }
+    saveMessage.value = body.message || data.message || '测试通知已提交';
+    saveSnackbar.value = true;
+  } catch (err) {
+    error.value = err?.message || '测试通知失败';
+  } finally {
+    testingNotify.value = false;
   }
 }
 
@@ -992,6 +1020,19 @@ return (_ctx, _cache) => {
                     }, {
                       default: _withCtx(() => [...(_cache[16] || (_cache[16] = [
                         _createTextVNode("手动扫描", -1)
+                      ]))]),
+                      _: 1
+                    }, 8, ["loading"]),
+                    _createVNode(_component_VBtn, {
+                      color: "info",
+                      "prepend-icon": "mdi-message-check-outline",
+                      variant: "text",
+                      size: "small",
+                      loading: testingNotify.value,
+                      onClick: testNotify
+                    }, {
+                      default: _withCtx(() => [...(_cache[17] || (_cache[17] = [
+                        _createTextVNode("测试通知", -1)
                       ]))]),
                       _: 1
                     }, 8, ["loading"]),
@@ -1660,7 +1701,7 @@ return (_ctx, _cache) => {
                   _createElementVNode("div", _hoisted_67, [
                     _createVNode(_component_VIcon, { icon: "mdi-toggle-switch-outline" }),
                     _cache[40] || (_cache[40] = _createElementVNode("span", null, "已启用功能", -1)),
-                    _createElementVNode("strong", null, _toDisplayString(enabledFeatureCount.value) + "/6", 1)
+                    _createElementVNode("strong", null, _toDisplayString(enabledFeatureCount.value) + "/7", 1)
                   ])
                 ])
               ])

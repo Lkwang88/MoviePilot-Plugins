@@ -53,3 +53,57 @@ class ConfigSaveSchedulerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotificationTest(unittest.TestCase):
+    def make_plugin(self, **config):
+        plugin = OguraSubscribePlus()
+        plugin._plugin_config = PluginConfig.from_dict({"enabled": True, **config})
+        return plugin
+
+    def test_plugin_notification_has_telegram_channel_and_plugin_type(self):
+        plugin = self.make_plugin()
+        calls = []
+        plugin.post_message = lambda **kwargs: calls.append(kwargs)
+
+        plugin._post_plugin_notification("标题", "正文", save_history=False)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(getattr(calls[0]["channel"], "value", calls[0]["channel"]), "Telegram")
+        self.assertEqual(getattr(calls[0]["mtype"], "value", calls[0]["mtype"]), "插件")
+        self.assertEqual(calls[0]["title"], "标题")
+
+    def test_test_notification_is_blocked_when_notifications_are_disabled(self):
+        plugin = self.make_plugin(notifications_enabled=False)
+        calls = []
+        plugin.post_message = lambda **kwargs: calls.append(kwargs)
+
+        result = plugin.test_notify_api()
+
+        self.assertFalse(result["success"])
+        self.assertEqual(calls, [])
+
+    def test_test_notification_does_not_touch_business_data(self):
+        plugin = self.make_plugin()
+        calls = []
+        plugin.post_message = lambda **kwargs: calls.append(kwargs)
+
+        result = plugin.test_notify_api()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("测试通知发送成功", calls[0]["text"])
+
+    def test_scan_complete_notification_contains_scan_summary(self):
+        plugin = self.make_plugin(notify_scan_complete=True)
+        calls = []
+        plugin._post_plugin_notification = lambda **kwargs: calls.append(kwargs)
+
+        plugin._notify_scan_complete("schedule", 12, 5, 3)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["title"], "小仓酱的订阅补全助手扫描完成")
+        self.assertIn("扫描方式：定时", calls[0]["text"])
+        self.assertIn("发现候选订阅：12 部", calls[0]["text"])
+        self.assertIn("本轮处理：5 部", calls[0]["text"])
+        self.assertIn("生成诊断：3 部", calls[0]["text"])
