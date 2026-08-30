@@ -138,5 +138,19 @@ class StartupNotificationTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class RuntimeDiagnosisLogTest(unittest.TestCase):
+    def test_init_logs_loaded_version_and_frontend_assets(self):
+        plugin = OguraSubscribePlus()
+        plugin._post_plugin_notification = lambda **kwargs: None
+
+        with patch("ogurasubscribeplus.logger.info") as info:
+            plugin.init_plugin({"enabled": True, "notifications_enabled": True})
+
+        messages = [str(call.args[0]) for call in info.call_args_list if call.args]
+        self.assertTrue(any("1.0.5 已加载" in message for message in messages))
+        self.assertTrue(any("frontend=dist/assets-v104" in message for message in messages))
+        self.assertTrue(any("启动通知已提交到 Telegram 插件通道" in message for message in messages))
+
+
 if __name__ == "__main__":
     unittest.main()

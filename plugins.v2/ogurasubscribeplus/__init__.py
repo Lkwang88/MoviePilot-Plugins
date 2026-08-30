@@ -137,7 +137,7 @@ class OguraSubscribePlus(_PluginBase):
     plugin_name = "小仓酱的订阅补全助手"
     plugin_desc = "检测已播出但未入库的电视剧订阅，并分析 PT 资源、识别和订阅规则原因。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/ogurasubscribeplus.png"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "ogurasubscribeplus_"
@@ -189,6 +189,12 @@ class OguraSubscribePlus(_PluginBase):
         self._download_contexts = {}
         self._category_cache = {}
         self._custom_release_groups_cache = []
+        logger.info(
+            "小仓酱的订阅补全助手 1.0.5 已加载："
+            f"enabled={self._plugin_config.enabled}，"
+            f"notifications_enabled={self._plugin_config.notifications_enabled}，"
+            "frontend=dist/assets-v104"
+        )
         self._sync_startup_notification()
 
     def get_state(self) -> bool:
@@ -378,6 +384,7 @@ class OguraSubscribePlus(_PluginBase):
                 ),
                 save_history=False,
             )
+            logger.info("小仓酱的订阅补全助手启动通知已提交到 Telegram 插件通道")
         except Exception as exc:
             self._notification_active = False
             logger.warning(f"小仓酱的订阅补全助手启动通知发送失败：{exc}")
