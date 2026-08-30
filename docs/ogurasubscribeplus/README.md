@@ -84,6 +84,12 @@ Telegram 保留 `/ci 媒体文件名` 作为自定义识别词交互入口。
 - `候选缓存天数`：候选下载信息的本地缓存有效期，默认 3 天；设为 0 关闭缓存。
 - `通知方式`：每部剧单独发送 Telegram 通知。
 
+## v1.0.6（通知通道修复与 Telegram 白名单）
+
+- 修复 v2 通知通道：`MediaSource` 在 v2 不存在，原先整行导入失败导致退回假枚举、消息被 `check_message` 丢弃；现拆分导入，`MessageChannel.Telegram` / `NotificationType.Plugin` 始终使用真枚举。
+- 新增 `tg_user_ids` 白名单：逗号/空格分隔的 Telegram 用户数字 ID；配置后通知定向直发白名单用户，绕过 MP 全局通知开关；留空则按全局通知设置广播。
+- 测试通知如实上报发送失败，启动通知记录提交结果。
+
 ## v1.0.5（可靠重装与运行诊断）
 
 - 发布不可变 GitHub Release ZIP，避免镜像逐文件下载命中旧缓存。
@@ -285,9 +291,9 @@ Telegram 保留 `/ci 媒体文件名` 作为自定义识别词交互入口。
 
 - 插件 ID：`OguraSubscribePlus`
 - 插件目录：`ogurasubscribeplus`
-- 当前版本：`1.0.5`
-- Release tag：`OguraSubscribePlus_v1.0.5`
-- Release 资产：`ogurasubscribeplus_v1.0.5.zip`
+- 当前版本：`1.0.6`
+- Release tag：`OguraSubscribePlus_v1.0.6`
+- Release 资产：`ogurasubscribeplus_v1.0.6.zip`
 
 ## 致谢
 
