@@ -11,8 +11,8 @@ __pycache__/
 build/
 develop-eggs/
 dist/
-!plugins.v2/subscribeplus/dist/
-!plugins.v2/subscribeplus/dist/**
+!plugins.v2/ogurasubscribeplus/dist/
+!plugins.v2/ogurasubscribeplus/dist/**
 downloads/
 eggs/
 .eggs/

@@ -157,19 +157,20 @@
    "v0.1.8": "修复空识别信息触发 MP 自定义识别词刷屏和 media_exists 的 NoneType.value 报错；查库失败改为保守跳过，避免误报；DEBUG 改为短心跳+汇总诊断；混合分类在总上限内合并为一条通知；修复 37.5GB~37.5GB 假范围。"
   }
  },
- "SubscribePlus": {
+ "OguraSubscribePlus": {
   "name": "小仓酱的订阅补全助手",
   "description": "电视剧订阅缺集诊断与补全助手：优先复用 MoviePilot 原生订阅搜索，支持手动扫描、定时扫描、PT 资源分析、Telegram 交互和识别词修正。",
   "labels": "订阅,补全,工具",
-  "version": "1.0.0",
-  "icon": "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/subscribeplus.png",
+  "version": "1.0.1",
+  "icon": "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/ogurasubscribeplus.png",
   "author": "Lkwang88",
   "level": 1,
   "v2": true,
   "v3": false,
   "release": true,
   "history": {
-   "v1.0.0": "小仓酱系列首发：修复定时扫描注册参数错位（func_kwargs）；修复配置页保存 Cron/启用状态后定时任务不即时刷新；补充 V2 调度回归测试；保留插件 ID SubscribePlus 兼容已有安装。"
+   "v1.0.1": "独立插件 ID 发布：使用 OguraSubscribePlus，隔离配置、数据目录、API、Telegram 回调和调度服务，避免与原作者版本竞争。",
+   "v1.0.0": "小仓酱系列首发：修复 V2 定时扫描注册参数错位（func_kwargs）；修复配置页保存 Cron/启用状态后定时任务不即时刷新；补充 V2 调度回归测试。"
   }
  }
 }

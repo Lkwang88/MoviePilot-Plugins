@@ -1,0 +1,5 @@
+node_modules/
+__pycache__/
+tests/__pycache__/
+.codex_tmp_tests/
+.data/
