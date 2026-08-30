@@ -15,6 +15,7 @@
 兼容：MoviePilot V2（app/chain/torrents.py 的 TorrentsChain、app/schemas/context.py 的 Context/TorrentInfo/MediaInfo）
 """
 import copy
+import html
 import re
 import threading
 import uuid
@@ -27,7 +28,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.1.8"
+PLUGIN_VERSION = "0.1.9"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
@@ -135,6 +136,21 @@ def _upgrade_score(text: str) -> Tuple[int, str]:
     score = tier + (4 if q == 4 else 3 if q == 3 else 1 if q in (1, 2) else 0)
     label = f"{tier_label} {_QUALITY_TAGS.get(q, '?')}"
     return score, label
+
+
+def _display_quality_tag(text: str) -> str:
+    """从标题/描述生成通知展示标签：4K REMUX DV / 4K WEB-DL / 1080p REMUX / 4K HDR / 1080p DV / 空"""
+    text = text or ""
+    tier, tier_label = _version_tier(text)
+    q = _quality_level(text)
+    q_label = _QUALITY_TAGS.get(q, "")
+    if q_label == "SDR":
+        q_label = ""
+    if tier_label:
+        return f"{tier_label} {q_label}".strip()
+    res = _res_label(_resolution_level(text))
+    parts = [p for p in (res if res != "?" else "", q_label) if p]
+    return " ".join(parts)
 
 
 def _pub_minutes_of(pubdate: Optional[str]) -> Optional[int]:
@@ -758,6 +774,8 @@ class SeedWatch(_PluginBase):
         # 查库条件不足或 MP 查询异常时不能推断“库里没有”；保守跳过，避免误报。
         if exists is None:
             return None
+        # 展示用画质标签（电影/洗版/人工核对显示；剧集不显示）
+        quality_tag = _display_quality_tag(f"{torrent.title} {torrent.description or ''}")
         if exists:
             # 库内已有 → 只有电影洗版才可能命中
             if category != MediaType.MOVIE.value or not self._notify_upgrade:
@@ -766,20 +784,28 @@ class SeedWatch(_PluginBase):
             new_score, new_label = _upgrade_score(f"{torrent.title} {torrent.description or ''}")
             if new_score <= 0:
                 return None
-            # 库内版本打分对比（拿不到 / 打错 → 人工核对）
-            old_path = exists_info.get("path") or ""
-            if not old_path:
-                # 拿不到库内信息 → 人工核对
+            # 库内版本：下载历史种子标题优先（信息比 strm 文件名更全），回退 strm path
+            old_score: Optional[int] = None
+            old_label = ""
+            history_version = exists_info.get("history_version") or ""
+            if history_version:
+                old_score, old_label = _upgrade_score(history_version)
+            if old_score is None:
+                old_path = exists_info.get("path") or ""
+                if old_path:
+                    old_score, old_label = _upgrade_score(old_path)
+            if old_score is None:
+                # 都拿不到库内详情 → 人工核对
                 return {
                     "kind": "manual",
                     "title": title_cn,
                     "raw_title": torrent.title,
                     "size": torrent.size,
                     "category": category,
+                    "quality_tag": quality_tag,
                     "reason": "库内有旧版但拿不到详情，请人工核对画质",
                     "media_ids": media_ids,
                 }
-            old_score, old_label = _upgrade_score(old_path)
             if old_score < 0:
                 # 库里是 DIY/ISO → 当无用，不通知
                 return None
@@ -792,6 +818,7 @@ class SeedWatch(_PluginBase):
                 "raw_title": torrent.title,
                 "size": torrent.size,
                 "category": category,
+                "quality_tag": quality_tag,
                 "quality": _quality_level(torrent.title, torrent.description),
                 "reason": f"库内 {old_label} → 新种 {new_label}",
                 "media_ids": media_ids,
@@ -809,10 +836,10 @@ class SeedWatch(_PluginBase):
             reason = "新电影（未订阅或漏订）"
         # 下载历史排除（任一媒体 ID 存在即查）
         if self._exclude_downloaded and any(media_ids.values()):
-            downloaded = self._downloaded(media_ids)
-            if downloaded is None:
+            records = self._downloaded(media_ids)
+            if records is None:
                 return None
-            if downloaded:
+            if records:
                 return None
         return {
             "kind": kind,
@@ -820,6 +847,7 @@ class SeedWatch(_PluginBase):
             "raw_title": torrent.title,
             "size": torrent.size,
             "category": category,
+            "quality_tag": quality_tag,
             "quality": _quality_level(torrent.title, torrent.description),
             "reason": reason,
             "media_ids": media_ids,
@@ -940,20 +968,34 @@ class SeedWatch(_PluginBase):
                 "quality": 0,
                 "resolution": 0,
                 "path": None,
+                "history_version": None,
             }
-            try:
-                server = getattr(exist_info, "server", None)
-                itemid = getattr(exist_info, "itemid", None)
-                if server and itemid:
-                    detail = self.chain.iteminfo(server=server, item_id=itemid)
-                    path = getattr(detail, "path", None) if detail else None
-                    if path:
-                        info["path"] = path
-                        info["quality"] = _quality_level(path, "")
-                        info["resolution"] = _resolution_level(path)
-            except Exception as e:
-                # 拿不到画质不影响存在判定，仅降级为未知
-                logger.debug(f"【种子监控】获取库内条目画质失败：{e}")
+            # 电影洗版：优先用下载历史最新记录的种子标题作为"库内版本"（信息比 strm 文件名更全）
+            if category == MediaType.MOVIE.value and any(media_ids.values()):
+                records = self._downloaded(media_ids)
+                if records:
+                    latest = max(records, key=lambda r: getattr(r, "date", None) or "")
+                    vtext = " ".join(filter(None, [
+                        getattr(latest, "torrent_name", None) or "",
+                        getattr(latest, "torrent_description", None) or "",
+                    ])).strip()
+                    if vtext:
+                        info["history_version"] = vtext
+            # 只有拿不到下载历史版本才需要 strm path（剧集不洗版，完全不需要 path）
+            if category == MediaType.MOVIE.value and not info["history_version"]:
+                try:
+                    server = getattr(exist_info, "server", None)
+                    itemid = getattr(exist_info, "itemid", None)
+                    if server and itemid:
+                        detail = self.chain.iteminfo(server=server, item_id=itemid)
+                        path = getattr(detail, "path", None) if detail else None
+                        if path:
+                            info["path"] = path
+                            info["quality"] = _quality_level(path, "")
+                            info["resolution"] = _resolution_level(path)
+                except Exception as e:
+                    # 拿不到画质不影响存在判定，仅降级为未知
+                    logger.debug(f"【种子监控】获取库内条目画质失败：{e}")
             if category == MediaType.TV.value and info["seasons"]:
                 info["desc"] = f"已有{len(info['seasons'])}季"
             return True, info
@@ -964,8 +1006,8 @@ class SeedWatch(_PluginBase):
                 logger.warning(f"【种子监控】媒体库查重失败，本轮同类错误将合并：{e}")
             return None, {}
 
-    def _downloaded(self, media_ids: dict) -> Optional[bool]:
-        """下载历史三态：True=有记录，False=确认没有，None=查询失败。"""
+    def _downloaded(self, media_ids: dict) -> Optional[list]:
+        """下载历史三态：有记录=返回记录列表，确认没有=[]，查询失败=None。"""
         try:
             from app.db.downloadhistory_oper import DownloadHistoryOper
             records = DownloadHistoryOper().get_by_mediaid(
@@ -974,7 +1016,7 @@ class SeedWatch(_PluginBase):
                 bangumiid=media_ids.get("bangumi_id"),
                 anilistid=media_ids.get("anilist_id"),
             )
-            return bool(records)
+            return list(records or [])
         except Exception as e:
             count = self._diag_inc("download_error")
             if count <= 1:
@@ -1009,6 +1051,7 @@ class SeedWatch(_PluginBase):
                     mtype=NotificationType.Plugin,
                     title=message_title,
                     text=self._format_mixed_groups(items),
+                    parse_mode="HTML",
                 )
                 sent_items.extend(items)
             except Exception as e:
@@ -1097,6 +1140,7 @@ class SeedWatch(_PluginBase):
                     "title": hit["title"],
                     "category": hit.get("category"),
                     "reason": hit.get("reason", ""),
+                    "quality_tag": hit.get("quality_tag", ""),
                     "torrent_count": 0,
                     "sites": [],
                     "sizes": [],
@@ -1120,11 +1164,14 @@ class SeedWatch(_PluginBase):
             item["raw_titles"].append(hit.get("raw_title", ""))
         return [merged_map[k] for k in order_keys]
 
+    # 剧集/电影/洗版/人工核对是否显示画质标签
+    _TAG_KINDS = {"movie", "upgrade", "manual"}
+
     def _format_group(self, label: str, items: List[dict]) -> str:
-        """渲染一个类别块"""
-        lines = [f"{label}（{len(items)}）"]
+        """渲染一个类别块（HTML 富文本：分类标题加粗，电影画质标签等宽高亮）"""
+        lines = [f"<b>{html.escape(label)}（{len(items)}）</b>"]
         for item in items:
-            sites = "/".join(item["sites"]) or "未知站"
+            sites = html.escape("/".join(item["sites"]) or "未知站")
             count = item["torrent_count"]
             torrent_desc = f"{count}个种子" if count > 1 else "1个种子"
             sizes = item["sizes"]
@@ -1137,12 +1184,17 @@ class SeedWatch(_PluginBase):
             pub = item.get("pub_min")
             if pub is None:
                 pub_desc = ""
-            elif count > 1:
-                pub_desc = f" | 最近发布{pub}分钟前"
             else:
-                pub_desc = f" | 发布{pub}分钟前"
+                pub_desc = f" | {int(pub)}分钟前"
+            # 电影/洗版/人工核对行显示画质标签（等宽高亮）；剧集行不显示
+            tag_desc = ""
+            if item.get("kind") in self._TAG_KINDS:
+                tag = item.get("quality_tag") or ""
+                if tag:
+                    tag_desc = f" | <code>{html.escape(tag)}</code>"
+            title = html.escape(item["title"])
             lines.append(
-                f"• 《{item['title']}》{torrent_desc} · {sites} | {size_desc}{pub_desc}"
+                f"• 《{title}》{torrent_desc} · {sites} | {size_desc}{tag_desc}{pub_desc}"
             )
         return "\n".join(lines)
 
