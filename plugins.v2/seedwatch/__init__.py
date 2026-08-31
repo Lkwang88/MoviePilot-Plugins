@@ -28,7 +28,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.2.1"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
@@ -189,6 +189,31 @@ _PAGE_STYLE_CSS = {
 }
 .sw-push { font-size: .7rem; opacity: .5; white-space: nowrap; }
 .sw-empty { text-align: center; opacity: .6; padding: 24px 0; font-size: .85rem; }
+.sw-details {
+    border: 1px solid rgba(var(--v-theme-on-surface), .09);
+    border-radius: 10px;
+    background: rgba(var(--v-theme-surface), .4);
+    overflow: hidden;
+}
+.sw-details + .sw-details { margin-top: 12px; }
+.sw-details-head {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 10px 14px; cursor: pointer; list-style: none;
+    user-select: none;
+}
+.sw-details-head::-webkit-details-marker { display: none; }
+.sw-details[open] > .sw-details-head {
+    border-bottom: 1px dashed rgba(var(--v-theme-on-surface), .09);
+}
+.sw-day-body {
+    padding: 4px 14px 10px;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 400px;
+}
+.sw-range {
+    font-family: monospace; font-size: .72rem; opacity: .55; white-space: nowrap;
+}
+.sw-omit { text-align: center; opacity: .55; padding: 6px 0; font-size: .75rem; }
 """,
 }
 
@@ -561,14 +586,75 @@ class SeedWatch(_PluginBase):
             "clear_seen": False,
         }
 
+    # 详情页单次渲染的行数硬上限：超出从最旧的天整组省略，页面绝不被撑爆
+    _MAX_PAGE_ROWS = 350
+
+    @staticmethod
+    def _page_row_nodes(item: dict, show_range: bool = False) -> List[dict]:
+        """渲染一行作品记录（按天视图与汇总视图共用）"""
+        nodes: List[dict] = [
+            {"component": "span", "props": {"class": "sw-time"},
+             "text": item["first_hhmm"]},
+            {"component": "span", "props": {"class": "sw-title"},
+             "text": f"《{item['title']}》"},
+        ]
+        if show_range and item.get("last_date") and item["last_date"] != item.get("first_date"):
+            nodes.append({
+                "component": "span",
+                "props": {"class": "sw-range"},
+                "text": f"{item['first_date'][5:]}~{item['last_date'][5:]}",
+            })
+        nodes.append({
+            "component": "span",
+            "props": {"class": "sw-meta"},
+            "text": " · ".join(filter(None, [
+                f"{item['torrent_count']}个种子",
+                "/".join(item["sites"]),
+            ])),
+        })
+        if item.get("quality_tag"):
+            nodes.append({
+                "component": "span",
+                "props": {"class": "sw-tag"},
+                "text": item["quality_tag"],
+            })
+        if item.get("pushes", 1) > 1:
+            nodes.append({
+                "component": "span",
+                "props": {"class": "sw-push"},
+                "text": f"推送{item['pushes']}次",
+            })
+        return nodes
+
+    @classmethod
+    def _page_group_nodes(cls, group: dict) -> List[dict]:
+        """渲染一个类型分组（标题 + 若干行）"""
+        nodes: List[dict] = [{
+            "component": "div",
+            "props": {"class": "sw-group-title"},
+            "text": f"{group['label']}（{len(group['items'])}）",
+        }]
+        for item in group["items"]:
+            nodes.append({
+                "component": "div",
+                "props": {"class": "sw-row"},
+                "content": cls._page_row_nodes(item),
+            })
+        return nodes
+
     def get_page(self) -> Optional[list]:
-        """详情页：通知记录按天去重聚合 + 扫描状态（纯后端组件树，仿官方 autosignin 模式）"""
+        """详情页：通知记录按天折叠展示（今天默认展开）+ 7 天汇总去重 + 扫描状态。
+
+        性能设计：
+        - 原生 details 折叠 + content-visibility，收起内容浏览器跳过渲染
+        - 渲染行数硬上限 _MAX_PAGE_ROWS，超出从最旧的天整组省略
+        """
         days_data = self._grouped_notify_history(days=7)
+        summary_data = self._grouped_notify_summary(days=7)
         scan_text = self._scan_status_text()
         today = datetime.now().strftime("%Y-%m-%d")
         today_data = next((d for d in days_data if d["date"] == today), None)
 
-        # 顶部汇总（今天）
         if today_data:
             summary_text = (
                 f"今天 {today_data['total_works']} 部作品 / "
@@ -597,76 +683,108 @@ class SeedWatch(_PluginBase):
             }
         ]
 
-        if not days_data:
+        if not days_data and not summary_data["groups"]:
             sections.append({
                 "component": "div",
                 "props": {"class": "sw-empty"},
                 "text": "暂无通知记录。插件命中新内容推送后，会自动记录在这里。",
             })
-            return [_PAGE_STYLE_CSS, {"component": "div", "props": {"class": "sw-page"}, "content": sections}]
+            return [
+                _PAGE_STYLE_CSS,
+                {"component": "div", "props": {"class": "sw-page"}, "content": sections},
+            ]
+
+        # 行数预算：超出上限时从最旧的天整组省略（汇总视图是聚合行，保留）
+        omitted = 0
+        while (
+            days_data
+            and sum(
+                len(g["items"]) for d in days_data for g in d["groups"]
+            ) > self._MAX_PAGE_ROWS
+            and len(days_data) > 1
+        ):
+            dropped = days_data.pop()
+            omitted += sum(len(g["items"]) for g in dropped["groups"])
 
         for day in days_data:
-            day_block: List[dict] = [
-                {
-                    "component": "div",
-                    "props": {"class": "sw-day-head"},
-                    "content": [
-                        {"component": "span", "props": {"class": "sw-day-title"},
-                         "text": day["date_label"]},
-                        {"component": "span", "props": {"class": "sw-day-sub"},
-                         "text": f"{day['total_works']} 部作品 / {day['total_seeds']} 个种子"},
-                    ],
-                }
-            ]
+            is_today = day["date"] == today
+            day_content: List[dict] = []
             for group in day["groups"]:
-                day_block.append({
+                day_content.extend(self._page_group_nodes(group))
+            sections.append({
+                "component": "details",
+                "props": {
+                    "class": "sw-details",
+                    **({"open": True} if is_today else {}),
+                },
+                "content": [
+                    {
+                        "component": "summary",
+                        "props": {"class": "sw-details-head"},
+                        "content": [
+                            {"component": "span", "props": {"class": "sw-day-title"},
+                             "text": day["date_label"]},
+                            {"component": "span", "props": {"class": "sw-day-sub"},
+                             "text": f"{day['total_works']} 部作品 / {day['total_seeds']} 个种子"},
+                        ],
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "sw-day-body"},
+                        "content": day_content,
+                    },
+                ],
+            })
+
+        if omitted:
+            sections.append({
+                "component": "div",
+                "props": {"class": "sw-omit"},
+                "text": f"已省略更早的 {omitted} 行旧记录（数据保留上限内自动淘汰）",
+            })
+
+        # 7 天汇总（跨天去重，key=类型+作品）
+        if summary_data["groups"]:
+            summary_content: List[dict] = []
+            for group in summary_data["groups"]:
+                summary_content.append({
                     "component": "div",
                     "props": {"class": "sw-group-title"},
                     "text": f"{group['label']}（{len(group['items'])}）",
                 })
                 for item in group["items"]:
-                    row_content: List[dict] = [
-                        {"component": "span", "props": {"class": "sw-time"},
-                         "text": item["first_hhmm"]},
-                        {"component": "span", "props": {"class": "sw-title"},
-                         "text": f"《{item['title']}》"},
-                        {
-                            "component": "span",
-                            "props": {"class": "sw-meta"},
-                            "text": " · ".join(filter(None, [
-                                f"{item['torrent_count']}个种子",
-                                "/".join(item["sites"]),
-                            ])),
-                        },
-                    ]
-                    if item.get("quality_tag"):
-                        row_content.append({
-                            "component": "span",
-                            "props": {"class": "sw-tag"},
-                            "text": item["quality_tag"],
-                        })
-                    if item["pushes"] > 1:
-                        row_content.append({
-                            "component": "span",
-                            "props": {"class": "sw-push"},
-                            "text": f"推送{item['pushes']}次",
-                        })
-                    day_block.append({
+                    summary_content.append({
                         "component": "div",
                         "props": {"class": "sw-row"},
-                        "content": row_content,
+                        "content": self._page_row_nodes(item, show_range=True),
                     })
             sections.append({
-                "component": "div",
-                "props": {"class": "sw-card sw-day"},
-                "content": day_block,
+                "component": "details",
+                "props": {"class": "sw-details"},
+                "content": [
+                    {
+                        "component": "summary",
+                        "props": {"class": "sw-details-head"},
+                        "content": [
+                            {"component": "span", "props": {"class": "sw-day-title"},
+                             "text": "📋 7 天汇总（跨天去重）"},
+                            {"component": "span", "props": {"class": "sw-day-sub"},
+                             "text": f"{summary_data['total_works']} 部作品 / "
+                                     f"{summary_data['total_seeds']} 个种子"},
+                        ],
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "sw-day-body"},
+                        "content": summary_content,
+                    },
+                ],
             })
 
         return [
             _PAGE_STYLE_CSS,
             {"component": "div", "props": {"class": "sw-page"}, "content": sections},
         ]
-
     # ------------------------------------------------------------------ 数据
     def _get_data(self, key: str, default: Any = None) -> Any:
         try:
@@ -1472,6 +1590,73 @@ class SeedWatch(_PluginBase):
             f"上次扫描 {prefix} {hhmm} · 缓存{run.get('source_count', 0)}"
             f" | 新{run.get('seen_added', 0)} | 命中{run.get('hits', 0)} | 正常"
         )
+
+    def _grouped_notify_summary(self, days: int = 7) -> dict:
+        """近 N 天全量汇总去重（key=类型+作品，跨天合并）。
+
+        返回 {"groups": [...], "total_works": N, "total_seeds": M}；
+        组内作品按最近推送时间倒序。行字段含推送时间范围。
+        """
+        log = self._get_data(self._NOTIFY_LOG_KEY, []) or []
+        cutoff = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        buckets: Dict[str, Dict[str, dict]] = {}
+        for entry in log:
+            ts = str(entry.get("time") or "")
+            if len(ts) < 16 or ts[:10] < cutoff:
+                continue
+            kind = str(entry.get("kind") or "other")
+            title = str(entry.get("title") or "未知")
+            bucket = (
+                buckets
+                .setdefault(kind, {})
+                .setdefault(title, {
+                    "title": title,
+                    "kind": kind,
+                    "sites": [],
+                    "torrent_count": 0,
+                    "quality_tag": "",
+                    "first_date": ts[:10],
+                    "last_date": ts[:10],
+                    "first_hhmm": ts[11:16],
+                    "last_hhmm": ts[11:16],
+                    "pushes": 0,
+                })
+            )
+            bucket["pushes"] += 1
+            bucket["torrent_count"] += int(entry.get("torrent_count") or 1)
+            for site in str(entry.get("site") or "").split("/"):
+                site = site.strip()
+                if site and site not in bucket["sites"]:
+                    bucket["sites"].append(site)
+            if not bucket["quality_tag"]:
+                bucket["quality_tag"] = str(entry.get("quality_tag") or "")
+            if ts[:10] < bucket["first_date"]:
+                bucket["first_date"] = ts[:10]
+            if ts[:10] > bucket["last_date"]:
+                bucket["last_date"] = ts[:10]
+            if ts[11:16] < bucket["first_hhmm"]:
+                bucket["first_hhmm"] = ts[11:16]
+            if ts[11:16] > bucket["last_hhmm"]:
+                bucket["last_hhmm"] = ts[11:16]
+
+        groups = []
+        for kind, label in self._KIND_LABELS:
+            items_map = buckets.get(kind) or {}
+            if not items_map:
+                continue
+            groups.append({
+                "kind": kind,
+                "label": label,
+                "items": sorted(
+                    items_map.values(), key=lambda x: (x["last_date"], x["last_hhmm"]),
+                    reverse=True,
+                ),
+            })
+        return {
+            "groups": groups,
+            "total_works": sum(len(g["items"]) for g in groups),
+            "total_seeds": sum(i["torrent_count"] for g in groups for i in g["items"]),
+        }
 
     # ------------------------------------------------------------------ 报告
     def _new_run_report(self) -> dict:
