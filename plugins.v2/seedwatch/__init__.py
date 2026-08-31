@@ -19,7 +19,7 @@ import html
 import re
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.chain.torrents import TorrentsChain
@@ -28,7 +28,7 @@ from app.plugins import _PluginBase
 from app.schemas.types import MediaType, NotificationType
 
 # 版本
-PLUGIN_VERSION = "0.1.9"
+PLUGIN_VERSION = "0.2.0"
 
 # 画质等级（数字越大越好；v1 仅用于通知文案展示）
 # 4=DV+HDR(P8) 3=DV 2=HDR10+ 1=HDR 0=SDR/未知
@@ -153,6 +153,46 @@ def _display_quality_tag(text: str) -> str:
     return " ".join(parts)
 
 
+# 详情页样式（MP 深浅色主题自适应，仿官方插件 style 组件模式）
+_PAGE_STYLE_CSS = {
+    "component": "style",
+    "text": """
+.sw-page { display: flex; flex-direction: column; gap: 12px; }
+.sw-card {
+    padding: 12px 16px;
+    border-radius: 10px;
+    border: 1px solid rgba(var(--v-theme-on-surface), .09);
+    background: rgba(var(--v-theme-surface), .4);
+}
+.sw-summary { display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.sw-summary-main { font-size: 1.05rem; font-weight: 700; }
+.sw-days { font-size: .75rem; opacity: .6; }
+.sw-scan { margin-top: 6px; font-size: .75rem; opacity: .65; font-family: monospace; }
+.sw-day-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.sw-day-title { font-weight: 700; font-size: .95rem; }
+.sw-day-sub { font-size: .72rem; opacity: .6; }
+.sw-group-title { font-weight: 600; margin: 10px 0 2px; font-size: .88rem; }
+.sw-row {
+    display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+    padding: 5px 0;
+    border-bottom: 1px dashed rgba(var(--v-theme-on-surface), .07);
+}
+.sw-row:last-child { border-bottom: none; }
+.sw-time { font-family: monospace; font-size: .78rem; opacity: .65; min-width: 38px; }
+.sw-title { font-weight: 600; }
+.sw-meta { opacity: .75; font-size: .82rem; }
+.sw-tag {
+    font-family: monospace; font-size: .72rem; padding: 1px 6px; border-radius: 4px;
+    background: rgba(var(--v-theme-primary), .14);
+    color: rgb(var(--v-theme-primary));
+    white-space: nowrap;
+}
+.sw-push { font-size: .7rem; opacity: .5; white-space: nowrap; }
+.sw-empty { text-align: center; opacity: .6; padding: 24px 0; font-size: .85rem; }
+""",
+}
+
+
 def _pub_minutes_of(pubdate: Optional[str]) -> Optional[int]:
     """解析 v2 的 pubdate 字符串（YYYY-MM-DD HH:MM:SS）为发布距今分钟数；无法解析返回 None"""
     if not pubdate:
@@ -186,7 +226,7 @@ class SeedWatch(_PluginBase):
 
     # 上限
     _MAX_SEEN = 5000
-    _MAX_NOTIFY_LOG = 100
+    _MAX_NOTIFY_LOG = 500
     _MAX_PENDING = 200
 
     # 运行状态（实例级）
@@ -522,8 +562,110 @@ class SeedWatch(_PluginBase):
         }
 
     def get_page(self) -> Optional[list]:
-        """详情页：暂无（v0.1 只读数据在运行报告里）"""
-        return None
+        """详情页：通知记录按天去重聚合 + 扫描状态（纯后端组件树，仿官方 autosignin 模式）"""
+        days_data = self._grouped_notify_history(days=7)
+        scan_text = self._scan_status_text()
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_data = next((d for d in days_data if d["date"] == today), None)
+
+        # 顶部汇总（今天）
+        if today_data:
+            summary_text = (
+                f"今天 {today_data['total_works']} 部作品 / "
+                f"{today_data['total_seeds']} 个种子"
+            )
+        else:
+            summary_text = "今天暂无推送记录"
+
+        sections: List[dict] = [
+            {
+                "component": "div",
+                "props": {"class": "sw-card"},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "sw-summary"},
+                        "content": [
+                            {"component": "span", "props": {"class": "sw-summary-main"},
+                             "text": summary_text},
+                            {"component": "span", "props": {"class": "sw-days"},
+                             "text": f"近 7 天 {len(days_data)} 天有记录"},
+                        ],
+                    },
+                    {"component": "div", "props": {"class": "sw-scan"}, "text": scan_text},
+                ],
+            }
+        ]
+
+        if not days_data:
+            sections.append({
+                "component": "div",
+                "props": {"class": "sw-empty"},
+                "text": "暂无通知记录。插件命中新内容推送后，会自动记录在这里。",
+            })
+            return [_PAGE_STYLE_CSS, {"component": "div", "props": {"class": "sw-page"}, "content": sections}]
+
+        for day in days_data:
+            day_block: List[dict] = [
+                {
+                    "component": "div",
+                    "props": {"class": "sw-day-head"},
+                    "content": [
+                        {"component": "span", "props": {"class": "sw-day-title"},
+                         "text": day["date_label"]},
+                        {"component": "span", "props": {"class": "sw-day-sub"},
+                         "text": f"{day['total_works']} 部作品 / {day['total_seeds']} 个种子"},
+                    ],
+                }
+            ]
+            for group in day["groups"]:
+                day_block.append({
+                    "component": "div",
+                    "props": {"class": "sw-group-title"},
+                    "text": f"{group['label']}（{len(group['items'])}）",
+                })
+                for item in group["items"]:
+                    row_content: List[dict] = [
+                        {"component": "span", "props": {"class": "sw-time"},
+                         "text": item["first_hhmm"]},
+                        {"component": "span", "props": {"class": "sw-title"},
+                         "text": f"《{item['title']}》"},
+                        {
+                            "component": "span",
+                            "props": {"class": "sw-meta"},
+                            "text": " · ".join(filter(None, [
+                                f"{item['torrent_count']}个种子",
+                                "/".join(item["sites"]),
+                            ])),
+                        },
+                    ]
+                    if item.get("quality_tag"):
+                        row_content.append({
+                            "component": "span",
+                            "props": {"class": "sw-tag"},
+                            "text": item["quality_tag"],
+                        })
+                    if item["pushes"] > 1:
+                        row_content.append({
+                            "component": "span",
+                            "props": {"class": "sw-push"},
+                            "text": f"推送{item['pushes']}次",
+                        })
+                    day_block.append({
+                        "component": "div",
+                        "props": {"class": "sw-row"},
+                        "content": row_content,
+                    })
+            sections.append({
+                "component": "div",
+                "props": {"class": "sw-card sw-day"},
+                "content": day_block,
+            })
+
+        return [
+            _PAGE_STYLE_CSS,
+            {"component": "div", "props": {"class": "sw-page"}, "content": sections},
+        ]
 
     # ------------------------------------------------------------------ 数据
     def _get_data(self, key: str, default: Any = None) -> Any:
@@ -1214,7 +1356,7 @@ class SeedWatch(_PluginBase):
             return "?"
 
     def _log_notify(self, merged: List[dict]):
-        """记录通知历史（合并后的条目）"""
+        """记录通知历史（合并后的条目；quality_tag 供详情页展示）"""
         log = self._get_data(self._NOTIFY_LOG_KEY, []) or []
         now = self._now_iso()
         for item in merged:
@@ -1225,9 +1367,111 @@ class SeedWatch(_PluginBase):
                 "site": "/".join(item.get("sites") or []),
                 "reason": item.get("reason", ""),
                 "torrent_count": item.get("torrent_count", 1),
+                "quality_tag": item.get("quality_tag", ""),
             })
         log = log[-self._MAX_NOTIFY_LOG:]
         self._save_data(self._NOTIFY_LOG_KEY, log)
+
+    # ------------------------------------------------------------------ 详情页
+    def _grouped_notify_history(self, days: int = 7) -> List[dict]:
+        """通知历史按「日期+类型+作品」聚合去重，供详情页展示。
+
+        - 同一作品同一天多次推送（跨站点/跨轮次）合并为一行
+        - 站点取并集，种子数累加，时间取最早一次，重复次数单独标记
+        - 返回日期倒序分组；每组内作品按最近推送时间倒序
+        """
+        log = self._get_data(self._NOTIFY_LOG_KEY, []) or []
+        keys: Dict[str, Dict[str, Dict[str, dict]]] = {}
+        for entry in log:
+            ts = str(entry.get("time") or "")
+            if len(ts) < 16:
+                continue
+            date = ts[:10]
+            hhmm = ts[11:16]
+            kind = str(entry.get("kind") or "other")
+            title = str(entry.get("title") or "未知")
+            bucket = (
+                keys.setdefault(date, {})
+                .setdefault(kind, {})
+                .setdefault(title, {
+                    "title": title,
+                    "kind": kind,
+                    "sites": [],
+                    "torrent_count": 0,
+                    "quality_tag": "",
+                    "first_hhmm": hhmm,
+                    "last_hhmm": hhmm,
+                    "pushes": 0,
+                })
+            )
+            bucket["pushes"] += 1
+            bucket["torrent_count"] += int(entry.get("torrent_count") or 1)
+            for site in str(entry.get("site") or "").split("/"):
+                site = site.strip()
+                if site and site not in bucket["sites"]:
+                    bucket["sites"].append(site)
+            if not bucket["quality_tag"]:
+                bucket["quality_tag"] = str(entry.get("quality_tag") or "")
+            if hhmm < bucket["first_hhmm"]:
+                bucket["first_hhmm"] = hhmm
+            if hhmm > bucket["last_hhmm"]:
+                bucket["last_hhmm"] = hhmm
+
+        cutoff = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
+        result: List[dict] = []
+        for date in sorted(keys.keys(), reverse=True):
+            if date < cutoff:
+                continue
+            groups = []
+            for kind, _label in self._KIND_LABELS:
+                items_map = keys[date].get(kind) or {}
+                if not items_map:
+                    continue
+                items = sorted(
+                    items_map.values(), key=lambda x: x["last_hhmm"], reverse=True
+                )
+                groups.append({
+                    "kind": kind,
+                    "label": dict(self._KIND_LABELS).get(kind, kind),
+                    "items": items,
+                })
+            if not groups:
+                continue
+            total_works = sum(len(g["items"]) for g in groups)
+            total_seeds = sum(
+                i["torrent_count"] for g in groups for i in g["items"]
+            )
+            try:
+                date_label = f"{datetime.strptime(date, '%Y-%m-%d').month}月{datetime.strptime(date, '%Y-%m-%d').day}日"
+            except Exception:
+                date_label = date
+            if date == today:
+                date_label += "（今天）"
+            result.append({
+                "date": date,
+                "date_label": date_label,
+                "total_works": total_works,
+                "total_seeds": total_seeds,
+                "groups": groups,
+            })
+        return result
+
+    def _scan_status_text(self) -> str:
+        """最近一轮扫描的简短状态（详情页顶部展示）"""
+        run = self._get_data(self._RUN_KEY, {}) or {}
+        if not run:
+            return "尚未运行过扫描"
+        started = str(run.get("started_at") or "")
+        hhmm = started[11:16] if len(started) >= 16 else "--:--"
+        day = started[:10]
+        prefix = "今天" if day == datetime.now().strftime("%Y-%m-%d") else (day or "未知")
+        if run.get("error"):
+            return f"上次扫描 {prefix} {hhmm} · 异常：{run.get('error')}"
+        return (
+            f"上次扫描 {prefix} {hhmm} · 缓存{run.get('source_count', 0)}"
+            f" | 新{run.get('seen_added', 0)} | 命中{run.get('hits', 0)} | 正常"
+        )
 
     # ------------------------------------------------------------------ 报告
     def _new_run_report(self) -> dict:
