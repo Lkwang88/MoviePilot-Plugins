@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     from app.chain import ChainBase
     from app.core.config import settings
+    from app.core.plugin import PluginManager
     from app.log import logger
     from app.plugins import _PluginBase
     from app.schemas import Notification, Response
@@ -42,6 +43,7 @@ try:
 except Exception:  # pragma: no cover - 本地单元测试环境无 MP 宿主
     ChainBase = type("ChainBase", (), {})
     settings = None
+    PluginManager = None
 
     class _FallbackLogger:
         @staticmethod
@@ -96,7 +98,7 @@ except Exception:  # pragma: no cover - 本地单元测试环境无 MP 宿主
         Plugin = "插件"
 
 # 版本
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "1.2"
 
 # 消息对象上的归属标记（私有属性，Pydantic 字段之外，不参与序列化/入库）
 MARKER = "_otr_owner"
@@ -271,8 +273,25 @@ class OguraTopicRouter(_PluginBase):
                     self._config_errors.append(f"默认话题ID「{default_raw}」应为正整数，已忽略")
                     self._default_tid = None
 
-        # 解析路由规则（插件ID=话题ID 或 type:类型=话题ID）
-        for idx, line in enumerate((routes_text or "").splitlines(), start=1):
+        # 新版配置：每插件一键 route_<插件ID> = 话题ID（配置页动态清单写入）
+        for key, raw in (config or {}).items():
+            if not key.startswith("route_"):
+                continue
+            pid = key[6:].strip()
+            raw = str(raw or "").strip()
+            if not pid or not raw:
+                continue  # 空 = 不接管
+            tid = _norm_chat_int(raw)
+            if tid is None or tid <= 0:
+                self._config_errors.append(
+                    f"插件 {pid} 的话题ID「{raw}」无效（应为正整数），已忽略"
+                )
+                continue
+            self._plugin_routes[pid] = tid
+
+        # 旧版兼容：routes 文本行（v0.1.0 手写格式），只补位不覆盖新版键
+        routes_text = str((config or {}).get("routes") or "")
+        for idx, line in enumerate(routes_text.splitlines(), start=1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -293,7 +312,8 @@ class OguraTopicRouter(_PluginBase):
             if key.lower().startswith("type:"):
                 self._type_routes[key[5:].strip()] = tid
             else:
-                self._plugin_routes[key] = tid
+                # 新版 route_ 键优先，旧文本只补位
+                self._plugin_routes.setdefault(key, tid)
 
         # 装载历史路由日志（详情页展示）
         try:
@@ -360,16 +380,16 @@ class OguraTopicRouter(_PluginBase):
             "chain_norm", ChainBase, "_normalize_notification_for_dispatch",
             _wrap_chain_normalize,
         )
-        # 3) 模块入口：TelegramModule.post_message + 媒体列表/种子信息两个旁路
-        status["模块入口"] = self._patch_one(
-            "tg_module", TelegramModule, "post_message", _wrap_tg_module_post
-        )
-        self._patch_one(
-            "tg_module_medias", TelegramModule, "post_medias_message", _wrap_tg_module_post
-        )
-        self._patch_one(
-            "tg_module_torrents", TelegramModule, "post_torrents_message", _wrap_tg_module_post
-        )
+        # 3) 模块入口：TelegramModule 三个消息入口（各自独立补丁标记）
+        entry_ok = True
+        for key, attr in [
+            ("tg_module", "post_message"),
+            ("tg_module_medias", "post_medias_message"),
+            ("tg_module_torrents", "post_torrents_message"),
+        ]:
+            ok = self._patch_one(key, TelegramModule, attr, _make_tg_entry_wrapper(key))
+            entry_ok = entry_ok and ok
+        status["模块入口"] = entry_ok
         # 4) 底层发送注入：三个 send 分支都要能透传 message_thread_id
         inject_ok = True
         for key, attr in [
@@ -666,14 +686,25 @@ class OguraTopicRouter(_PluginBase):
         if not owner:
             return Response(success=False, message="缺少插件ID参数")
         try:
-            config = self.get_config() or {}
+            config = dict(self.get_config() or {})
+            removed = False
+            # 新版：route_<插件ID> 键
+            if f"route_{owner}" in config:
+                config.pop(f"route_{owner}")
+                removed = True
+            # 旧版兼容：routes 文本行
             routes_text = str(config.get("routes") or "")
-            lines = [
-                ln for ln in routes_text.splitlines()
-                if ln.strip() and not ln.strip().startswith("#")
-                and ln.split("=", 1)[0].strip() != owner
-            ]
-            config["routes"] = "\n".join(lines)
+            if routes_text:
+                lines = [
+                    ln for ln in routes_text.splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                    and ln.split("=", 1)[0].strip() != owner
+                ]
+                if "\n".join(lines) != routes_text:
+                    config["routes"] = "\n".join(lines)
+                    removed = True
+            if not removed:
+                return Response(success=False, message=f"{owner} 没有配置路由规则")
             self.update_config(config)
             self.init_plugin(config)
             logger.info(f"【话题路由】已删除 {owner} 的路由规则")
@@ -693,9 +724,95 @@ class OguraTopicRouter(_PluginBase):
         return Response(success=True, message="路由日志已清空")
 
     # ------------------------------------------------------------------ 配置页
+    def _installed_plugins(self) -> List[Tuple[str, str]]:
+        """
+        已安装插件清单 [(插件ID, 显示名)]，按显示名排序，排除自身。
+        任何失败返回空清单（配置页会给出提示，不阻塞表单渲染）。
+        """
+        try:
+            pm = PluginManager()
+            plugins = getattr(pm, "_plugins", None) or {}
+            items: List[Tuple[str, str]] = []
+            for pid, cls in plugins.items():
+                if pid == self.__class__.__name__:
+                    continue
+                name = getattr(cls, "plugin_name", "") or pid
+                items.append((pid, name))
+            return sorted(items, key=lambda x: x[1])
+        except Exception:
+            return []
+
+    def _plugin_display_map(self) -> Dict[str, str]:
+        """插件ID → 显示名（用于详情页展示）"""
+        return {pid: name for pid, name in self._installed_plugins()}
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """插件配置页面（Vuetify JSON）"""
-        return [
+        """
+        插件配置页面（Vuetify JSON，动态生成）：
+        每个已安装插件一行，填话题 ID 即接管该插件，无需手写插件 ID。
+        """
+        saved = {}
+        try:
+            saved = self.get_config() or {}
+        except Exception:
+            saved = {}
+        defaults: Dict[str, Any] = {
+            "enabled": False,
+            "debug": False,
+            "group_id": "",
+            "default_thread_id": "",
+        }
+        # 已安装插件都给 defaults：已配置的回显话题ID，未配置的空值
+        for pid in [pid for pid, _ in self._installed_plugins()]:
+            defaults[f"route_{pid}"] = str(self._plugin_routes.get(pid, ""))
+        # 未安装但历史配置过的插件也回显（插件停用时规则不丢）
+        for pid, tid in self._plugin_routes.items():
+            defaults.setdefault(f"route_{pid}", str(tid))
+
+        plugins = self._installed_plugins()
+        if plugins:
+            # 每行两个插件，紧凑排布
+            plugin_rows: List[dict] = []
+            for i in range(0, len(plugins), 2):
+                cols = []
+                for pid, name in plugins[i:i + 2]:
+                    cols.append({
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [{
+                            "component": "VTextField",
+                            "props": {
+                                "model": f"route_{pid}",
+                                "label": name,
+                                "placeholder": "话题ID，留空不接管",
+                                "hint": f"插件ID：{pid}",
+                                "persistent-hint": True,
+                                "type": "number",
+                            },
+                        }],
+                    })
+                plugin_rows.append({"component": "VRow", "content": cols})
+        else:
+            plugin_rows = [{
+                "component": "VRow",
+                "content": [{
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [{
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "text": (
+                                "暂时读不到已安装插件清单（可能是 MP 正在启动或插件尚未加载）。"
+                                "保存后重新打开配置页即可看到插件清单。"
+                            ),
+                        },
+                    }],
+                }],
+            }]
+
+        form = [
             {
                 "component": "VForm",
                 "content": [
@@ -713,11 +830,10 @@ class OguraTopicRouter(_PluginBase):
                                             "variant": "tonal",
                                             "title": "🔀 小仓酱的消息话题路由",
                                             "text": (
-                                                "把插件发出的通知自动改道到 Telegram 群组话题里按插件隔离显示。"
+                                                "在下方插件清单里给需要的插件填话题 ID，即接管它的通知路由（留空不接管）。"
                                                 "只拦截插件消息：系统通知、私聊、带按钮的交互消息一律不动；"
-                                                "没配规则的插件照常发送，不会丢消息也不会重复发。"
-                                                "路由规则格式：插件ID=话题ID，每行一条，# 开头为注释；"
-                                                "类型兜底写 type:Plugin=话题ID（可选）。"
+                                                "未配置的插件照常发送，不会丢消息也不会重复发。"
+                                                "话题 ID 用详情页「扫描/刷新话题」获取。"
                                             ),
                                         },
                                     }
@@ -770,7 +886,7 @@ class OguraTopicRouter(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "default_thread_id",
-                                            "label": "默认话题ID（可选，未命中规则的插件消息进这里）",
+                                            "label": "默认话题ID（未配置插件的兜底）",
                                             "placeholder": "留空=未配置的插件保持原样",
                                         },
                                     }
@@ -778,56 +894,93 @@ class OguraTopicRouter(_PluginBase):
                             },
                         ],
                     },
+                    {"component": "VDivider", "props": {"class": "my-2"}},
                     {
                         "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "routes",
-                                            "label": "路由规则（每行一条：插件ID=话题ID）",
-                                            "placeholder": (
-                                                "# 种子监控 → 种子话题\n"
-                                                "SeedWatch=123\n"
-                                                "# 订阅补全 → 订阅话题\n"
-                                                "OguraSubscribePlus=456\n"
-                                                "# 其余插件消息按类型兜底（可选）\n"
-                                                "type:Plugin=789"
-                                            ),
-                                            "rows": 8,
-                                            "auto-grow": True,
-                                            "hint": "插件ID 就是插件类名（详情页的「已发现插件」表里可以直接看）；话题ID 用详情页「扫描话题」获取",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
+                        "content": [{
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [{
+                                "component": "p",
+                                "props": {"class": "text-h6 mb-0"},
+                                "text": "插件路由清单（填话题 ID 即接管，留空不接管）",
+                            }],
+                        }],
                     },
+                    *plugin_rows,
                 ],
             }
-        ], {
-            "enabled": False,
-            "debug": False,
-            "group_id": "",
-            "default_thread_id": "",
-            "routes": "",
-        }
+        ]
+        return form, defaults
 
     # ------------------------------------------------------------------ 详情页
     def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：状态卡 + 话题清单 + 已发现插件 + 路由日志"""
+        """插件详情页：状态卡 + 路由规则 + 话题清单 + 已发现插件 + 路由日志"""
         sections: List[dict] = []
         sections.append(self._page_status_card())
         sections.append(self._page_action_row())
+        sections.append(self._page_rules_table())
         sections.append(self._page_topics_table())
         sections.append(self._page_plugins_table())
         sections.append(self._page_route_log_table())
         return sections
+
+    def _page_rules_table(self) -> dict:
+        """路由规则表：每条规则一行，带测试/删除按钮（配置完立刻可测）"""
+        if not self._plugin_routes:
+            return self._page_alert(
+                "info", "还没有路由规则",
+                "在配置页的「插件路由清单」里给需要的插件填话题 ID 并保存，"
+                "这里就会出现规则和对应的测试按钮。",
+            )
+        display = self._plugin_display_map()
+        rows = []
+        for pid, tid in sorted(self._plugin_routes.items(), key=lambda x: x[1]):
+            rows.append({
+                "component": "tr",
+                "content": [
+                    {"component": "td", "text": display.get(pid) or pid},
+                    {"component": "td", "text": pid},
+                    {"component": "td", "text": str(tid)},
+                    {"component": "td", "content": [
+                        self._page_btn("测试", "test_route",
+                                       {"owner": pid, "token": settings.API_TOKEN},
+                                       color="primary"),
+                        self._page_btn("删规则", "del_route",
+                                       {"owner": pid, "token": settings.API_TOKEN},
+                                       color="error"),
+                    ]},
+                ],
+            })
+        return {
+            "component": "div",
+            "content": [
+                {
+                    "component": "p",
+                    "props": {"class": "text-h6 mt-2 mb-1"},
+                    "text": "路由规则（点「测试」发一条测试通知到对应话题）",
+                },
+                {
+                    "component": "VTable",
+                    "props": {"hover": True, "density": "compact"},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [{
+                                "component": "tr",
+                                "content": [
+                                    {"component": "th", "text": "插件"},
+                                    {"component": "th", "text": "插件ID"},
+                                    {"component": "th", "text": "话题ID"},
+                                    {"component": "th", "text": "操作"},
+                                ],
+                            }],
+                        },
+                        {"component": "tbody", "content": rows},
+                    ],
+                },
+            ],
+        }
 
     def _page_alert(self, level: str, title: str, text: str) -> dict:
         return {
@@ -1155,33 +1308,40 @@ def _wrap_chain_normalize(original):
     return wrapper
 
 
-def _wrap_tg_module_post(original):
-    """TelegramModule.post_message 包装：查路由 → 设置线程话题上下文"""
+def _make_tg_entry_wrapper(key: str):
+    """
+    TelegramModule 消息入口包装器工厂（post_message / post_medias_message /
+    post_torrents_message 三个入口共用，各自带独立补丁标记避免幂等检查串号）：
+    查路由 → 设置线程话题上下文 → 调原入口 → finally 清理。
+    """
 
-    def wrapper(inner_self, message, *args, **kwargs):
-        try:
-            _TLS.tid = None
-            _TLS.owner = None
-            router = _get_router()
-            if router is not None:
-                tid = router._resolve_thread(message)
-                if tid:
-                    _TLS.tid = tid
-                    try:
-                        _TLS.owner = getattr(message, MARKER, None)
-                    except Exception:
-                        _TLS.owner = None
-        except Exception:
-            _TLS.tid = None
-            _TLS.owner = None
-        try:
-            return original(inner_self, message, *args, **kwargs)
-        finally:
-            _TLS.tid = None
-            _TLS.owner = None
+    def _factory(original):
+        def wrapper(inner_self, message, *args, **kwargs):
+            try:
+                _TLS.tid = None
+                _TLS.owner = None
+                router = _get_router()
+                if router is not None:
+                    tid = router._resolve_thread(message)
+                    if tid:
+                        _TLS.tid = tid
+                        try:
+                            _TLS.owner = getattr(message, MARKER, None)
+                        except Exception:
+                            _TLS.owner = None
+            except Exception:
+                _TLS.tid = None
+                _TLS.owner = None
+            try:
+                return original(inner_self, message, *args, **kwargs)
+            finally:
+                _TLS.tid = None
+                _TLS.owner = None
 
-    wrapper.__otr_patched__ = "tg_module"
-    return wrapper
+        wrapper.__otr_patched__ = key
+        return wrapper
+
+    return _factory
 
 
 def _make_send_injector(key: str):

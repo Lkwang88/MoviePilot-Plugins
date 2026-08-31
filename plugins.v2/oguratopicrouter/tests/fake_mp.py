@@ -139,6 +139,24 @@ def chat_id_of(*_args):
     return None
 
 
+def register_fake_installed(plugin_id: str, plugin_name: str):
+    """往假 PluginManager 注册一个已安装插件类（供配置页动态清单测试）"""
+    import sys as _sys
+    pm = _sys.modules.get("app.core.plugin")
+    if pm is None:
+        return None
+    cls = type(plugin_id, (), {"plugin_name": plugin_name})
+    pm.PluginManager._plugins[plugin_id] = cls
+    return cls
+
+
+def clear_fake_installed():
+    import sys as _sys
+    pm = _sys.modules.get("app.core.plugin")
+    if pm is not None:
+        pm.PluginManager._plugins.clear()
+
+
 class FakeModuleManager:
     """假 ModuleManager：_running_modules 可由测试注入"""
     running: dict = {}
@@ -300,6 +318,20 @@ def install_fake_mp():
     sys.modules["app.core.module"] = module_module
     core_pkg.module = module_module
 
+    # 假 PluginManager（插件配置页动态枚举已安装插件用）
+    plugin_module = types.ModuleType("app.core.plugin")
+
+    class FakePluginManager:
+        # {插件ID: 类(需带 plugin_name 属性)}，测试用 register_fake_installed 注入
+        _plugins = {}
+
+        def __init__(self):
+            self.plugins = type(self)._plugins
+
+    plugin_module.PluginManager = FakePluginManager
+    sys.modules["app.core.plugin"] = plugin_module
+    core_pkg.plugin = plugin_module
+
     plugins_module = types.ModuleType("app.plugins")
     plugins_module._PluginBase = FakePluginBase
     sys.modules["app.plugins"] = plugins_module
@@ -320,11 +352,26 @@ def install_fake_mp():
     # 让 app.schemas.types 解析为子模块
     schemas_module.__path__ = []
 
+    # 假 PluginManager（插件配置页动态枚举已安装插件用）
+    plugin_module = types.ModuleType("app.core.plugin")
+
+    class FakePluginManager:
+        # {插件ID: 类(需带 plugin_name 属性)}
+        _plugins = {}
+
+        def __init__(self):
+            self.plugins = type(self)._plugins
+
+    plugin_module.PluginManager = FakePluginManager
+    sys.modules["app.core.plugin"] = plugin_module
+    core_pkg.plugin = plugin_module
+
     sys.modules["app"] = app_module
 
     def restore():
         for name in [
-            "app", "app.chain", "app.core", "app.core.config", "app.log",
+            "app", "app.chain", "app.core", "app.core.config", "app.core.module",
+            "app.core.plugin", "app.log",
             "app.plugins", "app.schemas", "app.schemas.types",
         ]:
             sys.modules.pop(name, None)

@@ -39,12 +39,16 @@ class StructureTest(unittest.TestCase):
     def test_patch_points_are_guarded(self):
         """所有 setattr 补丁必须包在 try/except 里（_patch_one 内部）"""
         self.assertIn("def _patch_one", SOURCE)
-        # 五个包装器工厂都要有补丁标记，注入器工厂用 key 标记
+        # 三个包装器工厂用字面量标记，两个 key 工厂用变量标记
         self.assertIn('wrapper.__otr_patched__ = "chain_post"', SOURCE)
         self.assertIn('wrapper.__otr_patched__ = "chain_norm"', SOURCE)
-        self.assertIn('wrapper.__otr_patched__ = "tg_module"', SOURCE)
-        self.assertIn("__otr_patched__ = key", SOURCE)  # 注入器工厂
+        self.assertIn("__otr_patched__ = key", SOURCE)  # 入口工厂+注入器工厂
         self.assertIn('wrapper.__otr_patched__ = "tg_request"', SOURCE)
+        # 三个模块入口共用入口工厂，各自独立标记
+        self.assertIn('_make_tg_entry_wrapper(key)', SOURCE)
+        self.assertIn('("tg_module", "post_message")', SOURCE)
+        self.assertIn('("tg_module_medias", "post_medias_message")', SOURCE)
+        self.assertIn('("tg_module_torrents", "post_torrents_message")', SOURCE)
 
     def test_scope_guards_present(self):
         """铁律守卫必须存在：私聊/交互/无标记/未启用"""

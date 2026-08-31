@@ -16,10 +16,32 @@ from fake_helpers import build_router, make_message  # noqa: E402
 
 
 class ConfigParseTest(unittest.TestCase):
-    """配置解析：路由规则行、群ID、默认话题"""
+    """配置解析：route_键、旧文本规则、群ID、默认话题"""
 
     def _router(self, **config):
         return build_router(config)
+
+    def test_route_key_config(self):
+        r = self._router(enabled=True, group_id="-100123",
+                         route_SeedWatch=11, route_OguraSubscribePlus=22)
+        self.assertEqual(r._plugin_routes, {"SeedWatch": 11, "OguraSubscribePlus": 22})
+        self.assertEqual(r._config_errors, [])
+
+    def test_route_key_invalid_reported(self):
+        r = self._router(enabled=True, group_id="-100123", route_SeedWatch="abc")
+        self.assertNotIn("SeedWatch", r._plugin_routes)
+        self.assertTrue(any("SeedWatch" in e for e in r._config_errors))
+
+    def test_route_key_empty_ignored(self):
+        r = self._router(enabled=True, group_id="-100123", route_SeedWatch="")
+        self.assertEqual(r._plugin_routes, {})
+        self.assertEqual(r._config_errors, [])
+
+    def test_route_key_wins_over_legacy_text(self):
+        """同插件同时有 route_ 键与旧文本规则时，route_ 键优先"""
+        r = self._router(enabled=True, group_id="-100123",
+                         route_SeedWatch=33, routes="SeedWatch=11")
+        self.assertEqual(r._plugin_routes.get("SeedWatch"), 33)
 
     def test_valid_routes(self):
         r = self._router(

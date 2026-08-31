@@ -105,19 +105,72 @@ class HandlerInstallTest(unittest.TestCase):
 class PageTest(unittest.TestCase):
 
     def test_page_renders_all_sections(self):
-        r = build_router({"enabled": True, "group_id": "-100123"})
+        r = build_router({"enabled": True, "group_id": "-100123",
+                          "route_SeedWatch": 11})
         r._patch_status = {"消息归属": True, "标记传递": True, "模块入口": True,
                            "底层发送注入": True, "发送失败监视": True}
         r._log_route("SeedWatch", "插件", "插件规则:SeedWatch", 11, "改道")
         page = r.get_page()
         self.assertIsInstance(page, list)
-        self.assertTrue(len(page) >= 4)
+        self.assertTrue(len(page) >= 5)
         text = str(page)
         self.assertIn("运行状态", text)
+        self.assertIn("路由规则", text)
         self.assertIn("话题清单", text)
         self.assertIn("SeedWatch", text)
         self.assertIn("plugin/OguraTopicRouter/test_route", text)
         self.assertIn("token", text)
+
+    def test_rules_table_has_test_button(self):
+        """每条规则一行测试按钮（配置完立刻可测，不依赖消息流过）"""
+        r = build_router({"enabled": True, "group_id": "-100123",
+                          "route_SeedWatch": 11, "route_OguraSubscribePlus": 22})
+        page = r.get_page()
+        text = str(page)
+        self.assertEqual(text.count("test_route"), 2, "两条规则两个测试按钮")
+        self.assertEqual(text.count("del_route"), 2, "两条规则两个删除按钮")
+
+    def test_form_dynamic_plugin_list(self):
+        """配置页动态列出已安装插件（无需手写插件ID）"""
+        from fake_mp import register_fake_installed, clear_fake_installed
+        clear_fake_installed()
+        register_fake_installed("SeedWatch", "小仓酱的种子监控助手")
+        register_fake_installed("OguraSubscribePlus", "小仓酱的订阅补全助手")
+        try:
+            r = build_router({"enabled": True})
+            form, defaults = r.get_form()
+            text = str(form)
+            self.assertIn("小仓酱的种子监控助手", text)
+            self.assertIn("route_SeedWatch", text)
+            self.assertIn("插件ID：SeedWatch", text)
+            self.assertIn("route_OguraSubscribePlus", text)
+            self.assertIn("route_SeedWatch", defaults)
+            self.assertNotIn("routes", defaults, "旧文本字段应退出默认配置")
+        finally:
+            clear_fake_installed()
+
+    def test_form_excludes_self(self):
+        """清单不含自身（路由插件不路由自己）"""
+        from fake_mp import register_fake_installed, clear_fake_installed
+        clear_fake_installed()
+        register_fake_installed("OguraTopicRouter", "小仓酱的消息话题路由")
+        register_fake_installed("SeedWatch", "种子监控")
+        try:
+            r = build_router({"enabled": True})
+            form, _ = r.get_form()
+            text = str(form)
+            self.assertIn("route_SeedWatch", text)
+            self.assertNotIn("route_OguraTopicRouter", text)
+        finally:
+            clear_fake_installed()
+
+    def test_form_no_plugins_fallback(self):
+        """读不到插件清单时给提示而非报错"""
+        from fake_mp import clear_fake_installed
+        clear_fake_installed()
+        r = build_router({"enabled": True})
+        form, defaults = r.get_form()
+        self.assertIn("暂时读不到已安装插件清单", str(form))
 
     def test_page_disabled_state(self):
         r = build_router({"enabled": False})
