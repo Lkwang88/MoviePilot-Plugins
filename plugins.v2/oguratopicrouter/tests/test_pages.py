@@ -119,7 +119,6 @@ class PageTest(unittest.TestCase):
         self.assertIn("话题清单", text)
         self.assertIn("SeedWatch", text)
         self.assertIn("plugin/OguraTopicRouter/test_route", text)
-        self.assertIn("token", text)
 
     def test_rules_table_has_test_button(self):
         """每条规则一行测试按钮（配置完立刻可测，不依赖消息流过）"""

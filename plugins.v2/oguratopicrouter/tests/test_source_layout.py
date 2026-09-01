@@ -77,9 +77,13 @@ class VersionSyncTest(unittest.TestCase):
 
 class PageContractTest(unittest.TestCase):
 
-    def test_page_buttons_have_token_param(self):
-        """前端 events.click 需要 params（token 对齐官方 tvfirstwatch 写法）"""
-        self.assertIn('"params": params or {"token": settings.API_TOKEN}', SOURCE)
+    def test_page_apis_use_bear_auth(self):
+        """页面按钮 API 必须用登录态鉴权（verify_apikey 不认前端 Bearer，会 401 静默失败）"""
+        self.assertEqual(SOURCE.count('"auth": "bear"'), 4)
+
+    def test_page_buttons_no_token_param(self):
+        """bear 模式下前端自动带 Authorization，无需 token/apikey 参数"""
+        self.assertNotIn("settings.API_TOKEN", SOURCE)
 
     def test_api_paths_prefixed_by_plugin_id_automatically(self):
         """get_api 返回的 path 不应自带插件ID前缀（MP 会自动加）"""

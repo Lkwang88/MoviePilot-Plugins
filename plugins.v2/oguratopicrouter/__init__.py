@@ -99,7 +99,7 @@ except Exception:  # pragma: no cover - 本地单元测试环境无 MP 宿主
         Plugin = "插件"
 
 # 版本
-PLUGIN_VERSION = "1.4"
+PLUGIN_VERSION = "1.5"
 
 # 消息对象上的归属标记（私有属性，Pydantic 字段之外，不参与序列化/入库）
 MARKER = "_otr_owner"
@@ -464,9 +464,13 @@ class OguraTopicRouter(_PluginBase):
             elif mark in _KNOWN_KEYS:
                 original = getattr(current, "__otr_original__", None) or current
                 _ORIGINALS[key] = (target_class, attr, original)
-                logger.info(
-                    f"【话题路由】接管旧版包装器并重建：{attr}（升级场景，功能不中断）"
-                )
+                if getattr(current, "__otr_original__", None) is None:
+                    logger.info(
+                        f"【话题路由】接管旧版包装器：{attr}（旧版无真身引用，本次嵌套接管；"
+                        f"重启 MP 后恢复单层，日志可能重复一次，功能不受影响）"
+                    )
+                else:
+                    logger.info(f"【话题路由】已用最新代码重建包装器：{attr}")
             elif mark:
                 logger.error(f"【话题路由】补丁点 {attr} 已被其它补丁占用，跳过")
                 return False
@@ -658,24 +662,28 @@ class OguraTopicRouter(_PluginBase):
                 "endpoint": self._api_scan_topics,
                 "methods": ["GET"],
                 "summary": "扫描/刷新话题记录",
+                "auth": "bear",
             },
             {
                 "path": "/test_route",
                 "endpoint": self._api_test_route,
                 "methods": ["GET"],
                 "summary": "向指定插件的路由发送测试通知",
+                "auth": "bear",
             },
             {
                 "path": "/del_route",
                 "endpoint": self._api_del_route,
                 "methods": ["GET"],
                 "summary": "删除指定插件的路由规则",
+                "auth": "bear",
             },
             {
                 "path": "/clear_log",
                 "endpoint": self._api_clear_log,
                 "methods": ["GET"],
                 "summary": "清空路由日志",
+                "auth": "bear",
             },
         ]
 
@@ -991,10 +999,10 @@ class OguraTopicRouter(_PluginBase):
                     {"component": "td", "text": str(tid)},
                     {"component": "td", "content": [
                         self._page_btn("测试", "test_route",
-                                       {"owner": pid, "token": settings.API_TOKEN},
+                                       {"owner": pid},
                                        color="primary"),
                         self._page_btn("删规则", "del_route",
-                                       {"owner": pid, "token": settings.API_TOKEN},
+                                       {"owner": pid},
                                        color="error"),
                     ]},
                 ],
@@ -1069,11 +1077,14 @@ class OguraTopicRouter(_PluginBase):
 
     def _page_btn(self, text: str, api_path: str, params: Optional[dict],
                   color: str = "primary", size: str = "small") -> dict:
+        # API 已声明 auth="bear"（登录态校验），前端 axios 自动带 Authorization 头，
+        # 无需再传 token/apikey 参数
         event = {
             "api": f"plugin/OguraTopicRouter/{api_path}",
             "method": "get",
-            "params": params or {"token": settings.API_TOKEN},
         }
+        if params:
+            event["params"] = params
         return {
             "component": "VBtn",
             "props": {"color": color, "variant": "tonal", "size": size, "class": "mr-2"},
@@ -1089,10 +1100,8 @@ class OguraTopicRouter(_PluginBase):
                     "component": "VCol",
                     "props": {"cols": 12},
                     "content": [
-                        self._page_btn("🔄 扫描/刷新话题", "scan_topics",
-                                       {"token": settings.API_TOKEN}),
-                        self._page_btn("🧹 清空路由日志", "clear_log",
-                                       {"token": settings.API_TOKEN}, color="warning"),
+                        self._page_btn("🔄 扫描/刷新话题", "scan_topics", None),
+                        self._page_btn("🧹 清空路由日志", "clear_log", None, color="warning"),
                         {
                             "component": "span",
                             "props": {"class": "text-body-2 text-medium-emphasis"},
