@@ -99,7 +99,7 @@ except Exception:  # pragma: no cover - 本地单元测试环境无 MP 宿主
         Plugin = "插件"
 
 # 版本
-PLUGIN_VERSION = "1.5"
+PLUGIN_VERSION = "1.6"
 
 # 消息对象上的归属标记（私有属性，Pydantic 字段之外，不参与序列化/入库）
 MARKER = "_otr_owner"
@@ -662,28 +662,24 @@ class OguraTopicRouter(_PluginBase):
                 "endpoint": self._api_scan_topics,
                 "methods": ["GET"],
                 "summary": "扫描/刷新话题记录",
-                "auth": "bear",
             },
             {
                 "path": "/test_route",
                 "endpoint": self._api_test_route,
                 "methods": ["GET"],
                 "summary": "向指定插件的路由发送测试通知",
-                "auth": "bear",
             },
             {
                 "path": "/del_route",
                 "endpoint": self._api_del_route,
                 "methods": ["GET"],
                 "summary": "删除指定插件的路由规则",
-                "auth": "bear",
             },
             {
                 "path": "/clear_log",
                 "endpoint": self._api_clear_log,
                 "methods": ["GET"],
                 "summary": "清空路由日志",
-                "auth": "bear",
             },
         ]
 
@@ -971,14 +967,95 @@ class OguraTopicRouter(_PluginBase):
 
     # ------------------------------------------------------------------ 详情页
     def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：状态卡 + 路由规则 + 话题清单 + 路由日志"""
+        """插件详情页：自检 + 状态卡 + 路由规则 + 话题清单 + 路由日志"""
         sections: List[dict] = []
         sections.append(self._page_status_card())
+        sections.append(self._page_api_selfcheck())
         sections.append(self._page_action_row())
         sections.append(self._page_rules_table())
         sections.append(self._page_topics_table())
         sections.append(self._page_route_log_table())
         return sections
+
+    def _page_api_selfcheck(self) -> dict:
+        """
+        API 注册自检：插件按钮全靠这几条路由，MP 更新插件后会重注册。
+        路由缺失/鉴权依赖异常时一眼可见，不用猜「按钮为什么没反应」。
+        """
+        results = []
+        try:
+            from app.factory import app as fastapp
+            prefixes = (
+                "/api/v1/plugin/OguraTopicRouter/",
+                "/api/v2/plugin/OguraTopicRouter/",
+            )
+            found: Dict[str, List[str]] = {}
+            for route in getattr(fastapp, "routes", []):
+                path = getattr(route, "path", "") or ""
+                for prefix in prefixes:
+                    if path.startswith(prefix):
+                        deps = [
+                            getattr(d.dependency, "__name__", "?")
+                            for d in getattr(route, "dependencies", []) or []
+                        ]
+                        found[path] = deps
+            for name in ("scan_topics", "test_route", "del_route", "clear_log"):
+                deps = found.get(f"/api/v1/plugin/OguraTopicRouter/{name}")
+                if deps is None:
+                    results.append((f"/{name}", "❌ 未注册", "error"))
+                elif "verify_token" in deps:
+                    results.append((f"/{name}", "✅ 登录态鉴权", "success"))
+                elif "verify_apikey" in deps:
+                    results.append((f"/{name}", "✅ apikey 鉴权", "success"))
+                else:
+                    results.append((f"/{name}", f"⚠️ 依赖异常：{deps}", "warning"))
+        except Exception as e:
+            results.append(("自检失败", str(e), "warning"))
+        apikey_state = "已生成" if getattr(settings, "API_TOKEN", None) else "❌ 为空"
+        rows = []
+        for path, state, color in results:
+            rows.append({
+                "component": "tr",
+                "content": [
+                    {"component": "td", "text": path},
+                    {"component": "td", "content": [{
+                        "component": "VChip",
+                        "props": {"color": color, "size": "small"},
+                        "text": state,
+                    }]},
+                ],
+            })
+        rows.append({
+            "component": "tr",
+            "content": [
+                {"component": "td", "text": "按钮鉴权参数 (apikey)"},
+                {"component": "td", "text": apikey_state},
+            ],
+        })
+        return {
+            "component": "div",
+            "content": [
+                {
+                    "component": "p",
+                    "props": {"class": "text-body-2 text-medium-emphasis mt-1 mb-1"},
+                    "text": "API 自检（按钮点了没反应时先看这里）",
+                },
+                {
+                    "component": "VTable",
+                    "props": {"density": "compact"},
+                    "content": [
+                        {"component": "thead", "content": [{
+                            "component": "tr",
+                            "content": [
+                                {"component": "th", "text": "路由"},
+                                {"component": "th", "text": "状态"},
+                            ],
+                        }]},
+                        {"component": "tbody", "content": rows},
+                    ],
+                },
+            ],
+        }
 
     def _page_rules_table(self) -> dict:
         """路由规则表：每条规则一行，带测试/删除按钮（配置完立刻可测）"""
@@ -1077,14 +1154,19 @@ class OguraTopicRouter(_PluginBase):
 
     def _page_btn(self, text: str, api_path: str, params: Optional[dict],
                   color: str = "primary", size: str = "small") -> dict:
-        # API 已声明 auth="bear"（登录态校验），前端 axios 自动带 Authorization 头，
-        # 无需再传 token/apikey 参数
+        """
+        API 为默认 apikey 鉴权：按钮参数里带上 apikey（settings.API_TOKEN
+        渲染进页面），verify_apikey 读 query `apikey` —— 全 v2 版本通吃。
+        （v1.5 曾改用 auth="bear"，但旧版 MP 不支持该字段会导致路由注册失败）
+        """
+        full_params = {"apikey": getattr(settings, "API_TOKEN", None)}
+        if params:
+            full_params.update(params)
         event = {
             "api": f"plugin/OguraTopicRouter/{api_path}",
             "method": "get",
+            "params": full_params,
         }
-        if params:
-            event["params"] = params
         return {
             "component": "VBtn",
             "props": {"color": color, "variant": "tonal", "size": size, "class": "mr-2"},
