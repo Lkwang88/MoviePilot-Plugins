@@ -140,13 +140,14 @@ def chat_id_of(*_args):
 
 
 def register_fake_installed(plugin_id: str, plugin_name: str):
-    """往假 PluginManager 注册一个已安装插件类（供配置页动态清单测试）"""
+    """往假 PluginManager 注册一个已启用插件（供配置页动态清单测试）"""
     import sys as _sys
     pm = _sys.modules.get("app.core.plugin")
     if pm is None:
         return None
     cls = type(plugin_id, (), {"plugin_name": plugin_name})
     pm.PluginManager._plugins[plugin_id] = cls
+    pm.PluginManager._running_plugins[plugin_id] = cls()
     return cls
 
 
@@ -155,6 +156,7 @@ def clear_fake_installed():
     pm = _sys.modules.get("app.core.plugin")
     if pm is not None:
         pm.PluginManager._plugins.clear()
+        pm.PluginManager._running_plugins.clear()
 
 
 class FakeModuleManager:
@@ -352,15 +354,17 @@ def install_fake_mp():
     # 让 app.schemas.types 解析为子模块
     schemas_module.__path__ = []
 
-    # 假 PluginManager（插件配置页动态枚举已安装插件用）
+    # 假 PluginManager（插件配置页动态枚举已启用插件用）
     plugin_module = types.ModuleType("app.core.plugin")
 
     class FakePluginManager:
-        # {插件ID: 类(需带 plugin_name 属性)}
+        # {插件ID: 类/实例(需带 plugin_name 属性)}，测试用 register_fake_installed 注入
         _plugins = {}
+        _running_plugins = {}
 
         def __init__(self):
             self.plugins = type(self)._plugins
+            self.running = type(self)._running_plugins
 
     plugin_module.PluginManager = FakePluginManager
     sys.modules["app.core.plugin"] = plugin_module

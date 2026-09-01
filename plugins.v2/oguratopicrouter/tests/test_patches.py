@@ -73,16 +73,56 @@ class PatchInstallTest(unittest.TestCase):
         self.assertTrue(all(status.values()), msg=f"补丁状态：{status}")
         self.assertGreaterEqual(len(status), 5)
 
-    def test_idempotent_no_double_wrap(self):
-        """重复 init 不会二次包装：原函数只被包一层"""
+    def test_idempotent_rebuilds_without_nesting(self):
+        """重复 init 用最新代码重建，且绝不嵌套包装"""
+        import sys as _sys
         r = full_router()
+        tg_cls = _sys.modules["app.modules.telegram"].Telegram
+        w1 = tg_cls._Telegram__send_short_message
+        r2 = full_router()
+        w2 = tg_cls._Telegram__send_short_message
+        self.assertIsNot(w1, w2, "重初始化应重建包装器（热更新生效）")
+        self.assertEqual(getattr(w2, "__otr_patched__", None), "tg_short")
+        # 真身必须是裸原函数：不再带任何补丁标记（无嵌套）
+        self.assertIsNone(getattr(w2.__otr_original__, "__otr_patched__", None))
+
+    def test_upgrade_takes_over_legacy_wrapper(self):
+        """升级场景：旧版包装器（v0.1.0 标记、无真身引用）被识别并接管，不报占用"""
         import sys as _sys
         tg_cls = _sys.modules["app.modules.telegram"].Telegram
-        first = tg_cls._Telegram__send_short_message
-        r2 = full_router()
-        second = tg_cls._Telegram__send_short_message
-        self.assertIs(first, second)  # 幂等：对象不变
-        self.assertEqual(getattr(second, "__otr_patched__", None), "tg_short")
+        raw = tg_cls._Telegram__send_short_message.__otr_original__
+
+        calls = []
+
+        def legacy_wrapper(inner_self, *args, **kwargs):
+            calls.append("legacy")
+            return raw(inner_self, *args, **kwargs)
+
+        legacy_wrapper.__otr_patched__ = "tg_module"  # v0.1.0 三个入口共用的旧标记
+        tg_cls._Telegram__send_short_message = legacy_wrapper
+
+        r = full_router(group="-100999")  # 群ID与假客户端默认群一致，注入才合法
+        status = r._patch_status
+        self.assertTrue(status.get("底层发送注入"), f"接管失败：{status}")
+        w = tg_cls._Telegram__send_short_message
+        self.assertIsNot(w, legacy_wrapper, "应重建而非沿用旧包装器")
+        # 功能仍正常：旧包装器被包在新包装器里兜底，注入照常生效
+        bot = FakeBot()
+        client = tg_cls(bot, default_chat_id="-100999")
+        mod_cls = _sys.modules["app.modules.telegram"].TelegramModule
+        module = mod_cls(client)
+        self._dispatch_via(module, make_message(owner="SeedWatch"))
+        self.assertEqual(bot.calls[0][3].get("message_thread_id"), 11)
+
+    @staticmethod
+    def _router_instance_enabled():
+        from oguratopicrouter import ChainBase
+        router = getattr(ChainBase, "_otr_router_instance", None)
+        return router is not None and router._enabled
+
+    @staticmethod
+    def _dispatch_via(module, message):
+        module.post_message(message=message)
 
     def test_import_failure_degrades(self):
         """TG 模块导入失败：全部补丁放弃挂载，不留半成品"""
@@ -188,15 +228,6 @@ class InjectTest(unittest.TestCase):
         self._dispatch(module, msg)
         self.assertEqual(bot.calls[0][3].get("message_thread_id"), 99)
 
-    def test_chat_mismatch_no_injection(self):
-        """目标群不是配置的话题群时绝不注入"""
-        r, bot, client, module = self._setup(group_id="-100123")
-        msg = make_message(owner="SeedWatch")
-        self._dispatch(module, msg)
-        # 注意：消息应该到了 -100999（原生行为），thread 注入被群匹配拦下
-        kind, chat_id, text, kwargs = bot.calls[0]
-        self.assertNotIn("message_thread_id", kwargs)
-
     def test_group_match_by_config(self):
         """群ID配成客户端默认群时注入成功"""
         r, bot, client, module = self._setup(group_id="-100999")
@@ -205,7 +236,7 @@ class InjectTest(unittest.TestCase):
         self.assertEqual(bot.calls[0][3].get("message_thread_id"), 11)
 
     def test_long_message_path_injects(self):
-        r, bot, client, module = self._setup(group="-100999")
+        r, bot, client, module = self._setup(group_id="-100999")
         msg = make_message(owner="SeedWatch")
         msg.text = "长" * 5000
         self._dispatch(module, msg)
@@ -216,6 +247,24 @@ class InjectTest(unittest.TestCase):
         r, bot, client, module = self._setup()
         self._dispatch(module, make_message(owner="SeedWatch"))
         self.assertIsNone(getattr(otr._TLS, "tid", None))
+
+    def test_forced_redirect_when_default_target_differs(self):
+        """MP 默认通知目标不是话题群（如旧频道）→ 命中规则的消息强制改道"""
+        r, bot, client, module = self._setup(group_id="-100123")
+        self._dispatch(module, make_message(owner="SeedWatch"))
+        self.assertEqual(len(bot.calls), 1)
+        kind, chat_id, text, kwargs = bot.calls[0]
+        self.assertEqual(chat_id, -100123, "目标应改写为配置的话题群")
+        self.assertEqual(kwargs.get("message_thread_id"), 11)
+
+    def test_redirect_skips_directed_messages(self):
+        """私聊目标在路由决策处已排除，注入器不劫持"""
+        r, bot, client, module = self._setup(group="-100123")
+        msg = make_message(owner="SeedWatch", userid="86023")
+        self._dispatch(module, msg)
+        kind, chat_id, text, kwargs = bot.calls[0]
+        self.assertEqual(chat_id, "86023", "私聊目标不动")
+        self.assertNotIn("message_thread_id", kwargs)
 
     def test_marker_survives_thread_hop(self):
         """标记必须跨线程存活（真实 MP 消息队列在独立线程消费）"""

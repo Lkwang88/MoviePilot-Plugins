@@ -16,10 +16,35 @@ from fake_helpers import build_router, make_message  # noqa: E402
 
 
 class ConfigParseTest(unittest.TestCase):
-    """配置解析：route_键、旧文本规则、群ID、默认话题"""
+    """配置解析：route_键、链接反推、旧文本规则、群ID、默认话题"""
 
     def _router(self, **config):
         return build_router(config)
+
+    def test_route_key_accepts_tme_link(self):
+        """话题值直接粘贴 t.me 分享链接 → 自动提取话题ID"""
+        r = self._router(enabled=True, group_id="-100123",
+                         route_SeedWatch="https://t.me/c/4423340207/17")
+        self.assertEqual(r._plugin_routes.get("SeedWatch"), 17)
+        self.assertEqual(r._config_errors, [])
+
+    def test_route_key_accepts_msg_link(self):
+        """话题内消息链接（三段式）也取第二段为话题ID"""
+        r = self._router(enabled=True, group_id="-100123",
+                         route_SeedWatch="https://t.me/c/4423340207/17/105")
+        self.assertEqual(r._plugin_routes.get("SeedWatch"), 17)
+
+    def test_group_id_accepts_tme_link(self):
+        """群ID栏直接粘贴链接 → 解析出 -100 群ID"""
+        r = self._router(enabled=True,
+                         group_id="https://t.me/c/4423340207/17")
+        self.assertEqual(r._group_int, -1004423340207)
+        self.assertEqual(r._config_errors, [])
+
+    def test_default_thread_accepts_link(self):
+        r = self._router(enabled=True, group_id="-100123",
+                         default_thread_id="https://t.me/c/4423340207/17")
+        self.assertEqual(r._default_tid, 17)
 
     def test_route_key_config(self):
         r = self._router(enabled=True, group_id="-100123",
@@ -165,14 +190,13 @@ class ResolveTest(unittest.TestCase):
         self.assertIsNone(r._resolve_thread(make_message(owner="SeedWatch")))
 
     def test_route_log_entries(self):
+        """已配置插件留痕；未配置插件完全静默（零日志零记录）"""
         r = build_router({"enabled": True, "group_id": "-100123",
                           "routes": "SeedWatch=11"})
         r._resolve_thread(make_message(owner="SeedWatch"))
         r._resolve_thread(make_message(owner="Unkown"))
-        self.assertEqual(len(r._route_log), 2)
-        # insert(0) 新条目在前：后调用的 Unkown(原样) 在 [0]，先调用的 SeedWatch(改道) 在 [1]
-        self.assertEqual(r._route_log[0]["result"], "原样")
-        self.assertEqual(r._route_log[1]["result"], "改道")
+        self.assertEqual(len(r._route_log), 1, "未配置插件不应产生日志")
+        self.assertEqual(r._route_log[0]["result"], "改道")
 
 
 if __name__ == "__main__":

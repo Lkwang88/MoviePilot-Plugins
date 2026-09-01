@@ -25,6 +25,7 @@
 getUpdates，与 MP 自身的轮询零冲突），详情页「扫描话题」即可查看清单；
 机器人看不到消息的话题，可转发消息给 @getidsbot 查询。
 """
+import re
 import sys
 import threading
 import time
@@ -98,7 +99,7 @@ except Exception:  # pragma: no cover - 本地单元测试环境无 MP 宿主
         Plugin = "插件"
 
 # 版本
-PLUGIN_VERSION = "1.2"
+PLUGIN_VERSION = "1.4"
 
 # 消息对象上的归属标记（私有属性，Pydantic 字段之外，不参与序列化/入库）
 MARKER = "_otr_owner"
@@ -143,6 +144,34 @@ def _norm_chat_int(value: Any) -> Optional[int]:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _parse_tme_link(text: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    解析 Telegram 链接 → (群chat_id, 话题ID)。
+    支持：t.me/c/<chat>/<topic>（话题分享链接，两段式）与
+         t.me/c/<chat>/<topic>/<msg>（话题内消息链接，三段式）。
+    群ID = -100 前缀 + 第一段；话题ID = 第二段。
+    """
+    m = re.search(r"t\.me/c/(\d+)(?:/(\d+))?(?:/(\d+))?", str(text or ""))
+    if not m:
+        return None, None
+    try:
+        chat_id = int(f"-100{m.group(1)}")
+    except ValueError:
+        return None, None
+    topic_id = int(m.group(2)) if m.group(2) else None
+    return chat_id, topic_id
+
+
+def _norm_topic_value(raw: Any) -> Optional[int]:
+    """话题值：支持纯数字，或直接粘贴 t.me 话题链接（自动提取话题ID）"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if "t.me/" in text:
+        return _parse_tme_link(text)[1]
+    return _norm_chat_int(text)
 
 
 def _find_plugin_owner() -> Optional[str]:
@@ -255,8 +284,24 @@ class OguraTopicRouter(_PluginBase):
             self._enabled = bool(config.get("enabled"))
             self._debug = bool(config.get("debug"))
             self._group_id = str(config.get("group_id") or "").strip()
+            # 群ID 支持直接粘贴 t.me 链接（群链接或话题链接均可，取群段）
+            if "t.me/" in self._group_id:
+                gid, _ = _parse_tme_link(self._group_id)
+                if gid:
+                    logger.info(f"【话题路由】已从链接解析群ID：{gid}")
+                    self._group_id = str(gid)
             default_raw = str(config.get("default_thread_id") or "").strip()
-            routes_text = str(config.get("routes") or "")
+            # 默认话题也支持链接
+            default_tid = _norm_topic_value(default_raw)
+            if default_raw and default_tid is None:
+                self._config_errors.append(
+                    f"默认话题「{default_raw}」无法识别（填数字或 t.me 话题链接），已忽略"
+                )
+                default_raw = ""
+            if default_tid is not None and default_tid <= 0:
+                self._config_errors.append(f"默认话题ID「{default_raw}」应为正整数，已忽略")
+                default_tid = None
+            self._default_tid = default_tid
             self._group_int = _norm_chat_int(self._group_id)
             if self._group_id and self._group_int is None:
                 self._config_errors.append(f"话题群ID「{self._group_id}」不是数字，路由不会生效")
@@ -265,13 +310,6 @@ class OguraTopicRouter(_PluginBase):
                     f"话题群ID「{self._group_id}」应为负数超级群ID（-100 开头），当前格式不对"
                 )
                 self._group_int = None
-            if default_raw:
-                self._default_tid = _norm_chat_int(default_raw)
-                if self._default_tid is None:
-                    self._config_errors.append(f"默认话题ID「{default_raw}」不是数字，已忽略")
-                elif self._default_tid <= 0:
-                    self._config_errors.append(f"默认话题ID「{default_raw}」应为正整数，已忽略")
-                    self._default_tid = None
 
         # 新版配置：每插件一键 route_<插件ID> = 话题ID（配置页动态清单写入）
         for key, raw in (config or {}).items():
@@ -281,10 +319,10 @@ class OguraTopicRouter(_PluginBase):
             raw = str(raw or "").strip()
             if not pid or not raw:
                 continue  # 空 = 不接管
-            tid = _norm_chat_int(raw)
+            tid = _norm_topic_value(raw)
             if tid is None or tid <= 0:
                 self._config_errors.append(
-                    f"插件 {pid} 的话题ID「{raw}」无效（应为正整数），已忽略"
+                    f"插件 {pid} 的话题「{raw}」无法识别（填数字或 t.me 话题链接），已忽略"
                 )
                 continue
             self._plugin_routes[pid] = tid
@@ -408,23 +446,30 @@ class OguraTopicRouter(_PluginBase):
 
     def _patch_one(self, key: str, target_class: type, attr: str, factory) -> bool:
         """
-        幂等打补丁。factory(original) -> wrapper；wrapper 需带 __otr_patched__ = key。
-        已是本插件的包装则跳过；否则先存原始函数再替换。
-        只有同一目标类上的记录才复用，防止目标类变更（重载/测试）时包到陈旧函数。
+        打补丁（每次 init 都用最新代码重建，杜绝热更新后旧包装器驻留）：
+        - 同类同键已捕获过真身 → 直接复用；
+        - 目标是自家旧版包装器（升级/重载场景，标记命中 _KNOWN_KEYS）→
+          取其 __otr_original__ 真身重建（旧版无该属性时退化为包一层）；
+        - 目标被陌生补丁占用 → 跳过并报错，绝不覆盖别人。
         """
         try:
             current = getattr(target_class, attr, None)
             if current is None:
                 logger.error(f"【话题路由】补丁点不存在：{target_class.__name__}.{attr}，跳过")
                 return False
-            if getattr(current, "__otr_patched__", None) == key:
-                return True  # 已挂过（热重载场景），不二次包装
-            if getattr(current, "__otr_patched__", None):
+            saved = _ORIGINALS.get(key)
+            mark = getattr(current, "__otr_patched__", None)
+            if saved and saved[0] is target_class and saved[1] == attr:
+                original = saved[2]  # 本进程内已捕获过的真身
+            elif mark in _KNOWN_KEYS:
+                original = getattr(current, "__otr_original__", None) or current
+                _ORIGINALS[key] = (target_class, attr, original)
+                logger.info(
+                    f"【话题路由】接管旧版包装器并重建：{attr}（升级场景，功能不中断）"
+                )
+            elif mark:
                 logger.error(f"【话题路由】补丁点 {attr} 已被其它补丁占用，跳过")
                 return False
-            saved = _ORIGINALS.get(key)
-            if saved and saved[0] is target_class and saved[1] == attr:
-                original = saved[2]
             else:
                 original = current
                 _ORIGINALS[key] = (target_class, attr, current)
@@ -463,18 +508,22 @@ class OguraTopicRouter(_PluginBase):
             return None
         mtype = getattr(message, "mtype", None)
         mtype_name = getattr(mtype, "name", "") if mtype else ""
+        configured = owner in self._plugin_routes
 
-        # 铁律一：定向私聊消息不进话题
+        # 铁律一：定向私聊消息不进话题（仅对已配置插件留痕，未配置的完全静默）
         if getattr(message, "userid", None):
-            self._log_route(owner, mtype_name, "定向私聊", None, "私聊跳过")
+            if configured:
+                self._log_route(owner, mtype_name, "定向私聊", None, "私聊跳过")
             return None
         # 铁律二：交互消息（按钮/强制回复）不进话题
         if getattr(message, "buttons", None) or getattr(message, "force_reply", False):
-            self._log_route(owner, mtype_name, "交互消息", None, "交互跳过")
+            if configured:
+                self._log_route(owner, mtype_name, "交互消息", None, "交互跳过")
             return None
         # 话题群未配置/配置错 → 不干预
         if self._group_int is None:
-            self._log_route(owner, mtype_name, "群未配置", None, "原样")
+            if configured:
+                self._log_route(owner, mtype_name, "群未配置", None, "原样")
             return None
 
         tid: Optional[int] = None
@@ -489,10 +538,7 @@ class OguraTopicRouter(_PluginBase):
             tid = self._default_tid
             rule = "默认话题"
         if tid is None:
-            # 未命中任何规则 → 原样
-            self._log_route(owner, mtype_name, "未配置", None, "原样")
-            if self._debug:
-                logger.info(f"【话题路由】{owner} 未配置路由，消息保持原样")
+            # 未命中任何规则 → 原样。未配置的插件零日志零记录（降噪）
             return None
 
         self._log_route(owner, mtype_name, rule, tid, "改道")
@@ -726,17 +772,18 @@ class OguraTopicRouter(_PluginBase):
     # ------------------------------------------------------------------ 配置页
     def _installed_plugins(self) -> List[Tuple[str, str]]:
         """
-        已安装插件清单 [(插件ID, 显示名)]，按显示名排序，排除自身。
+        已启用插件清单 [(插件ID, 显示名)]，按显示名排序，排除自身。
+        只列运行中（已启用）的插件：停用的插件不进清单、不进日志。
         任何失败返回空清单（配置页会给出提示，不阻塞表单渲染）。
         """
         try:
             pm = PluginManager()
-            plugins = getattr(pm, "_plugins", None) or {}
+            plugins = getattr(pm, "_running_plugins", None) or {}
             items: List[Tuple[str, str]] = []
-            for pid, cls in plugins.items():
+            for pid, obj in plugins.items():
                 if pid == self.__class__.__name__:
                     continue
-                name = getattr(cls, "plugin_name", "") or pid
+                name = getattr(obj, "plugin_name", "") or pid
                 items.append((pid, name))
             return sorted(items, key=lambda x: x[1])
         except Exception:
@@ -831,9 +878,10 @@ class OguraTopicRouter(_PluginBase):
                                             "title": "🔀 小仓酱的消息话题路由",
                                             "text": (
                                                 "在下方插件清单里给需要的插件填话题 ID，即接管它的通知路由（留空不接管）。"
+                                                "话题 ID 支持直接粘贴 t.me 话题分享链接自动提取。"
                                                 "只拦截插件消息：系统通知、私聊、带按钮的交互消息一律不动；"
                                                 "未配置的插件照常发送，不会丢消息也不会重复发。"
-                                                "话题 ID 用详情页「扫描/刷新话题」获取。"
+                                                "清单只显示已启用的插件；停用插件的历史规则保留，重新启用即恢复。"
                                             ),
                                         },
                                     }
@@ -915,13 +963,12 @@ class OguraTopicRouter(_PluginBase):
 
     # ------------------------------------------------------------------ 详情页
     def get_page(self) -> Optional[List[dict]]:
-        """插件详情页：状态卡 + 路由规则 + 话题清单 + 已发现插件 + 路由日志"""
+        """插件详情页：状态卡 + 路由规则 + 话题清单 + 路由日志"""
         sections: List[dict] = []
         sections.append(self._page_status_card())
         sections.append(self._page_action_row())
         sections.append(self._page_rules_table())
         sections.append(self._page_topics_table())
-        sections.append(self._page_plugins_table())
         sections.append(self._page_route_log_table())
         return sections
 
@@ -1069,8 +1116,10 @@ class OguraTopicRouter(_PluginBase):
         if not topics:
             return self._page_alert(
                 "info", "还没有话题记录",
-                "点「扫描/刷新话题」挂载记录器后，在需要的话题里发一条消息（机器人可见），"
-                "再点一次扫描即可看到话题清单。也可以转发话题消息给 @getidsbot 查询话题 ID。",
+                "两种方式获取话题 ID：① 在需要的话题里随便发一条消息（机器人可见），"
+                "点「扫描/刷新话题」即可收录；② 直接复制话题分享链接"
+                "（长按话题 → 复制链接，形如 https://t.me/c/4423340207/17），"
+                "粘贴到配置页对应插件的输入框，自动提取话题 ID——链接第二段就是话题 ID。",
             )
         rows = []
         for t in topics:
@@ -1106,104 +1155,6 @@ class OguraTopicRouter(_PluginBase):
                                     {"component": "th", "text": "群ID"},
                                     {"component": "th", "text": "最近消息"},
                                     {"component": "th", "text": "时间"},
-                                ],
-                            }],
-                        },
-                        {"component": "tbody", "content": rows},
-                    ],
-                },
-            ],
-        }
-
-    def _page_plugins_table(self) -> dict:
-        """已发现的插件：最近发过消息的插件 + 当前路由 + 测试/删除按钮"""
-        with self._log_lock:
-            logs = list(self._route_log)
-        seen: Dict[str, Dict[str, Any]] = {}
-        for entry in logs:
-            owner = entry.get("owner") or ""
-            if not owner:
-                continue
-            info = seen.setdefault(
-                owner,
-                {"mtype": entry.get("mtype", ""), "rule": "-", "tid": None,
-                 "result": "", "ts": ""},
-            )
-            for k in ("mtype", "rule", "tid", "result"):
-                if not info.get(k):
-                    info[k] = entry.get(k) or info.get(k)
-            if not info.get("ts"):
-                info["ts"] = entry.get("ts", "")
-        if not seen:
-            return self._page_alert(
-                "info", "还没有发现插件消息",
-                "启用插件后，任何插件发出通知都会出现在这里；"
-                "也可以先在配置页写好规则再来测试。",
-            )
-        rows = []
-        for owner, info in seen.items():
-            tid = info.get("tid")
-            actions = [
-                self._page_btn("测试", "test_route",
-                               {"owner": owner, "token": settings.API_TOKEN},
-                               color="primary"),
-            ]
-            if owner in self._plugin_routes:
-                actions.append(
-                    self._page_btn("删规则", "del_route",
-                                   {"owner": owner, "token": settings.API_TOKEN},
-                                   color="error")
-                )
-            result = info.get("result") or ""
-            chip_color = "success" if result == "改道" else (
-                "warning" if result in ("私聊跳过", "交互跳过", "原样", "未配置") else "grey"
-            )
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {"component": "td", "text": owner},
-                    {"component": "td", "text": info.get("mtype") or "-"},
-                    {"component": "td", "text": info.get("rule") or "-"},
-                    {"component": "td", "text": str(tid) if tid else "-"},
-                    {
-                        "component": "td",
-                        "content": [{
-                            "component": "VChip",
-                            "props": {"color": chip_color, "size": "small"},
-                            "text": result or "-",
-                        }],
-                    },
-                    {"component": "td", "text": info.get("ts") or "-"},
-                    {
-                        "component": "td",
-                        "content": actions,
-                    },
-                ],
-            })
-        return {
-            "component": "div",
-            "content": [
-                {
-                    "component": "p",
-                    "props": {"class": "text-h6 mt-3 mb-1"},
-                    "text": "已发现插件（最近发过通知的插件）",
-                },
-                {
-                    "component": "VTable",
-                    "props": {"hover": True, "density": "compact"},
-                    "content": [
-                        {
-                            "component": "thead",
-                            "content": [{
-                                "component": "tr",
-                                "content": [
-                                    {"component": "th", "text": "插件"},
-                                    {"component": "th", "text": "消息类型"},
-                                    {"component": "th", "text": "命中规则"},
-                                    {"component": "th", "text": "话题"},
-                                    {"component": "th", "text": "结果"},
-                                    {"component": "th", "text": "最近时间"},
-                                    {"component": "th", "text": "操作"},
                                 ],
                             }],
                         },
@@ -1266,6 +1217,14 @@ class OguraTopicRouter(_PluginBase):
 
 
 # ---------------------------------------------------------------------- 包装器
+# 已知补丁键集合（含历史版本键）：用于识别「自家旧版包装器」并接管重建
+_KNOWN_KEYS = {
+    "chain_post", "chain_norm",
+    "tg_module", "tg_module_medias", "tg_module_torrents",
+    "tg_short", "tg_long_plain", "tg_long", "tg_request",
+}
+
+
 def _wrap_chain_post_message(original):
     """ChainBase.post_message 包装：识别插件归属并打标记（系统消息零影响）"""
 
@@ -1286,6 +1245,7 @@ def _wrap_chain_post_message(original):
         return original(inner_self, message, *args, **kwargs)
 
     wrapper.__otr_patched__ = "chain_post"
+    wrapper.__otr_original__ = original
     return wrapper
 
 
@@ -1305,6 +1265,7 @@ def _wrap_chain_normalize(original):
         return dispatch
 
     wrapper.__otr_patched__ = "chain_norm"
+    wrapper.__otr_original__ = original
     return wrapper
 
 
@@ -1339,6 +1300,7 @@ def _make_tg_entry_wrapper(key: str):
                 _TLS.owner = None
 
         wrapper.__otr_patched__ = key
+        wrapper.__otr_original__ = original
         return wrapper
 
     return _factory
@@ -1346,8 +1308,12 @@ def _make_tg_entry_wrapper(key: str):
 
 def _make_send_injector(key: str):
     """
-    Telegram 底层 send 分支包装：目标群命中话题群时注入 message_thread_id。
-    这些方法都把 chat_id 放在 kwargs 里并透传 **kwargs 给 telebot。
+    Telegram 底层 send 分支包装：话题改道的最终执行点。
+    - 目标群已是配置的话题群 → 只注入 message_thread_id；
+    - 目标是 MP 默认通知目标（可能是旧频道/别的聊天）→ 强制改道：
+      chat_id 改写为配置的话题群 + 注入 message_thread_id。
+      （命中路由的插件消息是广播消息，chat_id 一定是客户端默认目标；
+        私聊/交互消息在路由决策处已被排除，不会走到这里。）
     """
 
     def _factory(original):
@@ -1356,14 +1322,32 @@ def _make_send_injector(key: str):
                 tid = getattr(_TLS, "tid", None)
                 if tid:
                     router = _get_router()
-                    if router is not None and router._chat_matches(kwargs.get("chat_id")):
-                        kwargs = dict(kwargs)
-                        kwargs["message_thread_id"] = int(tid)
+                    if router is not None and router._group_int is not None:
+                        chat_id = kwargs.get("chat_id")
+                        if router._chat_matches(chat_id):
+                            if "message_thread_id" not in kwargs:
+                                kwargs = dict(kwargs)
+                                kwargs["message_thread_id"] = int(tid)
+                        else:
+                            # 只接管"默认广播目标"：与客户端默认 chat_id 一致才改道
+                            default_id = getattr(inner_self, "_telegram_chat_id", None)
+                            same_target = (
+                                str(chat_id) == str(default_id) if default_id else False
+                            )
+                            if same_target:
+                                kwargs = dict(kwargs)
+                                kwargs["chat_id"] = router._group_int
+                                kwargs["message_thread_id"] = int(tid)
+                                logger.info(
+                                    f"【话题路由】已强制改道：默认目标 {chat_id} → "
+                                    f"话题群 {router._group_int} 话题 {tid}"
+                                )
             except Exception:
                 pass
             return original(inner_self, *args, **kwargs)
 
         wrapper.__otr_patched__ = key
+        wrapper.__otr_original__ = original
         return wrapper
 
     return _factory
@@ -1393,4 +1377,5 @@ def _wrap_send_request_monitor(original):
         return result
 
     wrapper.__otr_patched__ = "tg_request"
+    wrapper.__otr_original__ = original
     return wrapper
