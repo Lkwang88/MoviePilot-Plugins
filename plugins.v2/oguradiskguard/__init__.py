@@ -21,7 +21,7 @@ class OguraDiskGuard(_PluginBase):
     plugin_name = "小仓酱磁盘卫士"
     plugin_desc = "统计正在下载的种子体积与磁盘剩余空间，定时播报；触及阈值自动暂停下载，防止爆盘。"
     plugin_icon = "diskusage.jpg"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradiskguard_"
@@ -395,8 +395,9 @@ class OguraDiskGuard(_PluginBase):
 
     def _collect_dir_sizes(self, force: bool = False) -> Dict[str, int]:
         """
-        监控目录下各一级子目录的真实磁盘占用（全量遍历，du 语义）。
-        能抓到种子已删除但文件遗留的占用（种子元数据算不准磁盘）。
+        监控目录下各一级子目录的真实磁盘占用（du 口径 st_blocks，与 df/1Panel 一致）。
+        能抓到种子已删除但文件遗留的占用（种子元数据算不准磁盘），
+        预分配下载文件按实际写入计，不把未写入空间算成已占用。
         后台线程 + 10 分钟缓存 + 单飞锁，永不阻塞防爆盘检查。
         """
         now = time.time()
@@ -416,7 +417,9 @@ class OguraDiskGuard(_PluginBase):
                         if entry.is_dir():
                             total += _walk(entry)
                         elif entry.is_file():
-                            total += entry.stat().st_size
+                            # du 口径：只看实际磁块占用（st_blocks*512），
+                            # 与 df/1Panel 一致；稀疏文件/未写满的下载中文件不虚报
+                            total += entry.stat().st_blocks * 512
                     except (OSError, PermissionError):
                         continue
             except (OSError, PermissionError):
