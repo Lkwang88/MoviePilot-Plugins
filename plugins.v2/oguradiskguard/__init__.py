@@ -21,7 +21,7 @@ class OguraDiskGuard(_PluginBase):
     plugin_name = "小仓酱磁盘卫士"
     plugin_desc = "统计正在下载的种子体积与磁盘剩余空间，定时播报；触及阈值自动暂停下载，防止爆盘。"
     plugin_icon = "diskusage.jpg"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguradiskguard_"
@@ -221,6 +221,35 @@ class OguraDiskGuard(_PluginBase):
                 "props": {"class": "text-caption text-error mt-1"},
                 "text": foot,
             })
+        # 目录占用（真实遍历，10 分钟缓存）：占比条 + 目录名 + 体积，降序
+        self._collect_dir_sizes()
+        dir_sizes = getattr(self, "_dir_sizes", {}) or {}
+        if dir_sizes:
+            content.append({
+                "component": "div",
+                "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                "text": "📂 目录占用",
+            })
+            max_size = max(dir_sizes.values())
+            for name, size in sorted(dir_sizes.items(), key=lambda x: -x[1]):
+                content.append({
+                    "component": "div",
+                    "props": {"class": "text-body-2 d-flex align-center"},
+                    "content": [
+                        {"component": "span",
+                         "props": {"class": "text-medium-emphasis",
+                                   "style": "flex:0 0 92px;overflow:hidden;"
+                                            "text-overflow:ellipsis;"},
+                         "text": name},
+                        {"component": "span",
+                         "props": {"style": "font-family:monospace;"
+                                            "letter-spacing:-1px;"},
+                         "text": self._bar(size, max_size)},
+                        {"component": "span",
+                         "props": {"class": "ml-2 font-weight-medium"},
+                         "text": self._fmt_gb(size)},
+                    ],
+                })
         page = [{"component": "div", "content": content}]
         return col_config, global_config, page
 
@@ -364,6 +393,69 @@ class OguraDiskGuard(_PluginBase):
         return disk["free"] / disk["total"] * 100 > (self._threshold_value
                                                      * self._recover_factor)
 
+    def _collect_dir_sizes(self, force: bool = False) -> Dict[str, int]:
+        """
+        监控目录下各一级子目录的真实磁盘占用（全量遍历，du 语义）。
+        能抓到种子已删除但文件遗留的占用（种子元数据算不准磁盘）。
+        后台线程 + 10 分钟缓存 + 单飞锁，永不阻塞防爆盘检查。
+        """
+        now = time.time()
+        if not force and now - getattr(self, "_dir_sizes_ts", 0.0) < 600:
+            return getattr(self, "_dir_sizes", {}) or {}
+        if getattr(self, "_dir_sizes_busy", False):
+            return getattr(self, "_dir_sizes", {}) or {}
+        self._dir_sizes_busy = True
+
+        def _walk(path: Path) -> int:
+            total = 0
+            try:
+                for entry in path.iterdir():
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir():
+                            total += _walk(entry)
+                        elif entry.is_file():
+                            total += entry.stat().st_size
+                    except (OSError, PermissionError):
+                        continue
+            except (OSError, PermissionError):
+                pass
+            return total
+
+        def _job():
+            try:
+                result: Dict[str, int] = {}
+                for d in self._monitor_dirs:
+                    base = Path(d)
+                    if not base.exists():
+                        continue
+                    for child in sorted(base.iterdir()):
+                        if child.is_dir():
+                            used = _walk(child)
+                            if used > 0:
+                                result[child.name] = used
+                if result:
+                    self._dir_sizes = result
+                    self._dir_sizes_ts = time.time()
+            except Exception as err:
+                logger.error(f"小仓酱磁盘卫士 目录占用统计异常：{err}")
+            finally:
+                self._dir_sizes_busy = False
+
+        import threading
+        threading.Thread(target=_job, daemon=True).start()
+        return getattr(self, "_dir_sizes", {}) or {}
+
+    @staticmethod
+    def _bar(size: int, max_size: int, width: int = 10) -> str:
+        """文本比例条：█ 填充 + ░ 空位"""
+        if max_size <= 0:
+            filled = 0
+        else:
+            filled = int(round(size / max_size * width))
+        return "█" * filled + "░" * (width - filled)
+
     # ============================ 主流程 ============================
 
     def check(self):
@@ -385,6 +477,7 @@ class OguraDiskGuard(_PluginBase):
                 self._notify_error_once("下载器查询失败，本次检查跳过")
                 return
             disks = self._collect_disk()
+            self._collect_dir_sizes()   # 后台低频刷新，不阻塞
 
             # --- 阈值判定与制动/恢复 ---
             triggered = [d for d in disks if self._is_triggered(d)]
@@ -577,6 +670,13 @@ class OguraDiskGuard(_PluginBase):
                     self._fmt_pct(d["free"], d["total"])),
             ]
         text = "\n".join(lines)
+        dir_sizes = getattr(self, "_dir_sizes", {}) or {}
+        if dir_sizes:
+            max_size = max(dir_sizes.values())
+            text += "\n\n📂 目录占用"
+            for name, size in sorted(dir_sizes.items(), key=lambda x: -x[1]):
+                text += "\n   %s %s %s" % (self._bar(size, max_size),
+                                           name, self._fmt_gb(size))
         self.post_message(mtype=NotificationType.Plugin,
                           title="🛡️ 小仓酱磁盘卫士 · 播报", text=text)
         self._last_notify_ts = time.time()
@@ -874,6 +974,25 @@ class OguraDiskGuard(_PluginBase):
                 "text": "最近动作：\n" + log_lines,
             }],
         })
+        # 目录占用
+        dir_sizes = getattr(self, "_dir_sizes", {}) or {}
+        if dir_sizes:
+            max_size = max(dir_sizes.values())
+            dir_lines = ["📂 目录占用"]
+            for name, size in sorted(dir_sizes.items(), key=lambda x: -x[1]):
+                dir_lines.append("%s %s %s" % (self._bar(size, max_size),
+                                               name, self._fmt_gb(size)))
+            content.append({
+                "component": "VCard",
+                "props": {"variant": "tonal", "class": "mt-3"},
+                "content": [{
+                    "component": "VCardText",
+                    "props": {"class": "text-caption",
+                              "style": "white-space:pre-wrap;"
+                                       "font-family:monospace;"},
+                    "text": "\n".join(dir_lines),
+                }],
+            })
         return [{"component": "div", "content": content}]
 
     def _stat_card(self, label: str, value: str) -> dict:
