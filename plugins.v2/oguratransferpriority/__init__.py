@@ -4,8 +4,9 @@
 ================================
 
 让订阅下载的媒体在整理队列中享有最高优先级：
-- 订阅任务（下载历史 note.source 以 "Subscribe|" 开头）→ 优先级 0，插队到队首；
-- 手动下载 / 其他来源 / 无法识别来源 → 优先级 1，保持原有先来后到顺序；
+- **P0**：订阅任务（下载历史 `note.source` 以 `Subscribe|` 开头）——置顶；
+- **P0.5**：通过数据页手动插队的普通任务——排在订阅之后；
+- **P1**：手动下载 / 其他来源 / 识别失败的兜底；
 - 同一优先级内部严格按入队顺序（FIFO），绝不乱序。
 
 实现方式（零破坏设计）：
@@ -16,21 +17,25 @@
   一个取数周期（15s 超时）内自动切到新队列，无需打断正在整理的任务；
 - 所有判定路径全部 try/except 兜底，任何异常一律按普通优先级处理，
   插件自身异常绝不影响整理主流程；
-- 停用插件时把队列还原为原生 queue.Queue（按当前优先级顺序回填）。
+- 停用插件时把队列切换为降级模式（纯 FIFO），不交换对象引用，避免生产者并发入队丢任务；
+- 切换时保留 MP 当前活跃任务计数，保证 `task_done/join` 语义不因迁移少算；
 """
+import hashlib
 import heapq
 import importlib
+import re
 import threading
 import time
 import traceback
 import weakref
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
 
-# 原生 queue.Queue 类型引用（用于类型判断与还原）
+# 原生 queue.Queue 类型引用（用于类型判断）
 import queue as _native_queue
 
 
@@ -41,6 +46,12 @@ import queue as _native_queue
 # ---------------------------------------------------------------------------
 _active_plugin_refs: "weakref.WeakSet" = weakref.WeakSet()
 _registry_lock = threading.Lock()
+
+# 队列优先级：订阅最高；手动插队只超过普通任务，不越过订阅。
+_SUBSCRIBE_PRIORITY = 0
+_MANUAL_PRIORITY = 0.5
+_NORMAL_PRIORITY = 1
+_TERMINAL_STATES = {"completed", "failed", "cancelled", "success"}
 
 
 class SubscribePriorityQueue:
@@ -54,7 +65,7 @@ class SubscribePriorityQueue:
     - 阻塞语义：get(block=True) 在队列为空时挂起等待，被 put 唤醒；
       get(block=True, timeout=N) 超时抛 queue.Empty。
 
-    排序键：(priority, seq, item)，priority 0=订阅 1=普通；
+    排序键：(priority, seq, item)，priority 0=订阅、0.5=手动插队、1=普通；
     seq 为全局递增序号，堆比较在第二字段必分胜负，item 永不参与比较。
     """
 
@@ -83,14 +94,14 @@ class SubscribePriorityQueue:
         except Exception:
             pass
 
-    def _priority_of(self, item) -> int:
+    def _priority_of(self, item) -> float:
         """判定任务优先级：任何异常一律按普通（1）处理。"""
         try:
             if self._priority_fn is not None and self._priority_fn(item):
-                return 0
+                return _SUBSCRIBE_PRIORITY
         except Exception as e:
             self._log("warning", f"优先级判定异常，按普通处理：{e}")
-        return 1
+        return _NORMAL_PRIORITY
 
     # ------------------------------------------------------------------ put
     def put(self, item, block=True, timeout=None):
@@ -98,7 +109,7 @@ class SubscribePriorityQueue:
         with self.mutex:
             # 降级模式（插件停用）：一律按 P1 追加，纯 FIFO，不丢引用不换对象
             if self._disabled:
-                priority = 1
+                priority = _NORMAL_PRIORITY
             heapq.heappush(self._heap, (priority, self._seq, item))
             self._seq += 1
             self.unfinished_tasks += 1
@@ -106,8 +117,8 @@ class SubscribePriorityQueue:
             jump_ahead = 0
             jump_key = None
             jump_title = None
-            if priority == 0 and self._jump_notify_fn is not None:
-                normal_cnt = sum(1 for p, _, _ in self._heap if p == 1)
+            if priority == _SUBSCRIBE_PRIORITY and self._jump_notify_fn is not None:
+                normal_cnt = sum(1 for p, _, _ in self._heap if p == _NORMAL_PRIORITY)
                 if normal_cnt > 0:
                     jump_ahead = normal_cnt
                     jump_key = self._extract_hash(item)
@@ -191,6 +202,26 @@ class SubscribePriorityQueue:
         with self.mutex:
             return [(p, s) for p, s, _ in self._heap]
 
+    def snapshot_items(self):
+        """在队列锁内复制等待任务快照（不取出、不改变计数）。"""
+        with self.mutex:
+            return list(self._heap)
+
+    def promote(self, predicate) -> int:
+        """在锁内把命中的普通任务提升为中间优先级，不改变任务计数。"""
+        changed = 0
+        with self.mutex:
+            updated = []
+            for priority, seq, item in self._heap:
+                if priority == _NORMAL_PRIORITY and predicate(item):
+                    priority = _MANUAL_PRIORITY
+                    changed += 1
+                updated.append((priority, seq, item))
+            if changed:
+                self._heap[:] = updated
+                heapq.heapify(self._heap)
+        return changed
+
     # ------------------------------------------------------------------ 计数
     def task_done(self):
         with self.mutex:
@@ -242,9 +273,12 @@ class OguraTransferPriority(_PluginBase):
 
     # 插件元信息
     plugin_name = "小仓酱的订阅优先整理"
-    plugin_desc = "订阅下载的媒体优先整理：订阅任务插队到整理队列队首，手动及其他任务保持原有顺序，适合 HDD 等慢速存储环境。"
+    plugin_desc = (
+        "订阅下载的媒体优先整理：数据页合并显示等待中与正在整理的项目，"
+        "支持同剧同季合并及普通任务手动插队；订阅仍排在最前，适合 HDD 等慢速存储环境。"
+    )
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/SpeedLimiter.jpg"
-    plugin_version = "1.0.3"
+    plugin_version = "1.1.0"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguratransferpriority."
@@ -266,7 +300,7 @@ class OguraTransferPriority(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         """
-        生效配置：启用时改造整理队列，停用时还原。
+        生效配置：启用时改造整理队列，停用时切换为降级 FIFO。
         MP 重启后队列恢复原生 FIFO，本方法会被再次调用自动重新生效。
         """
         # 实例级状态初始化（每次 init 重建，隔离分身/残留）
@@ -341,7 +375,7 @@ class OguraTransferPriority(_PluginBase):
             except Exception as e:
                 logger.warning(f"【订阅优先整理】接管旧队列失败：{e}，改为重建迁移")
 
-        # ③ 可排空队列（原生 queue.Queue / 更早版本优先队列）：全新改造+吸收存量
+        # ③ 可排空队列（原生 queue.Queue / 更早版本优先队列）：全新改造+迁移存量
         if isinstance(old_queue, _native_queue.Queue) or callable(
                 getattr(old_queue, "get_nowait", None)):
             self._install_fresh_queue(chain, old_queue)
@@ -508,7 +542,511 @@ class OguraTransferPriority(_PluginBase):
         except Exception as e:
             logger.debug(f"【订阅优先整理】插队通知异常（忽略）：{e}")
 
-    # ------------------------------------------------------------------ 接口
+    # ------------------------------------------------------------------ 队列查看与手动插队
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        """规范化用于兜底分组的文本，不改变页面展示原文。"""
+        try:
+            return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _media_identity_key(cls, media=None, meta=None, history=None) -> str:
+        """
+        生成稳定的媒体身份键。
+
+        优先复用 MP v2 官方 ``resolve_media_identity``（来源+原生 ID），
+        再做兼容兜底；没有任何 ID 时才使用标题+年份+类型。不把标题作为有
+        ID 媒体的主键，避免同名剧误合并。
+        """
+        def value(obj, name):
+            try:
+                return getattr(obj, name, None) if obj is not None else None
+            except Exception:
+                return None
+
+        # MP v2.15.6 的正式媒体身份算法，避免把辅助 TMDB ID 错配到豆瓣等主源。
+        try:
+            from app.utils.media import resolve_media_identity
+            for obj in (media, meta, history):
+                if obj is None:
+                    continue
+                source, media_id = resolve_media_identity(media=obj)
+                if source and media_id:
+                    return f"id:{str(source).strip().casefold()}:{str(media_id).strip()}"
+        except Exception:
+            pass
+
+        # 兼容极老/测试环境没有官方 helper 的情况。
+        aliases = {
+            "tmdb": "themoviedb",
+            "themoviedb": "themoviedb",
+            "douban": "douban",
+            "bangumi": "bangumi",
+            "anilist": "anilist",
+        }
+        source = value(media, "source") or value(media, "media_source")
+        media_id = value(media, "media_id")
+        if not source:
+            source = value(meta, "media_source")
+        if media_id is None:
+            media_id = value(meta, "media_id")
+        if history is not None:
+            if not source:
+                source = value(history, "media_source")
+            if media_id is None:
+                media_id = value(history, "media_id")
+        source = aliases.get(cls._normalize_text(source), cls._normalize_text(source))
+        if source and media_id is not None and str(media_id).strip():
+            return f"id:{source}:{str(media_id).strip()}"
+
+        id_fields = (
+            ("themoviedb", ("tmdb_id", "tmdbid")),
+            ("douban", ("douban_id", "doubanid")),
+            ("bangumi", ("bangumi_id", "bangumiid")),
+            ("anilist", ("anilist_id", "anilistid")),
+        )
+        for identity_source, fields in id_fields:
+            for obj in (media, meta):
+                for field in fields:
+                    candidate = value(obj, field)
+                    if candidate is not None and str(candidate).strip():
+                        return f"id:{identity_source}:{str(candidate).strip()}"
+
+        title = (
+            value(media, "title")
+            or value(media, "original_title")
+            or value(meta, "name")
+            or value(meta, "title")
+            or value(history, "title")
+            or "未知媒体"
+        )
+        year = value(media, "year") or value(meta, "year") or value(history, "year") or ""
+        media_type = value(media, "type") or value(meta, "type") or value(history, "type") or ""
+        return (
+            f"title:{cls._normalize_text(title)}|year:{cls._normalize_text(year)}"
+            f"|type:{cls._normalize_text(media_type)}"
+        )
+
+    @classmethod
+    def _record_season(cls, record: dict):
+        """从队列任务/作业视图记录解析季号。"""
+        season = record.get("season")
+        if season is None:
+            meta = record.get("meta")
+            media = record.get("media")
+            for obj, fields in (
+                (meta, ("begin_season", "season")),
+                (media, ("season",)),
+            ):
+                for field in fields:
+                    try:
+                        candidate = getattr(obj, field, None) if obj is not None else None
+                    except Exception:
+                        candidate = None
+                    if candidate is not None:
+                        season = candidate
+                        break
+                if season is not None:
+                    break
+        try:
+            return int(season) if season is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _file_key(fileitem) -> Optional[tuple]:
+        """生成与 MP v2 JobManager 同口径的文件键。"""
+        try:
+            if fileitem is None:
+                return None
+            raw_path = getattr(fileitem, "path", None)
+            if not raw_path:
+                return None
+            path = str(raw_path).replace("\\", "/").rstrip("/") or "/"
+            path = Path(path).as_posix()
+            return str(getattr(fileitem, "storage", None) or "local"), path
+        except Exception:
+            return None
+
+    @classmethod
+    def _record_title(cls, record: dict) -> str:
+        """提取项目展示标题，优先已识别媒体标题。"""
+        media = record.get("media")
+        meta = record.get("meta")
+        for obj, fields in (
+            (media, ("title_year", "title", "original_title")),
+            (meta, ("name", "title")),
+        ):
+            for field in fields:
+                try:
+                    value = getattr(obj, field, None) if obj is not None else None
+                except Exception:
+                    value = None
+                if value:
+                    title = str(value).strip()
+                    if title:
+                        if field not in ("title_year",) and getattr(obj, "year", None):
+                            title = f"{title} ({getattr(obj, 'year')})"
+                        return title
+        return "未知媒体"
+
+    @staticmethod
+    def _record_episodes(record: dict) -> set[int]:
+        """提取单个任务的集数，供同剧同季合并展示。"""
+        meta = record.get("meta")
+        if meta is None:
+            return set()
+        try:
+            episodes = getattr(meta, "episode_list", None) or []
+            result = {int(ep) for ep in episodes if str(ep).strip().isdigit()}
+            if result:
+                return result
+            begin = getattr(meta, "begin_episode", None)
+            end = getattr(meta, "end_episode", None)
+            if begin is not None:
+                begin, end = int(begin), int(end or begin)
+                if 0 <= end - begin <= 200:
+                    return set(range(begin, end + 1))
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return set()
+
+    @staticmethod
+    def _format_episodes(episodes: set[int]) -> str:
+        """将集数集合压缩为 E01-E03、E05 的可读文本。"""
+        if not episodes:
+            return "集数未知"
+        values = sorted(episodes)
+        ranges = []
+        start = previous = values[0]
+        for value in values[1:]:
+            if value == previous + 1:
+                previous = value
+                continue
+            ranges.append((start, previous))
+            start = previous = value
+        ranges.append((start, previous))
+        return ", ".join(
+            f"E{begin:02d}" if begin == end else f"E{begin:02d}-E{end:02d}"
+            for begin, end in ranges
+        )
+
+    @staticmethod
+    def _history_is_subscribe(history) -> bool:
+        """判断 MP v2 DownloadHistory 是否来自订阅。"""
+        try:
+            note = getattr(history, "note", None)
+            source = note.get("source") if isinstance(note, dict) else None
+            return bool(source) and str(source).startswith("Subscribe|")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _queue_supported(queue) -> bool:
+        """判断当前队列是否具备本插件安全读写所需的结构。"""
+        return bool(
+            queue is not None
+            and type(queue).__name__ == "SubscribePriorityQueue"
+            and getattr(queue, "mutex", None) is not None
+            and isinstance(getattr(queue, "_heap", None), list)
+            and callable(getattr(queue, "get_nowait", None))
+            and callable(getattr(queue, "task_done", None))
+        )
+
+    @classmethod
+    def _snapshot_priority_items(cls, queue) -> list:
+        """锁内复制优先队列堆，不 pop、不改变 unfinished_tasks。"""
+        snapshot = getattr(queue, "snapshot_items", None)
+        if callable(snapshot):
+            return list(snapshot())
+        # 插件更新后的旧代队列没有新方法，但结构签名仍兼容。
+        with queue.mutex:
+            return list(queue._heap)
+
+    def _promote_queue_items(self, queue, file_keys: set[tuple]) -> int:
+        """将目标普通任务原地提升到 0.5，兼容跨代旧队列对象。"""
+        if not file_keys:
+            return 0
+
+        def matches(item) -> bool:
+            try:
+                task = getattr(item, "task", None)
+                return (
+                    self._file_key(getattr(task, "fileitem", None)) in file_keys
+                    and not self._detect_subscribe(item)
+                )
+            except Exception:
+                return False
+
+        promote = getattr(queue, "promote", None)
+        if callable(promote):
+            return int(promote(matches) or 0)
+
+        changed = 0
+        with queue.mutex:
+            updated = []
+            for priority, seq, item in queue._heap:
+                if priority == _NORMAL_PRIORITY and matches(item):
+                    priority = _MANUAL_PRIORITY
+                    changed += 1
+                updated.append((priority, seq, item))
+            if changed:
+                queue._heap[:] = updated
+                heapq.heapify(queue._heap)
+        return changed
+
+    def _load_history_map(self, hashes: set[str]) -> dict:
+        """一次性补查运行中任务的下载历史，避免页面请求形成 N+1 查询。"""
+        if not hashes:
+            return {}
+        try:
+            from app.db.downloadhistory_oper import DownloadHistoryOper
+            return DownloadHistoryOper().get_by_hashes(list(hashes)) or {}
+        except Exception as e:
+            logger.warning(f"【订阅优先整理】读取运行中任务下载来源失败：{e}")
+            return {}
+
+    def _collect_transfer_records(self) -> tuple[list, bool]:
+        """
+        合并等待队列与 MP v2 JobManager 的当前作业视图。
+
+        队列提供真实等待顺序；JobManager 补足已被消费者取走的运行中任务。
+        以 storage+path 去重，页面只显示请求瞬间快照。
+        """
+        chain = self._chain
+        if chain is None:
+            try:
+                transfer_module = importlib.import_module("app.chain.transfer")
+                chain = getattr(transfer_module, "TransferChain")()
+            except Exception as e:
+                logger.warning(f"【订阅优先整理】读取整理链失败：{e}")
+                return [], False
+        self._chain = chain
+        queue = getattr(chain, "_queue", None)
+        if not self._queue_supported(queue):
+            return [], False
+
+        records: dict[tuple, dict] = {}
+        try:
+            queue_items = sorted(
+                self._snapshot_priority_items(queue),
+                key=lambda entry: (entry[0], entry[1]),
+            )
+        except Exception as e:
+            logger.warning(f"【订阅优先整理】读取等待队列快照失败：{e}")
+            return [], False
+
+        for queue_index, entry in enumerate(queue_items):
+            try:
+                priority, seq, item = entry
+                task = getattr(item, "task", None)
+                fileitem = getattr(task, "fileitem", None)
+                file_key = self._file_key(fileitem)
+                if not task or not file_key:
+                    continue
+                records[file_key] = {
+                    "file_key": file_key,
+                    "media": getattr(task, "mediainfo", None),
+                    "meta": getattr(task, "meta", None),
+                    "season": None,
+                    "fileitem": fileitem,
+                    "download_hash": getattr(task, "download_hash", None),
+                    "history": getattr(task, "download_history", None),
+                    "subscribe": self._detect_subscribe(item),
+                    "priority": priority,
+                    "state": "waiting",
+                    "order": (1, priority, seq, queue_index),
+                }
+            except Exception:
+                continue
+
+        try:
+            jobs = chain.get_queue_tasks() or []
+        except Exception as e:
+            logger.warning(f"【订阅优先整理】读取 MP v2 作业视图失败：{e}")
+            jobs = []
+
+        hashes = {
+            str(getattr(job_task, "download_hash", "") or "")
+            for job in jobs
+            for job_task in (getattr(job, "tasks", None) or [])
+            if getattr(job_task, "download_hash", None)
+        }
+        history_map = self._load_history_map(hashes)
+
+        for job_index, job in enumerate(jobs):
+            job_media = getattr(job, "media", None)
+            job_season = getattr(job, "season", None)
+            for task_index, job_task in enumerate(getattr(job, "tasks", None) or []):
+                state = str(getattr(job_task, "state", None) or "waiting").lower()
+                if state in _TERMINAL_STATES:
+                    continue
+                fileitem = getattr(job_task, "fileitem", None)
+                file_key = self._file_key(fileitem)
+                if not file_key:
+                    continue
+                download_hash = str(getattr(job_task, "download_hash", "") or "")
+                is_subscribe = self._history_is_subscribe(history_map.get(download_hash))
+                record = records.get(file_key)
+                if record is not None:
+                    # 同一文件在等待队列和作业视图中只算一次；作业视图可补全媒体身份。
+                    if not record.get("media") and job_media:
+                        record["media"] = job_media
+                    if not record.get("meta") and getattr(job_task, "meta", None):
+                        record["meta"] = job_task.meta
+                    if record.get("season") is None and job_season is not None:
+                        record["season"] = job_season
+                    record["subscribe"] = bool(record["subscribe"] or is_subscribe)
+                    if state == "running":
+                        record["state"] = "running"
+                        record["order"] = (0, job_index, task_index)
+                    continue
+                records[file_key] = {
+                    "file_key": file_key,
+                    "media": job_media,
+                    "meta": getattr(job_task, "meta", None),
+                    "season": job_season,
+                    "fileitem": fileitem,
+                    "download_hash": download_hash,
+                    "history": history_map.get(download_hash),
+                    "subscribe": is_subscribe,
+                    "priority": None,
+                    "state": "running" if state == "running" else "waiting",
+                    "order": (
+                        (0, job_index, task_index)
+                        if state == "running"
+                        else (1, _NORMAL_PRIORITY, 10**12 + job_index, task_index)
+                    ),
+                }
+
+        return sorted(records.values(), key=lambda record: record["order"]), True
+
+    def _build_queue_view(self) -> dict:
+        """构造页面用的合并项目视图，并保留插队所需文件映射。"""
+        records, supported = self._collect_transfer_records()
+        groups = {}
+        for record in records:
+            season = self._record_season(record)
+            identity = self._media_identity_key(
+                media=record.get("media"),
+                meta=record.get("meta"),
+                history=record.get("history"),
+            )
+            raw_project_key = f"{identity}|season:{season if season is not None else '-'}"
+            project_key = hashlib.sha256(raw_project_key.encode("utf-8")).hexdigest()[:24]
+            group = groups.get(project_key)
+            if group is None:
+                group = {
+                    "project_key": project_key,
+                    "title": self._record_title(record),
+                    "season": season,
+                    "episodes": set(),
+                    "running": 0,
+                    "waiting": 0,
+                    "subscribe": 0,
+                    "normal": 0,
+                    "manual": 0,
+                    "promotable": 0,
+                    "order": record["order"],
+                    "file_keys": set(),
+                }
+                groups[project_key] = group
+            group["file_keys"].add(record["file_key"])
+            group["episodes"].update(self._record_episodes(record))
+            if record["state"] == "running":
+                group["running"] += 1
+            else:
+                group["waiting"] += 1
+            if record["subscribe"]:
+                group["subscribe"] += 1
+            else:
+                group["normal"] += 1
+                if record["priority"] == _MANUAL_PRIORITY:
+                    group["manual"] += 1
+                if (
+                    record["state"] != "running"
+                    and record["priority"] == _NORMAL_PRIORITY
+                ):
+                    group["promotable"] += 1
+            record["project_key"] = project_key
+
+        return {
+            "supported": supported,
+            "degraded": bool(
+                supported
+                and self._chain
+                and getattr(getattr(self._chain, "_queue", None), "_disabled", False)
+            ),
+            "records": records,
+            "groups": sorted(groups.values(), key=lambda group: group["order"]),
+        }
+
+    @staticmethod
+    def _api_event(path: str, method: str = "get", params: Optional[dict] = None) -> dict:
+        """生成 MP v2 Vuetify 页面按钮事件。"""
+        api = f"plugin/OguraTransferPriority{path}"
+        try:
+            from app.core.config import settings
+            token = getattr(settings, "API_TOKEN", None)
+            if token:
+                from urllib.parse import quote
+                api += f"?apikey={quote(str(token), safe='')}"
+        except Exception:
+            pass
+        event = {"api": api, "method": method}
+        if params:
+            event["params"] = params
+        return event
+
+    def api_queue(self) -> dict:
+        """页面刷新接口：只返回快照摘要，具体内容由 get_page 重载。"""
+        view = self._build_queue_view()
+        return {
+            "success": True,
+            "supported": view["supported"],
+            "degraded": bool(
+                self._chain
+                and getattr(getattr(self._chain, "_queue", None), "_disabled", False)
+            ),
+            "projects": len(view["groups"]),
+            "tasks": len(view["records"]),
+        }
+
+    def api_promote(self, project: str = "") -> dict:
+        """将指定项目中仍在等待的非订阅任务原地提升到 P0.5。"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用"}
+        view = self._build_queue_view()
+        if not view["supported"]:
+            return {"success": False, "message": "当前队列结构不支持手动插队"}
+        target_keys = {
+            record["file_key"]
+            for record in view["records"]
+            if (
+                record.get("project_key") == str(project)
+                and record["state"] != "running"
+                and record["priority"] == _NORMAL_PRIORITY
+                and not record["subscribe"]
+            )
+        }
+        queue = getattr(self._chain, "_queue", None) if self._chain else None
+        if not self._queue_supported(queue):
+            return {"success": False, "message": "当前队列结构不支持手动插队"}
+        if bool(getattr(queue, "_disabled", False)):
+            return {"success": False, "message": "插件当前处于降级模式，暂不可手动插队"}
+        promoted = self._promote_queue_items(queue, target_keys)
+        if promoted:
+            logger.info(
+                f"【订阅优先整理】手动插队项目 {str(project)[:24]}：已提升 {promoted} 个普通任务"
+            )
+        return {
+            "success": True,
+            "promoted": promoted,
+            "message": f"已将 {promoted} 个等待中的普通任务排到订阅之后",
+        }
+
     def get_state(self) -> bool:
         return self._enabled
 
@@ -516,13 +1054,155 @@ class OguraTransferPriority(_PluginBase):
     def get_command() -> list:
         return []
 
-    @staticmethod
-    def get_api() -> list:
-        return []
+    def get_api(self) -> List[Dict[str, Any]]:
+        """注册 MP v2 页面刷新与手动插队 API。"""
+        return [
+            {
+                "path": "/queue",
+                "endpoint": self.api_queue,
+                "methods": ["GET"],
+                "summary": "查看当前整理项目",
+                "description": "返回当前整理队列快照摘要，页面按钮用其触发刷新",
+            },
+            {
+                "path": "/promote",
+                "endpoint": self.api_promote,
+                "methods": ["POST"],
+                "summary": "手动插队整理项目",
+                "description": "将指定项目中等待的非订阅任务提升到订阅之后",
+            },
+        ]
 
     @staticmethod
     def get_service() -> list:
         return []
+
+    def get_page(self) -> List[dict]:
+        """MP v2 Vuetify 详情页：合并显示当前项目，并提供手动插队。"""
+        if not self._enabled:
+            return [{
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal"},
+                "text": "插件未启用，请先在设置中开启。",
+            }]
+
+        try:
+            view = self._build_queue_view()
+        except Exception as e:
+            logger.warning(f"【订阅优先整理】构造队列页面失败：{e}")
+            return [{
+                "component": "VAlert",
+                "props": {"type": "error", "variant": "tonal"},
+                "text": "读取当前整理队列失败，请稍后刷新。",
+            }]
+
+        header = {
+            "component": "div",
+            "props": {"class": "d-flex justify-space-between align-center flex-wrap"},
+            "content": [
+                {
+                    "component": "p",
+                    "props": {"class": "text-h6 mb-0"},
+                    "text": (
+                        f"当前整理项目：{len(view['groups'])} 个｜"
+                        f"任务：{len(view['records'])} 个"
+                    ),
+                },
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "size": "small",
+                        "variant": "tonal",
+                        "prepend-icon": "mdi-refresh",
+                    },
+                    "text": "刷新队列",
+                    "events": {"click": self._api_event("/queue")},
+                },
+            ],
+        }
+        content = [header]
+
+        if not view["supported"]:
+            content.append({
+                "component": "VAlert",
+                "props": {"type": "warning", "variant": "tonal", "class": "mt-3"},
+                "text": (
+                    "当前整理队列结构不支持安全查看/手动插队；"
+                    "插件核心整理功能不受影响。"
+                ),
+            })
+            return [{"component": "div", "content": content}]
+
+        if view.get("degraded"):
+            content.append({
+                "component": "VAlert",
+                "props": {"type": "warning", "variant": "tonal", "class": "mt-3"},
+                "text": "插件当前处于降级模式，暂不提供手动插队；正在整理与队列查看不受影响。",
+            })
+
+        if not view["groups"]:
+            content.append({
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal", "class": "mt-3"},
+                "text": "当前没有正在等待或执行的整理任务。",
+            })
+            return [{"component": "div", "content": content}]
+
+        for group in view["groups"]:
+            season_text = (
+                f"S{int(group['season']):02d}" if group["season"] is not None else "电影/季号未知"
+            )
+            state_text = f"正在整理 {group['running']}｜等待 {group['waiting']}"
+            source_text = f"订阅 {group['subscribe']}｜普通 {group['normal']}"
+            if group["manual"]:
+                source_text += f"｜已手动插队 {group['manual']}"
+            episode_text = self._format_episodes(group["episodes"])
+
+            card_content = [
+                {
+                    "component": "VCardTitle",
+                    "text": group["title"],
+                },
+                {
+                    "component": "VCardText",
+                    "props": {"class": "text-body-2", "style": "white-space:pre-wrap;"},
+                    "text": f"{season_text} · {episode_text}\n{state_text}\n{source_text}",
+                },
+            ]
+            if group["promotable"] and not view.get("degraded"):
+                card_content.append({
+                    "component": "VCardActions",
+                    "content": [{
+                        "component": "VBtn",
+                        "props": {
+                            "size": "small",
+                            "variant": "tonal",
+                            "color": "primary",
+                            "prepend-icon": "mdi-fast-forward",
+                        },
+                        "text": f"手动插队（{group['promotable']} 个普通任务）",
+                        "events": {
+                            "click": self._api_event(
+                                "/promote", method="post",
+                                params={"project": group["project_key"]},
+                            )
+                        },
+                    }],
+                })
+            elif group["manual"]:
+                card_content.append({
+                    "component": "VCardText",
+                    "props": {"class": "text-caption text-primary pt-0"},
+                    "text": "已手动插队；订阅任务仍然排在它前面。",
+                })
+
+            content.append({
+                "component": "VCard",
+                "props": {"variant": "tonal", "class": "mt-3"},
+                "content": card_content,
+            })
+
+        return [{"component": "div", "content": content}]
 
     def get_form(self):
         """
@@ -546,10 +1226,10 @@ class OguraTransferPriority(_PluginBase):
                                             "variant": "tonal",
                                             "title": "🚀 订阅优先整理",
                                             "text": (
-                                                "订阅下载的媒体插队到整理队列队首优先整理，"
-                                                "手动下载及其他来源保持原有先来后到顺序。"
+                                                "订阅任务仍排在整理队列最前；数据页会合并显示等待中与正在整理的项目，"
+                                                "同剧同季自动合并，并支持将等待中的普通任务手动插队到订阅之后。"
                                                 "适合 HDD 大盘机：订阅想尽快看，手动任务慢慢搬。"
-                                                "插件不影响正在整理中的任务，任务零丢失，停用后自动还原。"
+                                                "插件不影响正在整理中的任务，任务零丢失，停用后自动降级为 FIFO。"
                                             ),
                                         },
                                     }
@@ -606,13 +1286,9 @@ class OguraTransferPriority(_PluginBase):
             "notify_jump": True,
         }
 
-    @staticmethod
-    def get_page() -> Optional[list]:
-        return None
-
     def stop_service(self):
         """
-        插件停止：还原原生队列（按当前优先级顺序回填，不丢任务）。
+        插件停止：切换为降级 FIFO 模式，不交换队列引用，不丢任务。
         """
         self._restore_queue()
         if self._jump_notify_lock and self._jump_notified_hash:
