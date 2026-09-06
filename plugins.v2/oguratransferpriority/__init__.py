@@ -31,6 +31,13 @@ import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    from fastapi import Body
+except Exception:  # pragma: no cover - 本地单测环境可能未安装 FastAPI
+    def Body(default=None, **kwargs):
+        """返回本地测试环境中的请求体默认值。"""
+        return default
+
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
@@ -278,7 +285,7 @@ class OguraTransferPriority(_PluginBase):
         "支持同剧同季合并及普通任务手动插队；订阅仍排在最前，适合 HDD 等慢速存储环境。"
     )
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/SpeedLimiter.jpg"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "oguratransferpriority."
@@ -500,12 +507,14 @@ class OguraTransferPriority(_PluginBase):
             return False
 
     # ------------------------------------------------------------------ 通知
-    def _post(self, title: str, text: str):
-        """走插件消息通道发送通知，失败只记日志不影响功能。"""
+    def _post(self, title: str, text: str) -> bool:
+        """走插件消息通道发送通知，返回是否已提交。"""
         try:
             self.post_message(mtype=NotificationType.Plugin, title=title, text=text)
+            return True
         except Exception as e:
             logger.warning(f"【订阅优先整理】通知发送失败：{e}")
+            return False
 
     def notify_subscribe_jump(self, download_hash: str, title: str, ahead_of: int):
         """
@@ -1014,37 +1023,111 @@ class OguraTransferPriority(_PluginBase):
             "tasks": len(view["records"]),
         }
 
-    def api_promote(self, project: str = "") -> dict:
-        """将指定项目中仍在等待的非订阅任务原地提升到 P0.5。"""
+    def api_promote(
+        self,
+        project: str = "",
+        payload: Optional[Dict[str, Any]] = Body(default=None),
+    ) -> dict:
+        """将指定项目中仍在等待的非订阅任务原地提升到 P0.5。
+
+        MP v2 的 Vuetify 页面对 POST 事件使用 JSON 请求体；同时保留查询
+        参数兼容手工调用和旧版调用方。请求、命中数和通知结果均写入日志，
+        便于真机点击后直接定位闭环断点。
+        """
+        body_project = payload.get("project") if isinstance(payload, dict) else None
+        requested_project = str(body_project or project or "").strip()
+        logger.info(
+            "【订阅优先整理】收到手动插队请求："
+            f"body_project={'有' if body_project else '无'}，"
+            f"query_project={'有' if project else '无'}，"
+            f"project={'有' if requested_project else '空'}"
+        )
         if not self._enabled:
-            return {"success": False, "message": "插件未启用"}
+            logger.warning("【订阅优先整理】手动插队拒绝：插件未启用")
+            return {"success": False, "promoted": 0, "message": "插件未启用"}
+        if not requested_project:
+            logger.warning("【订阅优先整理】手动插队拒绝：缺少项目标识")
+            return {
+                "success": False,
+                "promoted": 0,
+                "message": "缺少项目标识，未执行插队",
+            }
         view = self._build_queue_view()
         if not view["supported"]:
-            return {"success": False, "message": "当前队列结构不支持手动插队"}
+            logger.warning("【订阅优先整理】手动插队拒绝：当前队列结构不支持")
+            return {
+                "success": False,
+                "promoted": 0,
+                "message": "当前队列结构不支持手动插队",
+            }
         target_keys = {
             record["file_key"]
             for record in view["records"]
             if (
-                record.get("project_key") == str(project)
+                record.get("project_key") == requested_project
                 and record["state"] != "running"
                 and record["priority"] == _NORMAL_PRIORITY
                 and not record["subscribe"]
             )
         }
+        logger.info(
+            f"【订阅优先整理】手动插队目标：项目={requested_project[:24]}，"
+            f"可提升={len(target_keys)}"
+        )
         queue = getattr(self._chain, "_queue", None) if self._chain else None
         if not self._queue_supported(queue):
-            return {"success": False, "message": "当前队列结构不支持手动插队"}
+            logger.warning("【订阅优先整理】手动插队拒绝：当前队列结构不支持")
+            return {
+                "success": False,
+                "promoted": 0,
+                "message": "当前队列结构不支持手动插队",
+            }
         if bool(getattr(queue, "_disabled", False)):
-            return {"success": False, "message": "插件当前处于降级模式，暂不可手动插队"}
+            logger.warning("【订阅优先整理】手动插队拒绝：插件处于降级模式")
+            return {
+                "success": False,
+                "promoted": 0,
+                "message": "插件当前处于降级模式，暂不可手动插队",
+            }
         promoted = self._promote_queue_items(queue, target_keys)
         if promoted:
             logger.info(
-                f"【订阅优先整理】手动插队项目 {str(project)[:24]}：已提升 {promoted} 个普通任务"
+                f"【订阅优先整理】手动插队成功：项目={requested_project[:24]}，"
+                f"提升={promoted} 个普通任务"
+            )
+            group = next(
+                (
+                    item
+                    for item in view["groups"]
+                    if item.get("project_key") == requested_project
+                ),
+                None,
+            )
+            title = group.get("title", "未知媒体") if group else "未知媒体"
+            if self._notify:
+                notify_ok = self._post(
+                    "⏫ 手动插队整理成功",
+                    f"《{title}》已将 {promoted} 个等待中的普通任务排到订阅任务之后。",
+                )
+                logger.info(
+                    "【订阅优先整理】手动插队通知结果："
+                    f"{'已提交' if notify_ok else '提交失败'}"
+                )
+            else:
+                logger.info("【订阅优先整理】手动插队通知结果：已关闭")
+        else:
+            logger.info(
+                f"【订阅优先整理】手动插队未改变队列：项目={requested_project[:24]}，"
+                "目标已开始整理、已插队或已不存在"
             )
         return {
             "success": True,
             "promoted": promoted,
-            "message": f"已将 {promoted} 个等待中的普通任务排到订阅之后",
+            "message": (
+                f"已将 {promoted} 个等待中的普通任务排到订阅之后"
+                if promoted
+                else "没有可提升的等待中普通任务，可能已插队或已开始整理"
+            ),
         }
 
     def get_state(self) -> bool:
