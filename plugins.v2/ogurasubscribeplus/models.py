@@ -33,6 +33,8 @@ class PluginConfig:
     season_pack_cleanup: str = "off"
     season_pack_full_download: bool = False
     candidate_cache_days: int = 3
+    # 批量扫描时相邻订阅之间的缓冲秒数，用于避开限流站点（如观众 CF 盾）；0 = 不缓冲
+    search_interval: int = 0
     # 新增：Telegram 白名单用户 ID（逗号分隔的数字列表）
     tg_user_ids: Optional[str] = None
 
@@ -56,6 +58,7 @@ class PluginConfig:
         config.allow_tg_rule_update = bool(config.allow_tg_rule_update)
         config.season_pack_full_download = bool(config.season_pack_full_download)
         config.candidate_cache_days = max(0, int(config.candidate_cache_days or 0))
+        config.search_interval = max(0, int(config.search_interval or 0))
         from .season_cleanup import normalize_cleanup_mode
 
         config.season_pack_cleanup = normalize_cleanup_mode(config.season_pack_cleanup)

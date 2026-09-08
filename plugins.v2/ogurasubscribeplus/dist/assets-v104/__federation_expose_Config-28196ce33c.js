@@ -57,6 +57,11 @@ const fields = [
     label: 'PT搜索范围', optionsKey: 'sites', clearable: true, cols: { md: 6 },
     hint: '插件诊断搜索的站点，留空用 MP 默认搜索站点',
   },
+  {
+    key: 'search_interval', group: 'scan', section: '扫描范围', type: 'number',
+    label: '订阅搜索间隔', min: 0, unit: '秒', cols: { md: 6 },
+    hint: '批量扫描时相邻两个订阅之间的缓冲秒数，用于避开站点限流（如观众 CF 盾），建议 30-60；0 = 不缓冲。手动单订阅诊断不受影响',
+  },
 
   // ---- 通知权限 ----
   {
@@ -121,6 +126,7 @@ const defaults = {
   season_pack_full_download: false,
   candidate_cache_days: 3,
   tg_user_ids: '',
+  search_interval: 0,
 };
 
 /**
@@ -494,6 +500,10 @@ function applyInitialConfig(source = props.initialConfig) {
       initial.candidate_cache_days === undefined || initial.candidate_cache_days === null
         ? 3
         : Number(initial.candidate_cache_days),
+    search_interval:
+      initial.search_interval === undefined || initial.search_interval === null
+        ? 0
+        : Number(initial.search_interval),
   });
 }
 
@@ -763,6 +773,7 @@ function buildConfigPayload() {
     delay_days: Number(config.delay_days),
     max_scan_subscribes: Number(config.max_scan_subscribes),
     candidate_cache_days: Number(config.candidate_cache_days),
+    search_interval: Number(config.search_interval),
     search_sites: Array.isArray(config.search_sites) ? [...config.search_sites] : [],
     selected_categories: Array.isArray(config.selected_categories) ? [...config.selected_categories] : [],
   }

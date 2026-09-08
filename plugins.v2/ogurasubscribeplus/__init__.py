@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import re
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -140,7 +141,7 @@ class OguraSubscribePlus(_PluginBase):
     plugin_name = "小仓酱的订阅补全助手"
     plugin_desc = "检测已播出但未入库的电视剧订阅，并分析 PT 资源、识别和订阅规则原因。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/ogurasubscribeplus.png"
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "ogurasubscribeplus_"
@@ -193,7 +194,7 @@ class OguraSubscribePlus(_PluginBase):
         self._category_cache = {}
         self._custom_release_groups_cache = []
         logger.info(
-            "小仓酱的订阅补全助手 1.0.6 已加载："
+            "小仓酱的订阅补全助手 1.0.7 已加载："
             f"enabled={self._plugin_config.enabled}，"
             f"notifications_enabled={self._plugin_config.notifications_enabled}，"
             "frontend=dist/assets-v104"
@@ -596,7 +597,17 @@ class OguraSubscribePlus(_PluginBase):
             f"候选={len(inputs)}，本批={len(batch)}，起点={cursor}，下次起点={next_cursor}，"
             f"订阅={[item.title for item in batch]}"
         )
-        for item in batch:
+        interval = max(0, int(getattr(config, "search_interval", 0) or 0))
+        for index, item in enumerate(batch):
+            if index > 0 and interval > 0:
+                logger.info(
+                    f"小仓酱的订阅补全助手订阅缓冲 {interval} 秒后继续：{item.title}"
+                    f"（{index + 1}/{len(batch)}）"
+                )
+                try:
+                    time.sleep(interval)
+                except Exception as exc:  # 中断/时钟异常时不阻断扫描
+                    logger.warning(f"小仓酱的订阅补全助手缓冲等待中断，继续扫描：{exc}")
             diagnosis = self._diagnose_item(item)
             if not diagnosis:
                 continue

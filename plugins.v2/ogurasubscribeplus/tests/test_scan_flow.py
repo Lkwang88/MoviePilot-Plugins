@@ -308,5 +308,64 @@ class ScanFlowTest(unittest.TestCase):
         self.assertTrue(diagnosis.candidates[0]["download_payload"])
 
 
+class ScanIntervalTest(unittest.TestCase):
+    def make_plugin(self, items, **config):
+        plugin = OguraSubscribePlus()
+        plugin._plugin_config = PluginConfig(
+            enabled=True,
+            notifications_enabled=False,
+            max_scan_subscribes=50,
+            **config,
+        )
+        plugin._store = FakeStore()
+        plugin._scanner = FakeScanner(items)
+        plugin._site_resolver = object()
+        plugin._diagnose_item = lambda _item: None
+        return plugin
+
+    def test_sleep_called_between_subscriptions_with_interval(self):
+        items = [make_input(), make_input(), make_input()]
+        plugin = self.make_plugin(items, search_interval=30)
+        sleeps = []
+        with patch("ogurasubscribeplus.time.sleep", side_effect=sleeps.append):
+            plugin.run_scan()
+
+        self.assertEqual(sleeps, [30, 30])
+
+    def test_no_sleep_when_interval_is_zero(self):
+        items = [make_input(), make_input()]
+        plugin = self.make_plugin(items, search_interval=0)
+        sleeps = []
+        with patch("ogurasubscribeplus.time.sleep", side_effect=sleeps.append):
+            plugin.run_scan()
+
+        self.assertEqual(sleeps, [])
+
+    def test_no_sleep_before_first_subscription(self):
+        items = [make_input()]
+        plugin = self.make_plugin(items, search_interval=45)
+        sleeps = []
+        with patch("ogurasubscribeplus.time.sleep", side_effect=sleeps.append):
+            plugin.run_scan()
+
+        self.assertEqual(sleeps, [])
+
+    def test_interval_below_zero_is_normalized(self):
+        plugin = OguraSubscribePlus()
+        config = PluginConfig.from_dict({"search_interval": -5})
+        self.assertEqual(config.search_interval, 0)
+
+    def test_interval_logged_before_each_wait(self):
+        items = [make_input(), make_input()]
+        plugin = self.make_plugin(items, search_interval=20)
+        infos = []
+        with patch("ogurasubscribeplus.time.sleep"), patch.object(
+            ogurasubscribeplus_module.logger, "info", side_effect=infos.append
+        ):
+            plugin.run_scan()
+
+        self.assertTrue(any("订阅缓冲 20 秒" in str(m) for m in infos))
+
+
 if __name__ == "__main__":
     unittest.main()
