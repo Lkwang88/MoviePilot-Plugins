@@ -9,28 +9,64 @@ from ogurasubscribeplus.models import PluginConfig
 class SchedulerServiceTest(unittest.TestCase):
     def setUp(self):
         self.plugin = OguraSubscribePlus()
-        self.plugin._plugin_config = PluginConfig(enabled=True, cron="*/5 * * * *")
+        self.plugin._plugin_config = PluginConfig(enabled=True, scan_times=["07:15", "19:45"])
 
-    def test_service_passes_source_to_function_not_scheduler(self):
-        service = self.plugin.get_service()[0]
+    def test_service_registers_one_job_per_explicit_time(self):
+        # 本地纯测试环境可能没有 APScheduler；模拟宿主可用的最小触发器。
+        class FakeCronTrigger:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
 
-        self.assertEqual(service["func"], self.plugin.run_scan)
-        self.assertEqual(service.get("kwargs"), None)
-        self.assertEqual(service["func_kwargs"], {"source": "schedule"})
+        with patch("ogurasubscribeplus.CronTrigger", FakeCronTrigger):
+            services = self.plugin.get_service()
 
-    def test_service_can_be_registered_without_function_kwargs_leaking(self):
-        service = self.plugin.get_service()[0]
-        captured = {}
+        self.assertEqual([service["id"] for service in services], ["scan_0715", "scan_1945"])
+        self.assertEqual([service["name"] for service in services], [
+            "小仓酱的订阅补全助手扫描（07:15）",
+            "小仓酱的订阅补全助手扫描（19:45）",
+        ])
+        self.assertTrue(all(service["func"] == self.plugin.run_scheduled_scan for service in services))
+        self.assertEqual([service["trigger"].kwargs for service in services], [
+            {"hour": 7, "minute": 15}, {"hour": 19, "minute": 45},
+        ])
 
-        def add_job(func, trigger, **kwargs):
-            captured.update(kwargs)
+    def test_disabled_plugin_registers_no_jobs(self):
+        self.plugin._plugin_config.enabled = False
+        self.assertEqual(self.plugin.get_service(), [])
 
-        add_job(service["func"], service["trigger"], **(service.get("kwargs") or {}),
-                kwargs={"job_id": "OguraSubscribePlus_ogurasubscribeplus_scan"},
-                replace_existing=True)
+    def test_scheduled_scan_defers_five_minutes_then_runs(self):
+        self.plugin._plugin_config = PluginConfig(enabled=True, system_refresh_retry_minutes=5)
+        checks = [True, False]
+        self.plugin._scan_is_running = lambda: checks.pop(0)
+        calls = []
+        self.plugin._run_scan_unlocked = lambda source: calls.append(source) or {"success": True, "source": source}
 
-        self.assertNotIn("source", captured)
-        self.assertEqual(captured["kwargs"], {"job_id": "OguraSubscribePlus_ogurasubscribeplus_scan"})
+        with patch("ogurasubscribeplus.time.sleep") as sleep:
+            result = self.plugin.run_scheduled_scan()
+
+        sleep.assert_called_once_with(300)
+        self.assertEqual(calls, ["schedule"])
+        self.assertTrue(result["success"])
+
+    def test_scheduled_scan_skips_when_plugin_is_already_busy(self):
+        self.assertTrue(self.plugin._scan_lock.acquire(blocking=False))
+        try:
+            result = self.plugin.run_scheduled_scan()
+        finally:
+            self.plugin._scan_lock.release()
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "plugin_scan_running")
+
+    def test_manual_scan_skips_when_scheduled_scan_or_wait_is_busy(self):
+        self.assertTrue(self.plugin._scan_lock.acquire(blocking=False))
+        try:
+            result = self.plugin.run_scan()
+        finally:
+            self.plugin._scan_lock.release()
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "plugin_scan_running")
 
 
 class ConfigSaveSchedulerTest(unittest.TestCase):
@@ -209,7 +245,7 @@ class RuntimeDiagnosisLogTest(unittest.TestCase):
 
         messages = [str(call.args[0]) for call in info.call_args_list if call.args]
         self.assertTrue(any("已加载" in message for message in messages))
-        self.assertTrue(any("frontend=dist/assets-v104" in message for message in messages))
+        self.assertTrue(any("frontend=dist/assets-v110" in message for message in messages))
         self.assertTrue(any("启动通知已提交到 Telegram 插件通道" in message for message in messages))
 
 

@@ -4,7 +4,9 @@ import asyncio
 import copy
 import hashlib
 import json
+import random
 import re
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -141,7 +143,7 @@ class OguraSubscribePlus(_PluginBase):
     plugin_name = "小仓酱的订阅补全助手"
     plugin_desc = "检测已播出但未入库的电视剧订阅，并分析 PT 资源、识别和订阅规则原因。"
     plugin_icon = "https://raw.githubusercontent.com/Lkwang88/MoviePilot-Plugins/main/icons/ogurasubscribeplus.png"
-    plugin_version = "1.0.7"
+    plugin_version = "1.1.0"
     plugin_author = "Lkwang88"
     author_url = "https://github.com/Lkwang88"
     plugin_config_prefix = "ogurasubscribeplus_"
@@ -162,6 +164,8 @@ class OguraSubscribePlus(_PluginBase):
         self._category_cache = {}
         self._custom_release_groups_cache = []
         self._notification_active = False
+        # 所有来源共用一把锁：定时、手动与退避等待均不允许叠加搜索。
+        self._scan_lock = threading.Lock()
 
     # 说明：这些成员在 init_plugin 中初始化实例属性；此处仅做类型注解，
     # 避免使用类级可变默认值（dict/list）导致多实例间状态共享的隐患。
@@ -194,10 +198,10 @@ class OguraSubscribePlus(_PluginBase):
         self._category_cache = {}
         self._custom_release_groups_cache = []
         logger.info(
-            "小仓酱的订阅补全助手 1.0.7 已加载："
+            "小仓酱的订阅补全助手 1.1.0 已加载："
             f"enabled={self._plugin_config.enabled}，"
             f"notifications_enabled={self._plugin_config.notifications_enabled}，"
-            "frontend=dist/assets-v104"
+            "frontend=dist/assets-v110"
         )
         self._sync_startup_notification()
 
@@ -206,7 +210,7 @@ class OguraSubscribePlus(_PluginBase):
 
     @staticmethod
     def get_render_mode() -> Tuple[str, Optional[str]]:
-        return "vue", "dist/assets-v104"
+        return "vue", "dist/assets-v110"
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -230,22 +234,21 @@ class OguraSubscribePlus(_PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._plugin_config.enabled:
             return []
-        trigger = self._plugin_config.cron
-        if CronTrigger:
-            try:
-                trigger = CronTrigger.from_crontab(self._plugin_config.cron)
-            except Exception as exc:
-                logger.warning(f"小仓酱的订阅补全助手 Cron 配置无效，使用每日 9 点：{exc}")
-                trigger = CronTrigger.from_crontab("0 9 * * *")
-        return [
-            {
-                "id": "ogurasubscribeplus_scan",
-                "name": "小仓酱的订阅补全助手扫描",
-                "trigger": trigger,
-                "func": self.run_scan,
-                "func_kwargs": {"source": "schedule"},
-            }
-        ]
+        if not CronTrigger:
+            logger.warning("小仓酱的订阅补全助手无法注册定时扫描：APScheduler CronTrigger 不可用")
+            return []
+        services = []
+        for scan_time in self._plugin_config.scan_times:
+            hour, minute = (int(part) for part in scan_time.split(":"))
+            services.append(
+                {
+                    "id": f"scan_{hour:02d}{minute:02d}",
+                    "name": f"小仓酱的订阅补全助手扫描（{scan_time}）",
+                    "trigger": CronTrigger(hour=hour, minute=minute),
+                    "func": self.run_scheduled_scan,
+                }
+            )
+        return services
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -581,7 +584,52 @@ class OguraSubscribePlus(_PluginBase):
             return {"success": False, "message": "缺少确认 token"}
         return self._rule_confirm(str(token))
 
+    def _scan_is_running(self) -> bool:
+        """查询 MP 系统订阅刷新是否正在运行；查询异常不阻断正常扫描。"""
+        try:
+            from app.scheduler import Scheduler
+            progress = Scheduler().get_progress("subscribe_refresh")
+            status = str(getattr(progress, "status", "") or "").lower()
+            return status in {"running", "正在运行"}
+        except Exception as exc:
+            logger.warning(f"小仓酱的订阅补全助手读取系统订阅刷新状态失败，继续本轮扫描：{exc}")
+            return False
+
+    def run_scheduled_scan(self) -> Dict[str, Any]:
+        """定时入口：系统订阅刷新优先，冲突时每 5 分钟退避后重查。"""
+        if not self._scan_lock.acquire(blocking=False):
+            logger.warning("小仓酱的订阅补全助手定时扫描跳过：已有插件扫描或退避等待正在进行")
+            return {"success": False, "skipped": True, "reason": "plugin_scan_running", "source": "schedule"}
+        try:
+            config = self._plugin_config
+            retry_seconds = max(1, int(config.system_refresh_retry_minutes or 5)) * 60
+            while config.defer_on_system_refresh and self._scan_is_running():
+                logger.info(
+                    "小仓酱的订阅补全助手检测到系统订阅刷新正在运行，"
+                    f"本轮定时扫描退避 {retry_seconds // 60} 分钟后重查"
+                )
+                try:
+                    time.sleep(retry_seconds)
+                except Exception as exc:
+                    logger.warning(f"小仓酱的订阅补全助手退避等待中断，本轮扫描取消：{exc}")
+                    return {"success": False, "skipped": True, "reason": "defer_interrupted", "source": "schedule"}
+                config = self._plugin_config
+            return self._run_scan_unlocked(source="schedule")
+        finally:
+            self._scan_lock.release()
+
     def run_scan(self, source: str = "manual") -> Dict[str, Any]:
+        """手动入口：不与定时扫描或其退避等待并发。"""
+        if not self._scan_lock.acquire(blocking=False):
+            logger.warning("小仓酱的订阅补全助手扫描跳过：已有插件扫描或退避等待正在进行")
+            return {"success": False, "skipped": True, "reason": "plugin_scan_running", "source": source}
+        try:
+            return self._run_scan_unlocked(source=source)
+        finally:
+            self._scan_lock.release()
+
+    def _run_scan_unlocked(self, source: str) -> Dict[str, Any]:
+        """实际扫描逻辑；调用方必须已持有 _scan_lock。"""
         config = self._plugin_config
         store = self._ensure_store()
         scanner = self._ensure_scanner()
@@ -600,12 +648,15 @@ class OguraSubscribePlus(_PluginBase):
         interval = max(0, int(getattr(config, "search_interval", 0) or 0))
         for index, item in enumerate(batch):
             if index > 0 and interval > 0:
+                # 对齐 MP 订阅补全的 1-5 分钟随机休眠：配置值是下限，
+                # 上限至少 300 秒，避免固定节奏持续撞到观众的限流窗口。
+                wait_seconds = random.randint(interval, max(interval, 300))
                 logger.info(
-                    f"小仓酱的订阅补全助手订阅缓冲 {interval} 秒后继续：{item.title}"
-                    f"（{index + 1}/{len(batch)}）"
+                    f"小仓酱的订阅补全助手订阅随机缓冲 {wait_seconds} 秒后继续：{item.title}"
+                    f"（配置下限 {interval} 秒，{index + 1}/{len(batch)}）"
                 )
                 try:
-                    time.sleep(interval)
+                    time.sleep(wait_seconds)
                 except Exception as exc:  # 中断/时钟异常时不阻断扫描
                     logger.warning(f"小仓酱的订阅补全助手缓冲等待中断，继续扫描：{exc}")
             diagnosis = self._diagnose_item(item)

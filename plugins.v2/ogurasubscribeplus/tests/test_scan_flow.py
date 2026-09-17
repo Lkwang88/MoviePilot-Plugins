@@ -323,14 +323,17 @@ class ScanIntervalTest(unittest.TestCase):
         plugin._diagnose_item = lambda _item: None
         return plugin
 
-    def test_sleep_called_between_subscriptions_with_interval(self):
+    def test_random_sleep_uses_configured_floor_between_subscriptions(self):
         items = [make_input(), make_input(), make_input()]
-        plugin = self.make_plugin(items, search_interval=30)
+        plugin = self.make_plugin(items, search_interval=90)
         sleeps = []
-        with patch("ogurasubscribeplus.time.sleep", side_effect=sleeps.append):
+        with patch("ogurasubscribeplus.random.randint", side_effect=[123, 299]) as randint, patch(
+            "ogurasubscribeplus.time.sleep", side_effect=sleeps.append
+        ):
             plugin.run_scan()
 
-        self.assertEqual(sleeps, [30, 30])
+        self.assertEqual(sleeps, [123, 299])
+        self.assertEqual(randint.call_args_list, [((90, 300),), ((90, 300),)])
 
     def test_no_sleep_when_interval_is_zero(self):
         items = [make_input(), make_input()]
@@ -364,7 +367,7 @@ class ScanIntervalTest(unittest.TestCase):
         ):
             plugin.run_scan()
 
-        self.assertTrue(any("订阅缓冲 20 秒" in str(m) for m in infos))
+        self.assertTrue(any("订阅随机缓冲" in str(m) and "配置下限 20 秒" in str(m) for m in infos))
 
 
 if __name__ == "__main__":

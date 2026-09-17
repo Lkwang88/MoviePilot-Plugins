@@ -34,9 +34,14 @@ export const fields = [
     hint: '单集播出超过 N 天仍未入库才触发诊断',
   },
   {
-    key: 'cron', group: 'scan', section: '扫描窗口', type: 'text',
-    label: 'Cron', cols: { md: 4 },
-    hint: '每 6 小时建议写 0 */6 * * *', validate: 'cron',
+    key: 'scan_times', group: 'scan', section: '扫描窗口', type: 'time-list',
+    label: '每日扫描时刻', cols: { md: 8 },
+    hint: '直接添加每天执行的时刻（最多 8 次）；不再需要 Cron。建议避开 MP Spider 的订阅刷新时段。',
+  },
+  {
+    key: 'defer_on_system_refresh', group: 'scan', section: '冲突保护', type: 'switch',
+    label: '系统订阅刷新时自动退避', color: 'success', cols: { md: 6 },
+    hint: '检测到 MP 系统订阅刷新正在运行时，本插件不启动搜索，每 5 分钟重查；系统刷新优先。',
   },
   {
     key: 'max_scan_subscribes', group: 'scan', section: '扫描窗口', type: 'number',
@@ -53,12 +58,22 @@ export const fields = [
     label: 'PT搜索范围', optionsKey: 'sites', clearable: true, cols: { md: 6 },
     hint: '插件诊断搜索的站点，留空用 MP 默认搜索站点',
   },
+  {
+    key: 'search_interval', group: 'scan', section: '扫描范围', type: 'number',
+    label: '订阅搜索间隔', min: 0, unit: '秒', cols: { md: 6 },
+    hint: '批量扫描时相邻订阅的随机缓冲下限；实际每次随机等候“设定值～300 秒”（设定值超过 300 时按设定值）。用于避开观众等站点限流；0 = 不缓冲。手动单订阅诊断不受影响。',
+  },
 
   // ---- 通知权限 ----
   {
     key: 'notifications_enabled', group: 'notify', section: '通知渠道', type: 'switch',
     label: '开启通知', color: 'success', cols: { md: 6 },
     hint: '关闭后不发送诊断、扫描完成和整季包处理通知；不影响扫描与下载逻辑',
+  },
+  {
+    key: 'tg_user_ids', group: 'notify', section: '通知渠道', type: 'text',
+    label: 'Telegram 白名单用户 ID', cols: { md: 12 },
+    hint: '可选：逗号/空格分隔的 Telegram 用户数字 ID。配置后通知只发给这些用户（绕过 MP 全局通知开关）；留空则按 MP 全局通知设置广播',
   },
   {
     key: 'notify_scan_complete', group: 'notify', section: '通知渠道', type: 'switch',
@@ -100,7 +115,8 @@ export const fields = [
 export const defaults = {
   enabled: false,
   delay_days: 1,
-  cron: '0 9 * * *',
+  scan_times: ['09:00'],
+  defer_on_system_refresh: true,
   selected_categories: [],
   search_sites: [],
   max_scan_subscribes: 20,
@@ -111,6 +127,8 @@ export const defaults = {
   season_pack_cleanup: 'off',
   season_pack_full_download: false,
   candidate_cache_days: 3,
+  tg_user_ids: '',
+  search_interval: 0,
 }
 
 /**

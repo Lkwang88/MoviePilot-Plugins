@@ -221,6 +221,13 @@
                     </div>
                     <div class="sp-field-control" :class="'sp-ctl-' + field.type">
                       <VSwitch v-if="field.type === 'switch'" v-model="config[field.key]" :color="field.color || 'primary'" inset hide-details density="compact" />
+                      <div v-else-if="field.type === 'time-list'" class="sp-time-list">
+                        <div v-for="(scanTime, index) in config.scan_times" :key="index" class="sp-time-item">
+                          <VTextField v-model="config.scan_times[index]" type="time" variant="outlined" density="compact" hide-details rounded="lg" />
+                          <VBtn icon="mdi-close" color="error" variant="text" size="small" :disabled="config.scan_times.length <= 1" @click="removeScanTime(index)" />
+                        </div>
+                        <VBtn color="primary" variant="tonal" size="small" prepend-icon="mdi-plus" :disabled="config.scan_times.length >= 8" @click="addScanTime">添加时刻</VBtn>
+                      </div>
                       <VTextField v-else-if="field.type === 'number'" v-model.number="config[field.key]" type="number" :min="field.min" variant="outlined" density="compact" hide-details rounded="lg" />
                       <VTextField v-else-if="field.type === 'text'" v-model="config[field.key]" variant="outlined" density="compact" hide-details="auto" rounded="lg" :error-messages="field.validate === 'cron' ? cronError : ''" />
                       <VSelect v-else-if="field.type === 'select'" v-model="config[field.key]" :items="field.options" item-title="title" item-value="value" variant="outlined" density="compact" hide-details rounded="lg" />
@@ -352,7 +359,7 @@ const loading = ref(false)
 const saving = ref(false)
 const saveMessage = ref('')
 const saveSnackbar = ref(false)
-const cronError = ref('')
+const scanTimesError = ref('')
 
 // ===== 配置（元数据驱动）=====
 const config = reactive({ ...defaults })
@@ -437,25 +444,32 @@ const enabledFeatureCount = computed(() => [
   Number(config.candidate_cache_days) > 0,
 ].filter(Boolean).length)
 
-const scanScheduleText = computed(() => describeCron(config.cron))
+const scanScheduleText = computed(() => config.scan_times?.length ? config.scan_times.join('、') : '未设置')
 const candidateCacheText = computed(() => Number(config.candidate_cache_days) > 0 ? `${config.candidate_cache_days} 天` : '已关闭')
 const lastScanText = computed(() => formatCompactDateTime(status.value.last_scan))
 
-function describeCron(value) {
-  const cron = String(value || '').trim()
-  const parts = cron.split(/\s+/)
-  if (parts.length !== 5) return cron || '-'
-  const [minute, hour, day, month, weekday] = parts
-  if (day === '*' && month === '*' && weekday === '*') {
-    if (/^\d+$/.test(minute) && /^\d+$/.test(hour)) {
-      return `每天 ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+function normalizeScanTimes(value) {
+  const list = Array.isArray(value) ? value : []
+  const normalized = new Set()
+  for (const item of list) {
+    const match = String(item || '').trim().match(/^(\d{1,2}):(\d{2})$/)
+    if (!match) continue
+    const hour = Number(match[1])
+    const minute = Number(match[2])
+    if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+      normalized.add(`${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`)
     }
-    const hourStep = hour.match(/^\*\/(\d+)$/)
-    if (minute === '0' && hourStep) return `每 ${hourStep[1]} 小时`
-    const minuteStep = minute.match(/^\*\/(\d+)$/)
-    if (hour === '*' && minuteStep) return `每 ${minuteStep[1]} 分钟`
   }
-  return cron
+  return [...normalized].sort()
+}
+
+function addScanTime() {
+  if (!Array.isArray(config.scan_times)) config.scan_times = []
+  if (config.scan_times.length < 8) config.scan_times.push('09:00')
+}
+
+function removeScanTime(index) {
+  if (config.scan_times.length > 1) config.scan_times.splice(index, 1)
 }
 
 function formatCompactDateTime(value) {
@@ -544,6 +558,8 @@ function applyInitialConfig(source = props.initialConfig) {
     search_sites: Array.isArray(initial.search_sites)
       ? [...initial.search_sites]
       : [],
+    scan_times: normalizeScanTimes(initial.scan_times?.length ? initial.scan_times : config.scan_times),
+    defer_on_system_refresh: initial.defer_on_system_refresh !== false,
     season_pack_cleanup: initial.season_pack_cleanup || 'off',
     season_pack_full_download: Boolean(initial.season_pack_full_download),
     candidate_cache_days:
@@ -635,6 +651,7 @@ async function testNotify() {
 }
 
 
+async function clearResults() {
   clearing.value = true
   error.value = ''
   try {
@@ -814,8 +831,10 @@ async function confirmRule() {
 }
 
 function buildConfigPayload() {
+  const scanTimes = normalizeScanTimes(config.scan_times)
   return {
     ...config,
+    scan_times: scanTimes,
     delay_days: Number(config.delay_days),
     max_scan_subscribes: Number(config.max_scan_subscribes),
     candidate_cache_days: Number(config.candidate_cache_days),
@@ -825,11 +844,14 @@ function buildConfigPayload() {
 }
 
 async function saveConfig() {
-  cronError.value = validateCron(config.cron)
-  if (cronError.value) {
+  const scanTimes = normalizeScanTimes(config.scan_times)
+  scanTimesError.value = scanTimes.length ? '' : '请至少保留一个有效的每日扫描时刻'
+  if (scanTimesError.value) {
     activeGroup.value = 'scan'
+    error.value = scanTimesError.value
     return
   }
+  config.scan_times = scanTimes
   const payload = buildConfigPayload()
   error.value = ''
   saving.value = true

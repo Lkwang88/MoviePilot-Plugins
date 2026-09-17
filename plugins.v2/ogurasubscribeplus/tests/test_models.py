@@ -12,7 +12,7 @@ class PluginConfigTest(unittest.TestCase):
 
         self.assertEqual(plugin.plugin_name, "小仓酱的订阅补全助手")
         self.assertEqual(plugin.plugin_config_prefix, "ogurasubscribeplus_")
-        self.assertEqual(plugin.get_render_mode(), ("vue", "dist/assets-v104"))
+        self.assertEqual(plugin.get_render_mode(), ("vue", "dist/assets-v110"))
 
     def test_config_defaults_select_all_categories_and_mp_sites(self):
         config = PluginConfig.from_dict({})
@@ -29,6 +29,31 @@ class PluginConfigTest(unittest.TestCase):
         self.assertEqual(config.delay_days, 0)
         self.assertEqual(config.max_scan_subscribes, 1)
         self.assertEqual(config.notifications_enabled, False)
+
+    def test_config_normalizes_explicit_scan_times_and_retry(self):
+        config = PluginConfig.from_dict({
+            "scan_times": ["7:05", "19:45", "07:05", "bad", "24:00"],
+            "system_refresh_retry_minutes": 0,
+        })
+
+        self.assertEqual(config.scan_times, ["07:05", "19:45"])
+        self.assertEqual(config.system_refresh_retry_minutes, 5)
+        self.assertTrue(config.defer_on_system_refresh)
+
+    def test_config_limits_explicit_scan_times_to_eight(self):
+        config = PluginConfig.from_dict({"scan_times": [f"{hour:02d}:00" for hour in range(10)]})
+
+        self.assertEqual(config.scan_times, [f"{hour:02d}:00" for hour in range(8)])
+
+    def test_config_migrates_legacy_step_cron_to_explicit_times(self):
+        config = PluginConfig.from_dict({"cron": "0 */9 * * *"})
+
+        self.assertEqual(config.scan_times, ["00:00", "09:00", "18:00"])
+
+    def test_invalid_legacy_cron_falls_back_to_daily_nine(self):
+        config = PluginConfig.from_dict({"cron": "not a cron"})
+
+        self.assertEqual(config.scan_times, ["09:00"])
 
     def test_new_notification_switch_overrides_legacy_notify_tg(self):
         config = PluginConfig.from_dict({"notify_tg": False, "notifications_enabled": True})

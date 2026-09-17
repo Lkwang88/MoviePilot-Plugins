@@ -2,7 +2,43 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+import re
 from typing import Any, Dict, List, Optional
+
+
+_TIME_PATTERN = re.compile(r"^(?:[01]?\d|2[0-3]):[0-5]\d$")
+
+
+def normalize_scan_times(value: Any) -> List[str]:
+    """规范化用户指定的每日扫描时刻，格式 HH:mm、去重并排序。"""
+    values = value if isinstance(value, (list, tuple)) else _as_list(value)
+    normalized = set()
+    for item in values:
+        text = str(item or "").strip()
+        if not _TIME_PATTERN.match(text):
+            continue
+        hour, minute = text.split(":")
+        normalized.add(f"{int(hour):02d}:{int(minute):02d}")
+    # UI 限制最多 8 次；后端同样收口，避免 API 绕过导致任务膨胀。
+    return sorted(normalized)[:8]
+
+
+def legacy_cron_to_scan_times(value: Any) -> List[str]:
+    """迁移旧版每日 Cron；不支持的表达式安全回退默认时刻。"""
+    parts = str(value or "").strip().split()
+    if len(parts) != 5 or any(part != "*" for part in parts[2:]):
+        return ["09:00"]
+    minute, hour = parts[:2]
+    if not minute.isdigit() or not 0 <= int(minute) <= 59:
+        return ["09:00"]
+    hours: List[int] = []
+    if hour.isdigit():
+        hours = [int(hour)] if 0 <= int(hour) <= 23 else []
+    elif hour.startswith("*/") and hour[2:].isdigit() and int(hour[2:]) > 0:
+        hours = list(range(0, 24, int(hour[2:])))
+    elif all(token.isdigit() and 0 <= int(token) <= 23 for token in hour.split(",")):
+        hours = [int(token) for token in hour.split(",")]
+    return normalize_scan_times([f"{item}:{int(minute):02d}" for item in hours]) or ["09:00"]
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -21,7 +57,12 @@ def _as_list(value: Any) -> List[Any]:
 class PluginConfig:
     enabled: bool = False
     delay_days: int = 1
+    # 旧 Cron 仅用于升级迁移；新版统一使用 scan_times 的明确每日时刻。
     cron: str = "0 9 * * *"
+    scan_times: List[str] = field(default_factory=lambda: ["09:00"])
+    # 系统订阅刷新运行时，本插件每 5 分钟检查一次；0 = 关闭让行。
+    defer_on_system_refresh: bool = True
+    system_refresh_retry_minutes: int = 5
     selected_categories: List[str] = field(default_factory=list)
     search_sites: List[str] = field(default_factory=list)
     max_scan_subscribes: int = 20
@@ -48,6 +89,11 @@ class PluginConfig:
 
         config.enabled = bool(config.enabled)
         config.delay_days = max(0, int(config.delay_days or 0))
+        # 有 scan_times 时以新版明确时刻为准；仅旧配置时迁移 cron，保持可升级。
+        config.scan_times = normalize_scan_times(raw.get("scan_times")) if "scan_times" in raw else legacy_cron_to_scan_times(config.cron)
+        config.defer_on_system_refresh = bool(config.defer_on_system_refresh)
+        # 与 MP Spider 刷新冲突时固定每 5 分钟检查一次，避免暴露难以理解的调参项。
+        config.system_refresh_retry_minutes = 5
         config.selected_categories = [str(item) for item in _as_list(config.selected_categories)]
         config.search_sites = [str(item) for item in _as_list(config.search_sites)]
         config.max_scan_subscribes = max(1, int(config.max_scan_subscribes or 1))

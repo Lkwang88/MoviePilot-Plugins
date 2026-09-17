@@ -7,7 +7,7 @@ function removeUnreachableSharedAssets() {
   return {
     name: 'remove-unreachable-shared-assets',
     closeBundle() {
-      rmSync(new URL('./dist/assets/__federation_shared_vuetify', import.meta.url), {
+      rmSync(new URL('./dist/assets-v110/__federation_shared_vuetify', import.meta.url), {
         recursive: true,
         force: true,
       })
@@ -46,6 +46,10 @@ export default defineConfig({
     removeUnreachableSharedAssets(),
   ],
   build: {
+    // Vite 的 assetsDir 才是插件联邦文件所在目录；保持 dist/assets-v110/remoteEntry.js 结构。
+    outDir: 'dist',
+    assetsDir: 'assets-v110',
+    emptyOutDir: true,
     target: 'esnext',
     minify: false,
     cssCodeSplit: true,
