@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Any, List, Dict, Tuple, Optional
+from urllib.request import Request, urlopen
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -52,7 +53,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.9.3"
+    plugin_version = "1.9.4"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -92,6 +93,8 @@ class GDStrmHelper(_PluginBase):
 
     _monitor_confs = None        # 目录配置(textarea)
     _mediaservers = None
+    _custom_emby_servers = None  # 独立Emby配置(textarea)
+    _custom_emby_server_configs = []
     _emby_paths = {}
     _rmt_mediaext = None
     _other_mediaext = None
@@ -162,6 +165,8 @@ class GDStrmHelper(_PluginBase):
         # 重置运行时状态
         self._dir_conf = {}
         self._emby_paths = {}
+        self._custom_emby_servers = ""
+        self._custom_emby_server_configs = []
         self._inflight = set()
         self._refresh_queue = set()
         self._sample_media = {}
@@ -225,6 +230,7 @@ class GDStrmHelper(_PluginBase):
 
             self._monitor_confs = config.get("monitor_confs")
             self._mediaservers = config.get("mediaservers") or []
+            self._custom_emby_servers = config.get("custom_emby_servers") or ""
             self._rmt_mediaext = config.get("rmt_mediaext") \
                 or ".mp4, .mkv, .ts, .iso, .rmvb, .avi, .mov, .mpeg, .mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .tp, .f4v"
             self._other_mediaext = config.get("other_mediaext") \
@@ -252,6 +258,7 @@ class GDStrmHelper(_PluginBase):
 
         # 解析目录配置
         self.__parse_confs()
+        self.__parse_custom_emby_servers()
 
         # 初始化数据库
         self.__init_db()
@@ -377,6 +384,35 @@ class GDStrmHelper(_PluginBase):
                 "emby_strm": emby_strm,
             }
         logger.info(f"共解析到 {len(self._dir_conf)} 个网盘配置")
+
+    def __parse_custom_emby_servers(self):
+        """解析独立Emby服务器配置，格式：名称#地址#APIKEY。"""
+        self._custom_emby_server_configs = []
+        if not self._custom_emby_servers:
+            return
+        for line_no, raw_line in enumerate(str(self._custom_emby_servers).splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [part.strip() for part in line.split("#")]
+            if len(parts) != 3 or not all(parts):
+                logger.error(
+                    f"独立Emby配置第{line_no}行格式错误，已跳过；"
+                    "格式：名称#地址#APIKEY")
+                continue
+            name, host, api_key = parts
+            host = host.rstrip("/")
+            if not host.startswith(("http://", "https://")):
+                logger.error(
+                    f"独立Emby配置第{line_no}行地址必须以http://或https://开头，已跳过")
+                continue
+            self._custom_emby_server_configs.append({
+                "name": name,
+                "host": host,
+                "api_key": api_key,
+            })
+        if self._custom_emby_server_configs:
+            logger.info(f"共解析到 {len(self._custom_emby_server_configs)} 台独立Emby服务器")
 
     def __build_ext_sets(self):
         """
@@ -1274,7 +1310,7 @@ class GDStrmHelper(_PluginBase):
                     self._monitor_pending.append((mon_path, strm_file))
 
             # 聚合刷新Emby
-            if self._refresh_emby and self._mediaservers:
+            if self._refresh_emby and (self._mediaservers or self._custom_emby_server_configs):
                 with self._refresh_lock:
                     self._refresh_queue.add(strm_file)
                     self._last_refresh_time = time.time()
@@ -1477,15 +1513,15 @@ class GDStrmHelper(_PluginBase):
         self.__refresh_emby(files)
 
     def __refresh_emby(self, strm_files: List[str]):
+        # MP已接入的Emby继续完全沿用原服务端调用；独立服务器仅增加直连发送目标。
         emby_servers = self.mediaserver_helper.get_services(
             name_filters=self._mediaservers, type_filter="emby")
-        if not emby_servers:
-            logger.error("未配置Emby媒体服务器，跳过刷新")
+        custom_servers = self._custom_emby_server_configs or []
+        if not emby_servers and not custom_servers:
+            logger.error("未配置Emby媒体服务器或独立Emby服务器，跳过刷新")
             return
 
         # 先沿用现有MP->Emby路径映射，再按媒体库目录归并。
-        # 例如：8个 /media/LK01/Lk01媒体库/国产剧集/.../*.strm
-        # 只提交1个 /media/LK01/Lk01媒体库/国产剧集，避免Emby重复刷新同一媒体库。
         library_counts = {}
         fallback_count = 0
         for f in sorted(strm_files):
@@ -1504,43 +1540,78 @@ class GDStrmHelper(_PluginBase):
         for path, count in library_counts.items():
             logger.info(f"[Emby刷新] {path}：归并 {count} 个STRM，提交1个刷新项")
 
-        # 分批发送，避免全量时单次payload过大打挂Emby
-        batch_size = 100
-        batch_count = (len(updates) + batch_size - 1) // batch_size
         for emby_name, emby_server in emby_servers.items():
             emby = emby_server.instance
-            ok, fail = 0, 0
-            started = time.monotonic()
-            logger.info(
-                f"[Emby刷新][{emby_name}] 准备发送：原始STRM={len(strm_files)}，"
-                f"最终Updates={len(updates)}，HTTP请求={batch_count}")
-            for i in range(0, len(updates), batch_size):
-                batch = updates[i:i + batch_size]
-                batch_no = i // batch_size + 1
-                try:
-                    res = emby.post_data(
-                        url='[HOST]emby/Library/Media/Updated?api_key=[APIKEY]&reqformat=json',
-                        data=json.dumps({"Updates": batch}),
-                        headers={"Content-Type": "application/json"})
-                    if res and res.status_code in [200, 204]:
-                        ok += len(batch)
-                        logger.info(
-                            f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}成功："
-                            f"Updates={len(batch)}，响应={res.status_code}")
-                    else:
-                        fail += len(batch)
-                        code = res.status_code if res else "无响应"
-                        logger.error(
-                            f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}失败："
-                            f"Updates={len(batch)}，错误码={code}")
-                except Exception as e:
+            self.__send_emby_updates(
+                emby_name, len(strm_files), updates,
+                lambda batch: emby.post_data(
+                    url='[HOST]emby/Library/Media/Updated?api_key=[APIKEY]&reqformat=json',
+                    data=json.dumps({"Updates": batch}),
+                    headers={"Content-Type": "application/json"}))
+
+        for server in custom_servers:
+            self.__send_emby_updates(
+                server["name"], len(strm_files), updates,
+                lambda batch, server=server: self.__post_custom_emby_updates(server, batch))
+
+    def __send_emby_updates(self, emby_name: str, strm_count: int,
+                            updates: List[Dict[str, str]], send_batch):
+        """复用媒体库级Updates的100条分批、统计与日志。"""
+        batch_size = 100
+        batch_count = (len(updates) + batch_size - 1) // batch_size
+        ok, fail = 0, 0
+        started = time.monotonic()
+        logger.info(
+            f"[Emby刷新][{emby_name}] 准备发送：原始STRM={strm_count}，"
+            f"最终Updates={len(updates)}，HTTP请求={batch_count}")
+        for i in range(0, len(updates), batch_size):
+            batch = updates[i:i + batch_size]
+            batch_no = i // batch_size + 1
+            try:
+                res = send_batch(batch)
+                code = res.status_code if hasattr(res, "status_code") else res
+                if code in [200, 204]:
+                    ok += len(batch)
+                    logger.info(
+                        f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}成功："
+                        f"Updates={len(batch)}，响应={code}")
+                else:
                     fail += len(batch)
                     logger.error(
-                        f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}出错：{e}")
-            elapsed_ms = (time.monotonic() - started) * 1000
-            logger.info(
-                f"[Emby刷新][{emby_name}] 完成：成功Updates={ok}，失败Updates={fail}，"
-                f"HTTP请求={batch_count}，耗时={elapsed_ms:.0f}ms")
+                        f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}失败："
+                        f"Updates={len(batch)}，错误码={code or '无响应'}")
+            except Exception as e:
+                fail += len(batch)
+                logger.error(
+                    f"[Emby刷新][{emby_name}] HTTP批次{batch_no}/{batch_count}出错："
+                    f"{self.__mask_custom_emby_error(str(e))}")
+        elapsed_ms = (time.monotonic() - started) * 1000
+        logger.info(
+            f"[Emby刷新][{emby_name}] 完成：成功Updates={ok}，失败Updates={fail}，"
+            f"HTTP请求={batch_count}，耗时={elapsed_ms:.0f}ms")
+
+    @staticmethod
+    def __get_custom_emby_api_url(host: str) -> str:
+        """兼容填写Emby根地址或已带/emby的地址，避免重复拼接。"""
+        host = host.rstrip("/")
+        base = host if host.lower().endswith("/emby") else f"{host}/emby"
+        return f"{base}/Library/Media/Updated?reqformat=json"
+
+    def __post_custom_emby_updates(self, server: Dict[str, str], batch: List[Dict[str, str]]) -> int:
+        """向未接入MP的独立Emby发送刷新；API Key只走请求头。"""
+        payload = json.dumps({"Updates": batch}).encode("utf-8")
+        request = Request(
+            self.__get_custom_emby_api_url(server["host"]), data=payload,
+            headers={"Content-Type": "application/json", "X-Emby-Token": server["api_key"]},
+            method="POST")
+        with urlopen(request, timeout=10) as response:
+            return response.getcode()
+
+    def __mask_custom_emby_error(self, message: str) -> str:
+        """避免底层HTTP异常意外回显独立Emby API Key。"""
+        for server in self._custom_emby_server_configs or []:
+            message = message.replace(server["api_key"], "***")
+        return message
 
     @staticmethod
     def __get_emby_refresh_path(mapped_path: str) -> Tuple[str, bool]:
@@ -1624,6 +1695,7 @@ class GDStrmHelper(_PluginBase):
             "del_max": self._del_max,
             "monitor_confs": self._monitor_confs,
             "mediaservers": self._mediaservers,
+            "custom_emby_servers": self._custom_emby_servers,
             "rmt_mediaext": self._rmt_mediaext,
             "other_mediaext": self._other_mediaext,
             "exclude_keywords": self._exclude_keywords,
@@ -1824,6 +1896,23 @@ class GDStrmHelper(_PluginBase):
                             }]
                         }]
                     },
+                    # 独立Emby服务器
+                    {
+                        "component": "VRow",
+                        "content": [{
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [{
+                                "component": "VTextarea",
+                                "props": {
+                                    "model": "custom_emby_servers",
+                                    "label": "独立Emby服务器（未接入MP，参与刷新）",
+                                    "rows": 3,
+                                    "placeholder": "每行一台：名称#地址#APIKEY\\n客厅Emby#http://192.168.1.10:8096#xxxxxxxx"
+                                }
+                            }]
+                        }]
+                    },
                     # 扩展名
                     {
                         "component": "VRow",
@@ -1884,6 +1973,7 @@ class GDStrmHelper(_PluginBase):
             "del_max": 10,
             "monitor_confs": "",
             "mediaservers": [],
+            "custom_emby_servers": "",
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso, .rmvb, .avi, .mov, .mpeg, .mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .tp, .f4v",
             "other_mediaext": ".nfo, .jpg, .png, .json, .ass, .srt, .sup",
             "exclude_keywords": "",
@@ -1946,9 +2036,9 @@ class GDStrmHelper(_PluginBase):
             if emby_play == mon_path:
                 issues.append(f"盘 {mon_path} 的Emby播放路径与监控目录相同，"
                               f"若Emby容器挂载路径不同请修正(否则Emby将无法播放)")
-        # 开启Emby刷新但没选服务器
-        if self._refresh_emby and not self._mediaservers:
-            issues.append("已开启【刷新Emby】但未选择媒体服务器")
+        # 开启Emby刷新但没有任何MP或独立服务器
+        if self._refresh_emby and not (self._mediaservers or self._custom_emby_server_configs):
+            issues.append("已开启【刷新Emby】但未选择媒体服务器或填写独立Emby服务器")
         return issues
 
     def __validate_and_preview(self):
