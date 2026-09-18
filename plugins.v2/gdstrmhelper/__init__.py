@@ -53,7 +53,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.9.4"
+    plugin_version = "1.9.5"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -266,6 +266,9 @@ class GDStrmHelper(_PluginBase):
         if not (self._enabled or self._onlyonce or self._onlyonce_incr or self._onlyonce_clean
                 or self._onlyonce_dbcheck or self._onlyonce_dbrebuild or self._onlyonce_dbvacuum):
             return
+
+        # 启动时对独立Emby做一次只读鉴权探测，尽早暴露地址/端口/反代路径/API Key问题。
+        self.__verify_custom_emby_servers()
 
         # 定时服务
         self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -1591,11 +1594,33 @@ class GDStrmHelper(_PluginBase):
             f"HTTP请求={batch_count}，耗时={elapsed_ms:.0f}ms")
 
     @staticmethod
-    def __get_custom_emby_api_url(host: str) -> str:
+    def __get_custom_emby_base_url(host: str) -> str:
         """兼容填写Emby根地址或已带/emby的地址，避免重复拼接。"""
         host = host.rstrip("/")
-        base = host if host.lower().endswith("/emby") else f"{host}/emby"
-        return f"{base}/Library/Media/Updated?reqformat=json"
+        return host if host.lower().endswith("/emby") else f"{host}/emby"
+
+    def __verify_custom_emby_servers(self):
+        """启动时用只读 System/Info 验证独立Emby的地址、端口、反代路径与API Key。"""
+        for server in self._custom_emby_server_configs or []:
+            try:
+                request = Request(
+                    f"{self.__get_custom_emby_base_url(server['host'])}/System/Info",
+                    headers={"X-Emby-Token": server["api_key"]}, method="GET")
+                with urlopen(request, timeout=5) as response:
+                    code = response.getcode()
+                    if code in [200, 204]:
+                        logger.info(f"[独立Emby][{server['name']}] 连通与鉴权验证成功：响应={code}")
+                    else:
+                        logger.error(
+                            f"[独立Emby][{server['name']}] 连通验证失败：错误码={code}")
+            except Exception as e:
+                logger.error(
+                    f"[独立Emby][{server['name']}] 连通或鉴权验证失败："
+                    f"{self.__mask_custom_emby_error(str(e))}")
+
+    @staticmethod
+    def __get_custom_emby_api_url(host: str) -> str:
+        return f"{GDStrmHelper.__get_custom_emby_base_url(host)}/Library/Media/Updated?reqformat=json"
 
     def __post_custom_emby_updates(self, server: Dict[str, str], batch: List[Dict[str, str]]) -> int:
         """向未接入MP的独立Emby发送刷新；API Key只走请求头。"""
