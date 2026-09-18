@@ -20,7 +20,6 @@ from watchdog.observers.polling import PollingObserver
 
 from app.core.config import settings
 from app.core.event import eventmanager, Event
-from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, NotificationType
@@ -53,7 +52,7 @@ class GDStrmHelper(_PluginBase):
     # 插件图标
     plugin_icon = "Google_cloud_A.png"
     # 插件版本
-    plugin_version = "1.9.5"
+    plugin_version = "1.9.6"
     # 插件作者
     plugin_author = "lkwang88"
     # 作者主页
@@ -92,7 +91,6 @@ class GDStrmHelper(_PluginBase):
     _del_max: int = 10           # 单轮最大删除数(熔断阈值)
 
     _monitor_confs = None        # 目录配置(textarea)
-    _mediaservers = None
     _custom_emby_servers = None  # 独立Emby配置(textarea)
     _custom_emby_server_configs = []
     _emby_paths = {}
@@ -103,7 +101,6 @@ class GDStrmHelper(_PluginBase):
     # ==================== 运行时属性 ====================
     # 网盘配置解析结果 mon_path -> {strm_dir, emby_play, emby_strm}
     _dir_conf = {}
-    mediaserver_helper = None
 
     # 任务队列 + 工作线程
     _queue: Optional[Queue] = None
@@ -199,7 +196,6 @@ class GDStrmHelper(_PluginBase):
         self._write_cache = {}
         self._pending = 0
         self._last_commit = time.time()
-        self.mediaserver_helper = MediaServerHelper()
 
         if config:
             self._enabled = config.get("enabled")
@@ -229,7 +225,6 @@ class GDStrmHelper(_PluginBase):
             self._del_max = int(config.get("del_max") or 10)
 
             self._monitor_confs = config.get("monitor_confs")
-            self._mediaservers = config.get("mediaservers") or []
             self._custom_emby_servers = config.get("custom_emby_servers") or ""
             self._rmt_mediaext = config.get("rmt_mediaext") \
                 or ".mp4, .mkv, .ts, .iso, .rmvb, .avi, .mov, .mpeg, .mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .tp, .f4v"
@@ -1313,7 +1308,7 @@ class GDStrmHelper(_PluginBase):
                     self._monitor_pending.append((mon_path, strm_file))
 
             # 聚合刷新Emby
-            if self._refresh_emby and (self._mediaservers or self._custom_emby_server_configs):
+            if self._refresh_emby and self._custom_emby_server_configs:
                 with self._refresh_lock:
                     self._refresh_queue.add(strm_file)
                     self._last_refresh_time = time.time()
@@ -1516,15 +1511,13 @@ class GDStrmHelper(_PluginBase):
         self.__refresh_emby(files)
 
     def __refresh_emby(self, strm_files: List[str]):
-        # MP已接入的Emby继续完全沿用原服务端调用；独立服务器仅增加直连发送目标。
-        emby_servers = self.mediaserver_helper.get_services(
-            name_filters=self._mediaservers, type_filter="emby")
+        # 仅使用独立Emby配置直连刷新，不再读取或调用MoviePilot媒体服务器。
         custom_servers = self._custom_emby_server_configs or []
-        if not emby_servers and not custom_servers:
-            logger.error("未配置Emby媒体服务器或独立Emby服务器，跳过刷新")
+        if not custom_servers:
+            logger.error("未填写独立Emby服务器，跳过刷新")
             return
 
-        # 先沿用现有MP->Emby路径映射，再按媒体库目录归并。
+        # 先应用STRM路径映射，再按媒体库目录归并。
         library_counts = {}
         fallback_count = 0
         for f in sorted(strm_files):
@@ -1542,15 +1535,6 @@ class GDStrmHelper(_PluginBase):
             f"未识别媒体库回退文件级 {fallback_count} 个")
         for path, count in library_counts.items():
             logger.info(f"[Emby刷新] {path}：归并 {count} 个STRM，提交1个刷新项")
-
-        for emby_name, emby_server in emby_servers.items():
-            emby = emby_server.instance
-            self.__send_emby_updates(
-                emby_name, len(strm_files), updates,
-                lambda batch: emby.post_data(
-                    url='[HOST]emby/Library/Media/Updated?api_key=[APIKEY]&reqformat=json',
-                    data=json.dumps({"Updates": batch}),
-                    headers={"Content-Type": "application/json"}))
 
         for server in custom_servers:
             self.__send_emby_updates(
@@ -1719,7 +1703,6 @@ class GDStrmHelper(_PluginBase):
             "del_check_times": self._del_check_times,
             "del_max": self._del_max,
             "monitor_confs": self._monitor_confs,
-            "mediaservers": self._mediaservers,
             "custom_emby_servers": self._custom_emby_servers,
             "rmt_mediaext": self._rmt_mediaext,
             "other_mediaext": self._other_mediaext,
@@ -1891,26 +1874,12 @@ class GDStrmHelper(_PluginBase):
                             }]
                         }]
                     },
-                    # 媒体服务器
+                    # Emby路径映射
                     {
                         "component": "VRow",
                         "content": [{
                             "component": "VCol",
-                            "props": {"cols": 12, "md": 6},
-                            "content": [{
-                                "component": "VSelect",
-                                "props": {
-                                    "chips": True, "multiple": True, "clearable": True,
-                                    "model": "mediaservers",
-                                    "label": "媒体服务器(Emby)",
-                                    "items": [{"title": s.name, "value": s.name}
-                                              for s in self.mediaserver_helper.get_configs().values()]
-                                    if self.mediaserver_helper else []
-                                }
-                            }]
-                        }, {
-                            "component": "VCol",
-                            "props": {"cols": 12, "md": 6},
+                            "props": {"cols": 12},
                             "content": [{
                                 "component": "VTextField",
                                 "props": {
@@ -1997,7 +1966,6 @@ class GDStrmHelper(_PluginBase):
             "del_check_times": 3,
             "del_max": 10,
             "monitor_confs": "",
-            "mediaservers": [],
             "custom_emby_servers": "",
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso, .rmvb, .avi, .mov, .mpeg, .mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .tp, .f4v",
             "other_mediaext": ".nfo, .jpg, .png, .json, .ass, .srt, .sup",
@@ -2061,9 +2029,9 @@ class GDStrmHelper(_PluginBase):
             if emby_play == mon_path:
                 issues.append(f"盘 {mon_path} 的Emby播放路径与监控目录相同，"
                               f"若Emby容器挂载路径不同请修正(否则Emby将无法播放)")
-        # 开启Emby刷新但没有任何MP或独立服务器
-        if self._refresh_emby and not (self._mediaservers or self._custom_emby_server_configs):
-            issues.append("已开启【刷新Emby】但未选择媒体服务器或填写独立Emby服务器")
+        # 开启Emby刷新但没有独立服务器
+        if self._refresh_emby and not self._custom_emby_server_configs:
+            issues.append("已开启【刷新Emby】但未填写独立Emby服务器")
         return issues
 
     def __validate_and_preview(self):
